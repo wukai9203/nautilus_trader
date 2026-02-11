@@ -386,6 +386,30 @@ NautilusTrader 提供了一套全面的交易命令，支持为算法交易量�
 - 如果指定了 `exec_algorithm_id`（且没有 `emulation_trigger`），命令将*首先*发送到相应的 `ExecAlgorithm`。
 - 否则，命令将*首先*发送到 `RiskEngine`。
 
+:::info 为什么需要 OrderEmulator？
+很多交易所不原生支持高级订单类型（如 `STOP_LIMIT`、`TRAILING_STOP` 等）。`OrderEmulator` 的作用是**在本地模拟**这些订单类型：持续监控市场价格（由 `emulation_trigger` 指定监控买卖价或最新成交价），当触发条件满足时，将模拟订单转换为简单的 `MARKET` 或 `LIMIT` 订单，再提交到交易所。
+
+以模拟 `STOP_LIMIT` 订单为例，其生命周期如下：
+
+```
+策略提交订单(emulation_trigger=LAST_PRICE)
+  → RiskEngine 风险检查
+  → OrderEmulator 持有订单，订阅市场数据
+  → 持续监控最新成交价...
+  → 价格触及 stop 价格！
+  → 转换为 LIMIT 订单，释放
+  → 再次经过 RiskEngine 风险检查
+  → 提交到交易所执行
+```
+
+这一设计带来四个关键优势：
+
+- **跨交易所统一**：策略代码可以使用相同的高级订单类型，无需关心交易所是否原生支持
+- **回测/实盘一致**：模拟逻辑在所有环境中完全相同
+- **风险双重检查**：订单在初始提交和触发释放时都经过 `RiskEngine`
+- **可恢复**：模拟订单可持久化，系统崩溃后重启能恢复状态
+:::
+
 以下示例提交一个用于模拟的 `LIMIT` 买入订单（参见[模拟订单](orders.md#emulated-orders)）：
 
 ```python

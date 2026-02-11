@@ -108,6 +108,42 @@ def on_instrument(self, instrument: Instrument) -> None:
 
 金融工具对象是通过*只读*属性组织工具规格的便捷方式。可以获取正确的价格精度 (price precision) 和数量精度 (size precision)，以及最小价格和数量增量、合约乘数和标准手数 (lot size)。
 
+:::info 精度与增量属性详解
+每个金融工具对象包含以下 6 个关键只读属性：
+
+**精度 (Precision)** — 控制小数位数：
+
+| 属性 | 类型 | 含义 | 示例 |
+|------|------|------|------|
+| `price_precision` | `int` | 价格的小数位数 | `2` → 价格如 1.01, 1.02 |
+| `size_precision` | `int` | 数量的小数位数 | `8` → 数量如 0.00000001 |
+
+**增量 (Increment)** — 控制最小步进值：
+
+| 属性 | 类型 | 含义 | 示例 |
+|------|------|------|------|
+| `price_increment` | `Price` | 最小价格变动（即 tick size） | 外汇: `0.0001`, 股票: `0.01` |
+| `size_increment` | `Quantity` | 最小数量步进 | 加密货币: `0.00001`, 股票: `1.0` |
+
+精度与增量必须一致：`price_increment` 的精度等于 `price_precision`，`size_increment` 的精度等于 `size_precision`。若未指定 `price_increment`，系统自动计算为 `10^(-price_precision)`。
+
+**合约乘数 (Multiplier)** — 决定名义价值和盈亏：
+
+| 属性 | 类型 | 含义 | 示例 |
+|------|------|------|------|
+| `multiplier` | `Quantity` | 合约价值乘数 | 现货: `1.0`, CME ES 期货: `50` |
+
+名义价值计算公式：`notional = quantity × multiplier × price`。例如 CME 标普 500 期货（ES），`multiplier = 50`，若价格为 5000，1 份合约的名义价值为 `1 × 50 × 5000 = 250,000 美元`。每变动 1 点（tick），盈亏 = `tick_size × multiplier = 0.25 × 50 = 12.50 美元`。
+
+**标准手数 (Lot Size)** — 标准交易单位（可选）：
+
+| 属性 | 类型 | 含义 | 示例 |
+|------|------|------|------|
+| `lot_size` | `Quantity` 或 `None` | 标准交易手数单位 | 黄金: `100`（盎司）, 期权: `100`（股） |
+
+`lot_size` 是可选属性（可为 `None`），定义交易所的标准交易单位。与 `size_increment`（最小可下单步进）不同，`lot_size` 表示该工具约定俗成的"一手"大小。例如外汇中 1 标准手 = 100,000 单位基础货币，黄金期货 1 手 = 100 盎司。
+:::
+
 :::note
 这些限制大多由 Nautilus `RiskEngine` 检查，否则无效的价格和数量值*可能*导致交易所拒绝订单 (order)。
 :::
