@@ -31,6 +31,19 @@
 工具规格定义不正确可能会导致数据截断或产生意外结果。
 :::
 
+:::tip 处理 Binance 现货/期货代码冲突
+
+Binance 现货市场和期货市场共享部分相同的交易代码（如 `BTCUSDT`）。Nautilus 通过**适配器将其映射为不同的 InstrumentId** 来避免冲突：
+
+| 市场 | InstrumentId 示例 | 备注 |
+|------|----------------|------|
+| Binance 现货 | `BTCUSDT.BINANCE` | 现货交易对 |
+| Binance U 本位永续 | `BTCUSDT-PERP.BINANCE` | `-PERP` 后缀区分永续合约 |
+| Binance 币本位永续 | `BTCUSD-PERP.BINANCE` | 币本位用 `USD` 而非 `USDT` |
+
+如果你在同一系统中同时连接现货和期货市场，请确保使用不同的 `DataClient` 实例，并通过正确的 `client_id` 路由数据请求，以避免金融工具定义混淆。
+:::
+
 ## 回测 (Backtesting)
 
 可以通过 `TestInstrumentProvider` 实例化通用测试工具：

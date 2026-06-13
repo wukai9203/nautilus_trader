@@ -92,6 +92,7 @@ def on_stop(self) -> None:
     # 取消定时器以防止在 stop/resume 周期中产生资源泄漏
     self.clock.cancel_timer("my_timer")
 
+
 def on_timer(self, event: TimeEvent) -> None:
     if event.name == "my_timer":
         self.log.info("Timer fired!")
@@ -100,6 +101,16 @@ def on_alert(self, event: TimeEvent) -> None:
     if event.name == "my_alert":
         self.log.info("Alert triggered!")
 ```
+
+:::warning 并发安全：定时器与回调的约束
+
+Nautilus 采用单线程核心设计（参见[架构](architecture.md#线程模型)），所有 Actor/Strategy 回调（包括 `on_bar()`、`on_timer()`、`on_order_filled()` 等）均在**同一线程上顺序执行**。这意味着：
+
+- **不存在真正的并发**：`on_timer()` 和 `on_bar()` 不会同时运行——一个完成后才会调用下一个。
+- **无需加锁**：可以在不同回调间安全地共享实例变量，无需使用 `threading.Lock`。
+- **长时间阻塞会延迟其他事件**：如果 `on_bar()` 中有耗时操作（如同步网络请求），会导致定时器事件和后续 K 线的处理延迟。应将耗时操作改为异步，或减少在回调中执行的工作量。
+- **定时器精度有限**：定时器事件在主循环处理完当前事件后才触发，不保证纳秒级精确触发时间。
+:::
 
 ## 系统访问
 
@@ -165,6 +176,20 @@ Actor 可以访问核心系统组件 (component)：
 | `request_trade_ticks()`         | 历史             | `on_historical_data()`   | 历史成交处理。 |
 | `request_bars()`                | 历史             | `on_historical_data()`   | 历史 K线 处理。 |
 | `request_aggregated_bars()`     | 历史             | `on_historical_data()`   | 历史聚合 K线（即时生成）。 |
+
+:::tip 请求（历史数据）与订阅（实时数据）的关键区别
+
+| 维度 | 请求（历史数据） | 订阅（实时数据） |
+|------|---------------|---------------|
+| 方法前缀 | `request_*` | `subscribe_*` |
+| 回调处理器 | `on_historical_data()` | `on_bar()`、`on_quote_tick()` 等专用处理器 |
+| 数据传递方式 | 批量返回（一次性） | 逐条推送（流式） |
+| 典型用途 | 启动时加载历史数据、预热指标 | 接收实时市场更新、触发交易逻辑 |
+| 回测中行为 | 立即同步返回数据 | 随历史数据回放逐条触发 |
+| 实盘中行为 | 发起 REST 请求，异步回调 | 订阅 WebSocket 流 |
+
+建议在 `on_start()` 中先 `request_*` 预热指标，再 `subscribe_*` 开始接收实时更新。
+:::
 
 ### 示例
 

@@ -8,6 +8,16 @@
 
 系统在订单成交时自动创建持仓，并从开仓到平仓全程跟踪。平台通过 OMS（订单管理系统）配置支持净额和对冲 (hedging) 两种持仓管理方式。
 
+:::note 什么是敞口（Exposure）？
+**敞口** = 持仓量 × 市场价格，代表你有多少资金正在承受市场波动的风险。敞口越大，同样的价格变动对盈亏影响越大。
+
+- 持有 1 BTC（$60,000）→ 敞口 $60,000，市场波动 1% 盈亏 $600
+- 空仓（FLAT）→ 敞口为 0，不承担任何市场风险
+- 做空 2 BTC → 敞口 $120,000，方向相反但风险暴露金额相同
+
+本文档中"增加/减少敞口"指风险暴露的变化；"净敞口"（`signed_qty`）指买卖对冲后的净头寸；"峰值数量"（`peak_qty`）指持仓期间承受过的最大风险。
+:::
+
 ## 持仓生命周期
 
 ### 创建
@@ -129,6 +139,17 @@ NautilusTrader 支持两种主要的 OMS 类型，它们从根本上影响持仓
 - 所有成交贡献于同一个持仓。
 - 随着净数量变化，持仓在多头和空头之间翻转。
 - 历史快照保留已关闭的持仓状态。
+
+:::note NETTING 模式下的持仓 ID 分配规则
+
+在净额 OMS 中，持仓 ID 由**首次建仓成交**所属订单的 `client_order_id` 衍生生成：
+
+- **首次建仓**：当某金融工具的第一笔成交到达时，系统创建持仓并分配持仓 ID（`ExecutionEngine` 内部基于首笔订单 ID 生成）。
+- **后续成交**：同一金融工具的后续成交聚合到已有持仓，持仓 ID 不变。
+- **持仓关闭后重新开仓**：旧持仓被快照，新的首笔成交会触发新持仓创建，并分配基于新订单 ID 的持仓 ID。
+
+实践建议：不要在策略中硬编码或缓存持仓 ID——使用 `self.cache.positions(instrument_id=instrument_id)` 或 `self.cache.position_id(instrument_id=instrument_id)` 动态获取当前净额持仓的 ID。
+:::
 
 ### `HEDGING`
 
@@ -282,6 +303,20 @@ notional = position.notional_value(current_price)
 - 如果反向金融工具未设置 `base_currency`，将会触发 panic。
 - 不处理 quanto 合约（返回报价货币而非结算货币）。
 - 对于 quanto 金融工具，请使用 `instrument.calculate_notional_value()` 代替。
+
+:::note 什么是 Quanto 合约？
+**Quanto 合约**（quantity-adjusted contract）是一种跨币种结算的衍生品合约：标的以 A 货币计价，但盈亏以 B 货币按**固定汇率**结算，从而消除汇率风险。
+
+| 类型 | 标的计价 | 结算货币 | 汇率风险 | 典型例子 |
+|------|---------|---------|---------|---------|
+| 线性（标准） | USD | USD | 无 | Binance BTCUSDT |
+| 反向 | USD | BTC | 有（非线性 PnL） | BitMEX XBTUSD |
+| **Quanto** | USD | BTC | **无**（固定汇率） | BitMEX 早期 ETHUSD |
+
+**示例（BitMEX ETHUSD quanto 永续，固定乘数 0.000001 BTC/USD）：** 做多 10,000 张，ETH 从 $2,000 涨到 $2,100 → PnL = (2100 - 2000) × 10000 × 0.000001 = **1.0 BTC**，无论 BTC/USD 汇率如何变化。
+
+Quanto 的结算货币（如 BTC）既不是报价货币（USD）也不是基础货币（ETH），而是第三种货币。`Position` 类只处理线性和反向两种情况，无法自动识别这个固定换算关系，因此需要使用 `instrument.calculate_notional_value()` 代替。
+:::
 
 ## 持仓属性与状态
 

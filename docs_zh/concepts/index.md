@@ -59,6 +59,12 @@ NautilusTrader 可以同时处理多个策略和交易场所 (venue) 的交易�
 包括点对点、发布/订阅和请求/响应模式。
 **消息总线 (Message Bus)** 指南涵盖了 `MessageBus` 的功能和最佳实践。
 
+## [值类型](value_types.md)
+
+`Price`、`Quantity` 和 `Money` 是 NautilusTrader 用于表示核心交易概念的专用值类型，
+基于定点算术实现高性能且确定性的计算。
+**值类型 (Value Types)** 指南涵盖不可变性、算术运算、精度处理和类型约束。
+
 ## [投资组合](portfolio.md)
 
 `Portfolio` 作为中央枢纽，负责管理和跟踪交易节点或回测 (backtest) 中所有活跃策略的持仓。

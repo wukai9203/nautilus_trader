@@ -10,6 +10,32 @@
 - **高级 API**：使用 `BacktestNode` 和配置 (configuration) 对象（内部使用 `BacktestEngine`）。
 - **低级 API**：直接使用 `BacktestEngine`，需要更多"手动"设置。
 
+:::note
+**Parquet 格式说明**
+
+Parquet 是 Apache 开源的**列式存储**文件格式，专为大数据分析设计。与行式存储（如 CSV）的区别：
+
+```
+行式（CSV）：              列式（Parquet）：
+ts    | price | qty       ts:    [1000, 1001, 1002]
+1000    100.0   10        price: [100.0, 100.1, 99.9]
+1001    100.1    5        qty:   [10, 5, 8]
+1002     99.9    8
+```
+
+回测时通常只需读取部分列（如 `price`），列式存储可跳过不需要的列，大幅减少 I/O。
+
+| | **CSV** | **Parquet** |
+|---|---|---|
+| 格式 | 文本，行式 | 二进制，列式 |
+| 体积 | 大 | 小（压缩比通常 5–10x） |
+| 读取速度 | 慢（全行扫描） | 快（按列、按时间范围裁剪） |
+| 内存占用 | 高（需全量加载） | 低（支持流式分批读取） |
+| 可读性 | 人类可读 | 需工具（如 `pyarrow`） |
+
+`ParquetDataCatalog` 是 NautilusTrader 专用数据目录，以 Nautilus 定义的 schema 存储 Parquet 文件，支持按时间范围查询和流式读取。**Tick 级别历史数据动辄 GB~TB，这是高级 API 的标准选择。**
+:::
+
 ## 选择 API 级别
 
 在以下情况下考虑使用**低级** API：
@@ -248,6 +274,15 @@ engine.run()
 - **快速实验：** 两种方法都可以 - 根据具体使用场景选择。
 :::
 
+:::info 低级 API 与高级 API 可以混合使用吗？
+
+两种 API **不能在同一回测运行中混合**——`BacktestEngine`（低级）和 `BacktestNode`（高级）是独立的系统入口。但在**项目层面**可以分阶段使用：
+
+- 用低级 API 快速验证策略逻辑（代码简洁、便于调试）。
+- 将成熟策略迁移到高级 API 进行大规模数据回测和参数优化（使用 `ParquetDataCatalog` 流式加载 TB 级数据）。
+- 两种 API 使用相同的策略类和配置对象，迁移成本低。
+:::
+
 ## 数据
 
 回测提供的数据驱动着执行流程。由于可以使用多种数据类型，
@@ -459,6 +494,43 @@ engine.add_venue(
 )
 ```
 
+### 内部 K 线聚合时机
+
+从 Tick 数据在内部聚合时间 K 线时，数据引擎使用定时器在区间边界处关闭 K 线。
+当数据恰好在 K 线收盘时间戳到达时，会出现一个时序边界问题——定时器可能在处理边界数据之前触发。
+
+在 `DataEngineConfig` 中配置 `time_bars_build_delay` 以延迟 K 线关闭定时器：
+
+```python
+from nautilus_trader.config import BacktestEngineConfig
+from nautilus_trader.data.config import DataEngineConfig
+
+config = BacktestEngineConfig(
+    data_engine=DataEngineConfig(
+        time_bars_build_delay=1,  # 微秒
+    ),
+)
+```
+
+:::tip
+较小的延迟（1 微秒）可确保边界数据在 K 线关闭前被处理。
+当 Tick 数据密集出现在整数区间时间戳时非常有用。
+:::
+
+:::note
+仅影响内部聚合的 K 线（`AggregationSource.INTERNAL`）。
+:::
+
+### 纯定时器回测
+
+回测引擎支持在没有市场数据的情况下仅通过定时器运行。这适用于计划性操作或测试基于定时器的逻辑。
+定时器按时间顺序触发，定时器回调可以通过 `add_data_iterator()` 动态添加数据，这些数据将按顺序处理。
+
+:::warning
+由定时器回调在精确开始时间添加的数据，其时间戳应**晚于**开始时间。
+引擎在处理开始时间定时器之前会读取第一个数据点，因此时间戳等于或早于开始时间的动态添加数据可能无法按预期顺序处理。
+:::
+
 ### 基于成交的执行
 
 当你拥有成交 Tick 数据时，在交易场所配置中启用 `trade_execution=True` 可以基于成交活动触发订单成交。
@@ -499,6 +571,56 @@ engine.add_venue(
 而成交 Tick 触发可能位于价差内或领先于报价更新的订单执行。
 :::
 
+#### 队列位置追踪
+
+当 `queue_position=True` 与 `trade_execution=True` 同时启用时，撮合引擎会模拟限价订单的队列位置，通过追踪在给定价格水平"排在前面"的订单数量来提供更真实的成交行为。
+
+**工作原理：**
+
+1. **订单下达**：当限价订单被接受时，引擎对订单价格水平处当前的同向订单簿深度进行快照。这代表队列中排在前面的订单量。
+
+2. **成交 Tick**：当在订单价格水平发生成交时，"前方数量"按成交大小递减。只有正确方向的成交才会影响队列（BUYER 成交递减 SELL 订单的队列，SELLER 成交递减 BUY 订单的队列）。带有 `NO_AGGRESSOR` 标记的成交（常见于缺少攻击方元数据的历史数据集）会同时影响两侧——这是悲观假设，但可防止订单永久滞留。
+
+3. **成交资格**：仅当前方数量归零后，订单才有资格成交。在清空队列的那一笔 Tick 上，只有超出部分（成交大小减去前方队列量）可用于成交，以防止过度成交。
+
+4. **价格水平 DELETE**：如果订单簿水平被删除（`BookAction.DELETE`），队列立即清空，使订单具备成交资格。UPDATE 操作被忽略（队列不变）。
+
+5. **订单修改**：如果订单被修改（价格或数量变更），队列位置重置——订单回到新价格水平的队列末尾。
+
+**配置：**
+
+```python
+from nautilus_trader.backtest.config import BacktestVenueConfig
+
+venue_config = BacktestVenueConfig(
+    name="SIM",
+    oms_type="NETTING",
+    account_type="MARGIN",
+    starting_balances=["100_000 USD"],
+    trade_execution=True,      # queue_position 的前提条件
+    queue_position=True,       # 启用队列位置追踪
+)
+```
+
+**示例场景：**
+
+1. 订单簿在 100.00 处显示 100 单位的买单。
+2. 你在 100.00 处挂 50 单位的买入限价单。前方队列量 = 100。
+3. 100.00 处发生 80 单位的 SELLER 成交 → 前方队列量 = 20。暂不成交。
+4. 100.00 处发生 30 单位的 SELLER 成交 → 队列清空，超出 10 单位。成交 = 10 单位。
+5. 下一笔 50 单位的 SELLER 成交 → 成交剩余 40 单位。
+
+**局限性：**
+
+- 仅适用于 `LIMIT` 订单。此实现不追踪止损限价单和限价触发单的队列。
+- 队列位置是每个订单独立的，不在同一价格的多个订单间共享。
+- 队列快照基于订单接受时的订单簿状态。
+- 带有 `NO_AGGRESSOR` 的成交会同时递减两侧的队列，可能导致订单比实际更早成交（对队列估计偏保守，但可防止滞留）。
+
+:::note
+队列位置追踪提供队列动态的启发式模拟。真实交易所的队列行为取决于很多因素（订单优先级规则、隐藏订单等），这些无法从历史数据中完美还原。
+:::
+
 ### 精度要求和不变量
 
 撮合引擎强制执行严格的精度不变量以确保整个成交管道中的数据完整性。
@@ -527,6 +649,24 @@ engine.add_venue(
 :::warning
 `Bar.volume` 必须以**基础货币单位**计量。某些数据提供商报告的是报价货币的成交量；
 加载前需转换为基础单位（除以价格或使用提供商特定的字段）。
+:::
+
+:::note `Bar.volume` 单位约定的根源
+
+此约定源于 NautilusTrader 的统一设计：平台将 K 线 `volume` 字段统一表示**基础资产的交易量**（"交易了多少个单位的标的资产"），与 `Quantity` 类型和金融工具规格保持一致。
+
+常见数据提供商的差异：
+- **Binance REST API**：`volume` 字段默认报告**基础资产数量**（如 BTC/USDT 对中返回 BTC 数量），另有 `quoteVolume` 字段表示报价货币金额。
+- **部分数据供应商**：直接提供以报价货币（如 USDT）计量的成交额，需要手动转换。
+
+**近似转换方法**（仅当无基础货币量字段时使用）：
+
+```python
+# 将报价货币成交额转换为基础货币成交量（使用收盘价近似）
+bar_volume_base = bar_volume_quote / bar_close_price
+```
+
+更准确的做法是优先使用数据提供商提供的专用基础货币成交量字段。
 :::
 
 :::tip
@@ -571,9 +711,26 @@ qty = instrument.make_qty(raw_qty)
 
 ### 成交模型 (Fill Model)
 
-`FillModel` 在回测期间以简单的概率方式帮助模拟订单队列位置和执行。
-它解决了一个根本性挑战：*即使拥有完美的历史市场数据，我们也无法完全模拟订单在实时环境中可能与其他
-市场参与者的交互方式*。
+`FillModel` 在回测期间模拟订单执行动态，解决了一个根本性挑战：*即使拥有完美的历史市场数据，我们也无法完全模拟订单在实时环境中可能与其他市场参与者的交互方式*。
+
+基础 `FillModel` 提供用于队列位置和滑点模拟的概率参数。
+子类可以重写 `get_orderbook_for_fill_simulation()` 方法，为更复杂的流动性建模生成合成订单簿。
+
+#### 可用成交模型
+
+| 模型                         | 描述                                               | 适用场景                              |
+|------------------------------|----------------------------------------------------|---------------------------------------|
+| `FillModel`                  | 带概率化成交/滑点参数的基础模型。                   | 简单队列位置和滑点模拟。              |
+| `BestPriceFillModel`         | 以最优价格成交，流动性无限。                         | 乐观地测试基本策略逻辑。              |
+| `OneTickSlippageFillModel`   | 对所有订单强制施加恰好 1 个 Tick 的滑点。            | 保守滑点测试。                        |
+| `TwoTierFillModel`           | 最优价格成交 10 张合约，其余差 1 个 Tick 成交。      | 基本市场深度模拟。                    |
+| `ThreeTierFillModel`         | 50/30/20 张合约分布在三个价格档位。                  | 更真实的深度模拟。                    |
+| `ProbabilisticFillModel`     | 50% 概率以最优价格成交，50% 概率差 1 个 Tick。       | 随机化执行质量。                      |
+| `SizeAwareFillModel`         | 根据订单大小（≤10 vs >10）采用不同执行方式。         | 与大小相关的市场冲击。                |
+| `LimitOrderPartialFillModel` | 每次触价最多成交 5 张合约。                          | 通过部分成交模拟队列位置。            |
+| `MarketHoursFillModel`       | 低流动性时段扩大价差。                               | 感知交易时段的执行模拟。              |
+| `VolumeSensitiveFillModel`   | 基于近期成交量决定流动性深度。                       | 成交量自适应深度。                    |
+| `CompetitionAwareFillModel`  | 仅可用可见流动性的一定比例。                         | 多参与者竞争场景。                    |
 
 `FillModel` 模拟了两个关键的交易方面，无论数据质量如何，这些都存在于真实市场中：
 
@@ -705,6 +862,59 @@ venue_config = BacktestVenueConfig(
 - 更复杂的队列位置建模。
 
 :::
+
+#### 订单簿仿真模型
+
+这些模型通过重写 `get_orderbook_for_fill_simulation()` 方法来生成表示预期市场流动性的合成订单簿。撮合引擎将针对此模拟订单簿执行订单成交。
+
+**工作原理：**
+
+1. 在处理成交前，撮合引擎调用 `get_orderbook_for_fill_simulation()`。
+2. 如果模型返回合成订单簿，则成交将针对该订单簿的流动性执行。
+3. 如果模型返回 `None`，则使用标准成交逻辑。
+
+:::note
+当自定义成交模型提供模拟订单簿时，`liquidity_consumption`（流动性消耗）追踪**不会**应用。
+自定义成交模型负责在返回的订单簿内管理其自身的流动性模拟。
+流动性消耗追踪仅影响内置成交逻辑（当 `get_orderbook_for_fill_simulation()` 返回 `None` 时）。
+:::
+
+**示例：ThreeTierFillModel**
+
+该模型创建一个流动性分布在三个价格档位的订单簿：
+
+- 最优价格处 50 张合约
+- 差 1 个 Tick 处 30 张合约
+- 差 2 个 Tick 处 20 张合约
+
+100 张合约的市价单将在每个档位逐级部分成交，呈现真实的价格冲击。
+
+**创建自定义成交模型：**
+
+```python
+from nautilus_trader.backtest.models import FillModel
+from nautilus_trader.model.book import OrderBook, BookOrder
+from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.core.rust.model import BookType
+
+class MyCustomFillModel(FillModel):
+    def get_orderbook_for_fill_simulation(
+        self,
+        instrument,
+        order,
+        best_bid,
+        best_ask,
+    ):
+        book = OrderBook(
+            instrument_id=instrument.id,
+            book_type=BookType.L2_MBP,
+        )
+
+        # 根据你的市场模型添加自定义流动性
+        # ...
+
+        return book
+```
 
 ## 账户类型
 

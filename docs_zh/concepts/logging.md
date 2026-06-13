@@ -3,6 +3,22 @@
 平台为回测 (backtesting) 和实盘交易 (live trading) 提供了日志功能，使用 Rust 实现的高性能日志子系统 (logging subsystem)，
 并基于 `log` crate 提供标准化的门面 (facade)。
 
+:::note
+**`log` crate 是什么？**
+
+`log` crate 是 Rust 生态的标准日志门面（facade），本身不做实际输出，只定义统一接口（`log::info!`、`log::warn!` 等宏）。类比 Java 的 SLF4J：
+
+```
+你的代码 / 第三方 Rust 库
+    ↓ 调用 log::info!("...")   ← 统一接口
+log crate（门面，只定义接口）
+    ↓ 转发
+NautilusTrader 日志子系统（实际实现，写到 stdout / 文件）
+```
+
+好处：NautilusTrader 依赖的所有第三方 Rust 库，只要使用 `log` crate 记录日志，就会自动汇入统一的日志系统，无需单独配置每个库。
+:::
+
 核心日志记录器 (logger) 运行在独立线程中，使用多生产者单消费者 (MPSC) 通道接收日志消息。
 这种设计确保主线程保持高性能 (performance)，避免日志字符串格式化或文件 I/O 操作造成潜在的瓶颈。
 
@@ -13,7 +29,79 @@
 
 :::info
 可以集成 [Vector](https://github.com/vectordotdev/vector) 等基础设施来收集和聚合系统中的事件。
+
+**与内部日志架构的关系**：两者是独立的两层，Vector 在进程外工作，与 NautilusTrader 内部的 `log` crate 门面和日志子系统无感知：
+
+```
+NautilusTrader 进程内
+  log crate（门面）→ 日志子系统（独立线程）→ stdout / 日志文件
+                                                      ↓
+                                          Vector（进程外）
+                                          读取文件或 stdout
+                                          → 转发到 ES / Loki / S3 等
+```
+
+- `log` crate + 日志子系统：解决**进程内**如何高性能写日志
+- Vector：解决日志落地后**跨机器收集、聚合、转发**到监控平台
+
+两者的唯一结合点是 stdout 或日志文件路径，替换内部实现不影响 Vector 配置，反之亦然。
 :::
+
+## 架构
+
+日志子系统从多个来源捕获事件，并通过 MPSC 通道路由到专用日志线程：
+
+```mermaid
+flowchart TB
+    subgraph Sources["日志来源"]
+        PY["Python 日志记录器"]
+        NAUT["Nautilus Rust 组件"]
+        LOG["外部 Rust 库<br/>（使用 log crate）<br/>rustls 等"]
+    end
+
+    subgraph Filtering["过滤"]
+        LF["log_level / log_level_file<br/>（LoggingConfig）"]
+    end
+
+    subgraph Logger["Nautilus 日志记录器"]
+        NL["Logger<br/>（实现 log::Log）"]
+    end
+
+    subgraph Channel["MPSC 通道"]
+        TX["发送端 (tx)"]
+        RX["接收端 (rx)"]
+    end
+
+    subgraph Thread["日志线程"]
+        LT["日志写入器"]
+    end
+
+    subgraph Output["输出"]
+        STDOUT["stdout/stderr"]
+        FILE["日志文件"]
+    end
+
+    PY --> NL
+    NAUT --> NL
+    LOG --> LF --> NL
+
+    NL --> TX --> RX --> LT
+    LT --> STDOUT
+    LT --> FILE
+
+    subgraph Tracing["Tracing 订阅者（可选）"]
+        TRACE["外部 Rust 库<br/>（使用 tracing crate）<br/>hyper_util、h2、tokio 等"]
+        EF["RUST_LOG<br/>（EnvFilter）"]
+        FMT["fmt::Layer"]
+    end
+
+    TRACE --> EF --> FMT --> STDOUT
+```
+
+- **Python 和 Nautilus 组件**：直接通过 Nautilus 日志记录器记录日志。
+- **外部 `log` crate 使用者**：由 `LoggingConfig` 中的 `log_level`/`log_level_file` 过滤。
+- **外部 `tracing` crate 使用者**：启用时，输出直接写入 stdout（与 Nautilus 日志分离），由 `RUST_LOG` 环境变量过滤。
+- **日志线程**：所有 Nautilus 日志事件通过 MPSC 通道发送到专用线程，确保主线程不被 I/O 操作阻塞。
 
 ## 配置
 
@@ -33,6 +121,17 @@
 
 :::tip
 你可以将 `TRACE` 设置为过滤级别来捕获 Rust 组件的跟踪日志，即使 Python 代码无法直接发出这些日志。
+:::
+
+:::note 为什么 Python 无法发出 TRACE 级别日志？
+
+TRACE 级别的限制来自以下原因：
+
+1. **Rust 零成本抽象**：Rust `log` crate 的 `log::trace!()` 宏可以在编译期被完全消除（当日志级别高于 TRACE 时），实现零运行时开销。Python 没有对等的编译期优化机制。
+2. **Python 日志接口设计**：Nautilus 的 Python `Logger` 绑定的最低级别从 `DEBUG` 开始，不暴露 `trace()` 方法。
+3. **语义差异**：TRACE 通常包含 Rust 内部状态的细粒度跟踪（如每次消息分发、缓存更新），这些细节在 Python 策略层面通常无意义。
+
+若需调试 Rust 组件的内部行为，将 `log_level` 设置为 `"TRACE"` 即可在日志输出中捕获这些消息——它们会与 Python 产生的 DEBUG/INFO 消息混合出现。
 :::
 
 更多详情请参阅 `LoggingConfig` [API 参考](../api_reference/config.md#class-loggingconfig)。
@@ -145,6 +244,55 @@ config_node = TradingNodeConfig(
 
 对于回测，可以使用 `BacktestEngineConfig` 类代替 `TradingNodeConfig`，因为两者提供相同的选项。
 
+### 环境变量配置
+
+`NAUTILUS_LOG` 环境变量提供了一种使用分号分隔的规范字符串来配置日志的替代方式。这对于仅 Rust 二进制文件或在不修改代码的情况下覆盖日志设置非常有用。
+
+```bash
+export NAUTILUS_LOG="stdout=Info;fileout=Debug;RiskEngine=Error;is_colored"
+```
+
+**支持的键：**
+
+| 键                    | 类型       | 描述                                               |
+|-----------------------|------------|----------------------------------------------------|
+| `stdout`              | 日志级别   | stdout 输出的最大级别。                             |
+| `fileout`             | 日志级别   | 文件输出的最大级别。                                |
+| `is_colored`          | 标志       | 启用 ANSI 颜色（默认：true）。                      |
+| `print_config`        | 标志       | 启动时将配置打印到 stdout。                         |
+| `log_components_only` | 标志       | 仅记录具有显式过滤器的组件。                        |
+| `<Component>`         | 日志级别   | 组件特定级别（精确匹配）。                          |
+| `<module::path>`      | 日志级别   | 模块特定级别（前缀匹配，仅 Rust）。                 |
+
+标志通过在规范字符串中出现即可启用（无需值）。日志级别大小写不敏感：`Off`、`Trace`、`Debug`、`Info`、`Warning`（或 `Warn`）、`Error`。
+
+:::note
+对于仅 Rust 二进制文件，设置 `NAUTILUS_LOG` 可在首次使用时启用日志子系统的延迟初始化，无需显式调用 `init_logging()`。
+:::
+
+### 模块路径过滤（仅 Rust）
+
+使用 `NAUTILUS_LOG` 环境变量时，除组件名称外，还可以按 Rust 模块路径进行过滤。包含 `::` 的键被视为使用前缀匹配的模块路径过滤器，不含 `::` 的键则是使用精确匹配的组件过滤器。
+
+```bash
+# 将所有适配器过滤为 Warn 级别，但允许 OKX 使用 Debug 级别
+export NAUTILUS_LOG="stdout=Info;nautilus_okx=Warn;nautilus_okx::websocket=Debug"
+```
+
+最长匹配前缀优先。在上面的示例中，`nautilus_okx::websocket::handler` 将使用 `Debug` 级别（更长的前缀），而 `nautilus_okx::data` 将使用 `Warn` 级别。
+
+:::tip
+Rust 日志宏在未提供显式组件时会自动捕获模块路径。这使模块级过滤能与标准日志调用无缝配合。
+:::
+
+:::note
+模块路径过滤仅通过 `NAUTILUS_LOG` 环境变量可用。Python 的 `log_component_levels` 配置仅使用组件名称匹配。
+:::
+
+:::warning
+如果 `log_components_only=True`（或规范字符串中存在 `log_components_only`）且 `log_component_levels` 为空，则不会向标准输出/标准错误或文件输出任何日志消息。请至少添加一个组件过滤器，或禁用仅组件日志。
+:::
+
 ### 仅组件日志
 
 当需要关注嘈杂系统中的某个子集时，启用 `log_components_only` 可以仅记录 `log_component_levels` 中明确列出的组件的消息。无论全局 `log_level` 或文件级别如何，其他所有组件都将被抑制。
@@ -167,10 +315,6 @@ logging = LoggingConfig(
 ```bash
 export NAUTILUS_LOG="stdout=Info;log_components_only;RiskEngine=Debug;Portfolio=Info"
 ```
-
-:::warning
-如果 `log_components_only=True`（或规范字符串中存在 `log_components_only`）且 `log_component_levels` 为空，则不会向标准输出/标准错误或文件输出任何日志消息。请至少添加一个组件过滤器，或禁用仅组件日志。
-:::
 
 ### 日志颜色
 
@@ -277,6 +421,77 @@ for i in range(number_of_backtests):
 - **每个进程多个 LogGuard**：系统支持每个进程最多 255 个并发 `LogGuard` 实例。每个守卫在创建时递增引用计数器，在释放时递减。
 - **线程安全**：日志子系统（包括 `LogGuard`）是线程安全的，确保即使在多线程环境中也能保持一致的行为。
 - **自动清理**：当最后一个 `LogGuard` 被释放（引用计数归零）时，日志线程被正确地 join，确保所有待处理的日志在进程终止前被写入。
+
+## 外部 Rust 库的 Tracing 订阅者
+
+使用 `tracing` crate 的外部 Rust 库可以通过启用 tracing 订阅者来显示其日志输出。
+这对于调试外部依赖项，或集成以独立 PyO3 扩展编译的自定义 Rust 组件（如特征提取器或适配器）时非常有用。
+
+### 启用订阅者
+
+在 `LoggingConfig` 中设置 `use_tracing=True` 以启用 tracing 订阅者：
+
+```python
+from nautilus_trader.config import LoggingConfig
+from nautilus_trader.config import TradingNodeConfig
+
+config_node = TradingNodeConfig(
+    trader_id="TESTER-001",
+    logging=LoggingConfig(
+        log_level="INFO",
+        use_tracing=True,
+    ),
+    ... # 省略
+)
+```
+
+或者，直接调用 `init_tracing()`：
+
+```python
+from nautilus_trader.core import nautilus_pyo3
+
+nautilus_pyo3.init_tracing()
+```
+
+### 使用 RUST_LOG 过滤
+
+`RUST_LOG` 环境变量控制哪些 tracing 事件会被显示：
+
+```bash
+# 显示自定义库的 debug 日志，hyper 只显示 warn 及以上
+RUST_LOG=my_feature_extractor=debug,hyper=warn python my_script.py
+```
+
+如果未设置 `RUST_LOG`，默认过滤级别为 `warn`。
+
+### 工作原理
+
+tracing 订阅者使用带有自定义格式化器的 `tracing-subscriber` fmt 层，直接输出到 stdout。
+这与 Nautilus 日志基础设施是分离的——tracing 输出采用与 Nautilus 对齐的格式，带有纳秒级时间戳。
+
+示例 tracing 输出：
+
+```
+2026-01-24T05:51:42.809619000Z [DEBUG] hyper_util::client::legacy::connect::http: connecting to 104.18.5.240:443
+2026-01-24T05:51:42.810543000Z [DEBUG] hyper_util::client::legacy::pool: pooling idle connection for ("https", api.example.com)
+```
+
+**与 Nautilus 日志的区别：**
+
+- Tracing 输出直接写入 stdout，而非通过 Nautilus 日志线程。
+- Tracing 事件不会写入 Nautilus 日志文件。
+- 过滤完全由 `RUST_LOG` 控制，与 `LoggingConfig` 无关。
+
+对于使用 `log` crate 的外部库（如 `rustls`），其事件通过 Nautilus 日志记录器传递，
+由 `LoggingConfig` 中的 `log_level`/`log_level_file` 过滤。
+
+:::tip
+`RUST_LOG` 仅影响使用 `tracing` 的 crate。对于使用 `log` 的 crate，通过 `LoggingConfig` 或 `NAUTILUS_LOG` 环境变量（如 `NAUTILUS_LOG=stdout=Debug`）配置详细程度。
+:::
+
+:::note
+tracing 订阅者每个进程只能初始化一次。在 `LoggingConfig` 中使用 `use_tracing=True` 时，后续内核创建会安全跳过重复初始化。已初始化后直接调用 `init_tracing()` 将引发错误。
+:::
 
 ## 平台特定注意事项
 

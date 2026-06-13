@@ -8,6 +8,26 @@
 - 发布/订阅 (Publish/Subscribe)
 - 请求/响应 (Request/Response)
 
+:::note
+**三种消息模式的区别**
+
+| | **点对点** | **发布/订阅** | **请求/响应** |
+|---|---|---|---|
+| 内部存储 | `endpoints: IndexMap<端点名, 处理器>` | `subscriptions` + `topics` 缓存 | `correlation_index: AHashMap<UUID4, 回调>` |
+| 接收者数量 | 一个（端点只能注册一个处理器） | 多个（所有匹配订阅者） | 一个（异步回调） |
+| 通配符支持 | 否 | 是（`*`、`?`） | 否 |
+| 是否阻塞 | 否（fire-and-forget） | 否 | 否（纯异步回调，非阻塞） |
+| 典型用途 | 发送命令（下单、取消订单） | 广播市场数据、事件 | 查询数据（如 `request_bars()`） |
+
+**请求/响应的真实流程**（源自 `crates/common/src/msgbus/`）：
+1. 请求方创建 UUID4 作为关联 ID，并注册回调函数（存入 `correlation_index`）
+2. 将请求发送到端点（走点对点），附带关联 ID
+3. 响应方处理完后调用 `send_response(correlation_id, response)`
+4. MessageBus 通过 UUID4 找到回调并触发
+
+> 请求/响应不是"同步等待"，而是**注册回调的异步模式**，与点对点的区别在于：点对点没有回调机制，响应方不需要回复。
+:::
+
 通过 `MessageBus` 交换的消息分为三类：
 
 - 数据 (Data)
@@ -247,6 +267,23 @@ def on_signal(self, signal):
 :::info
 Redis 目前支持所有可序列化的外部发布消息。
 最低支持的 Redis 版本为 6.2（[流 (streams)](https://redis.io/docs/latest/develop/data-types/streams/) 功能所需）。
+:::
+
+:::tip
+**将策略指标发送到 Telegram / Discord 等监控平台**
+
+外部发布目前仅内置 Redis 后端，不直接支持 Telegram/Discord。推荐通过 **Redis 中转**实现，无需修改 NautilusTrader 代码：
+
+```
+策略 → MessageBus → Redis Stream → 独立消费者进程 → Telegram / Discord Bot
+```
+
+实现步骤：
+1. 按正常方式配置 `MessageBusConfig`，启用 Redis 外部发布
+2. 在策略中通过 `publish_signal` 或 `msgbus.publish` 发布性能指标
+3. 编写独立消费者进程，从 Redis Stream 读取消息并转发到 Telegram/Discord
+
+这种方式将通知逻辑与策略逻辑完全解耦，符合职责分离原则。
 :::
 
 在底层，当配置了后端数据库（或任何其他兼容技术）时，所有外发消息首先被序列化，然后通过多生产者单消费者 (MPSC) 通道传输到一个独立线程（用 Rust 实现）。在该独立线程中，消息被写入其最终目的地，目前是 Redis 流。

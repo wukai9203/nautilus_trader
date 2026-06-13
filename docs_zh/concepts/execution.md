@@ -34,6 +34,28 @@ NautilusTrader 可以同时处理多个策略 (strategy) 和交易场所 (venue)
 
 `OrderEmulator` 和 `ExecAlgorithm` 组件在流程中是可选的，取决于各个订单的参数（如下所述）。
 
+:::note 何时跳过 OrderEmulator 和 ExecAlgorithm？
+
+执行流程的实际路径由每个订单的参数决定：
+
+| 组件 | 触发条件 | 跳过条件 |
+|------|---------|---------|
+| **OrderEmulator** | 订单的 `emulation_trigger` 设置为非 `NO_TRIGGER` 的值（如 `BID_ASK`、`LAST_PRICE`） | `emulation_trigger=NO_TRIGGER`（默认）或未指定 |
+| **ExecAlgorithm** | 订单指定了 `exec_algorithm_id`（如 TWAP 算法） | `exec_algorithm_id` 未指定 |
+
+**最常见路径**（无模拟、无执行算法）：
+
+`Strategy` -> `RiskEngine` -> `ExecutionEngine` -> `ExecutionClient`
+
+**带本地模拟（等待触发）路径**（例如模拟止损单）：
+
+`Strategy` -> `OrderEmulator`（持有，等待触发）-> `RiskEngine` -> `ExecutionEngine` -> `ExecutionClient`
+
+**带执行算法路径**（例如 TWAP 拆单）：
+
+`Strategy` -> `ExecAlgorithm`（接收主订单，派生子订单）-> `RiskEngine` -> `ExecutionEngine` -> `ExecutionClient`
+:::
+
 下图展示了 Nautilus 执行组件之间的消息流（命令和事件）。
 
 ```mermaid
@@ -81,6 +103,17 @@ OMS 配置示例：
 
 - 大多数加密货币交易所使用 `NETTING` OMS 类型，每个市场对应单一持仓。交易者可能希望为某个策略跟踪多个"虚拟"持仓。
 - 一些外汇 ECN 或经纪商使用 `HEDGING` OMS 类型，跟踪 `LONG` 和 `SHORT` 的多个持仓。交易者可能只关心每个货币对的净持仓。
+
+:::tip OMS 覆盖实战场景
+
+**场景 1：在 NETTING 交易所跟踪虚拟"多持仓"**
+
+Binance 现货等交易所原生仅支持每个品种的单一净额持仓。若你希望让两个策略分别独立管理同一品种（例如一个趋势跟随策略和一个均值回归策略），可以将策略的 `oms_type` 设为 `HEDGING`，交易所为 `NETTING`。Nautilus 会在本地维护两个"虚拟"持仓 ID，而在交易所层面仍然只有一个净额持仓。
+
+**场景 2：在 HEDGING 交易所统一管理净持仓**
+
+某些外汇 ECN 默认以 HEDGING 模式跟踪多方向持仓。若你只关心每个货币对的净敞口，可以将策略的 `oms_type` 设为 `NETTING`、交易所为 `HEDGING`。`ExecutionEngine` 会将所有成交聚合到单一持仓 ID，简化持仓跟踪。
+:::
 
 :::info
 Nautilus 尚不支持交易场所侧的对冲模式，例如 Binance 的 `BOTH` 与 `LONG/SHORT`（交易场所按方向净额计算）。建议将 Binance 账户配置保持为 `BOTH`，以便单一持仓进行净额计算。

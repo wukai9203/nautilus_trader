@@ -31,6 +31,27 @@ NautilusTrader 为多种订单类型和执行指令提供了统一的 API，但�
 而是记录一条清晰的解释性错误信息。
 :::
 
+:::tip 处理不支持的订单类型
+
+当订单包含交易场所不支持的类型或指令时，系统会生成 `OrderDenied` 事件（拒绝原因包含具体说明），而**不会**向交易场所发送该订单。在策略中处理此情况：
+
+```python
+from nautilus_trader.model.events import OrderDenied
+
+def on_order_denied(self, event: OrderDenied) -> None:
+    self.log.warning(
+        f"订单被拒绝: {event.client_order_id}, 原因: {event.reason}"
+    )
+    # 可回退到支持的替代订单类型（如改用 MARKET 代替 STOP_MARKET）
+```
+
+常见原因：
+- 交易场所不支持该订单类型（如不支持 `TRAILING_STOP_MARKET`）。
+- 不支持特定执行指令（如不支持 `post_only`）。
+
+若需要跨交易场所兼容性，考虑使用**订单模拟**（`emulation_trigger`），由 Nautilus 在本地模拟高级订单类型。
+:::
+
 ### 术语
 
 - 如果订单类型为 `MARKET`，或作为 *可成交* 订单执行（即消耗流动性），则该订单是**主动的 (aggressive)**。
@@ -43,6 +64,31 @@ NautilusTrader 为多种订单类型和执行指令提供了统一的 API，但�
   - `SUBMITTED`
   - `PENDING_UPDATE`
   - `PENDING_CANCEL`
+
+:::note 在途订单超时处理
+
+在实盘交易中，在途订单（`SUBMITTED`、`PENDING_UPDATE`、`PENDING_CANCEL`）表示已发送至交易场所但尚未收到确认。系统**不会自动超时取消**在途订单，因为该请求可能已在交易场所执行但确认延迟。
+
+`LiveExecutionEngine` 通过定期对账检测并解决此类差异（参见[持续对账](live.md#continuous-reconciliation)）。若需要在策略层主动处理超时，可使用定时器监控：
+
+```python
+from datetime import timedelta
+from nautilus_trader.model.identifiers import ClientOrderId
+
+def on_order_submitted(self, event) -> None:
+    # 设置 30 秒超时检查
+    self.clock.set_alert(
+        f"inflight_timeout_{event.client_order_id}",
+        self.clock.utc_now() + timedelta(seconds=30),
+    )
+
+def on_alert(self, event) -> None:
+    if event.name.startswith("inflight_timeout_"):
+        order_id = ClientOrderId(event.name.replace("inflight_timeout_", ""))
+        if self.cache.is_order_inflight(order_id):
+            self.query_order(order_id)  # 向交易场所查询最新状态
+```
+:::
 - 当订单处于以下（非终态）状态之一时，该订单是**开放的 (open)**：
   - `ACCEPTED`
   - `TRIGGERED`

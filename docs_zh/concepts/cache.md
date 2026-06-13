@@ -410,6 +410,28 @@ accounts = self.cache.accounts()               # 获取缓存中的所有账户
 
 在提供 `ts_now` 时使用交易时钟（例如 `self.clock.timestamp_ns()`）。仅在你打算同时从 Redis 或 PostgreSQL 中删除已持久化的记录时，才设置 `purge_from_database=True`。在实盘交易中，当执行引擎配置了清除间隔时，这些方法会自动运行；详见[内存管理](live.md#memory-management)中的调度器设置。
 
+:::note OCO 条件单的缓存清除逻辑
+
+当清除关联订单（OCO/OTO/OUO）时，`purge_closed_orders()` 的安全机制会保留整个条件单链，直到**所有关联订单均已关闭**。这防止了过早清除导致条件单链断裂的问题。
+
+**OCO 清除示例**：
+
+```python
+# 假设已创建括号订单：入场单 + 止盈 + 止损（OCO）
+# 后来止盈成交，止损被自动取消，入场单已成交
+
+# 所有关联订单均已关闭时，整个链会被一起清除
+self.cache.purge_closed_orders(
+    ts_now=self.clock.timestamp_ns(),
+    buffer_secs=60,  # 关闭后等待 60 秒再清除
+)
+
+# 如果 OCO 对中仍有一个订单处于开放状态，
+# 整个链中的所有订单（包括已关闭的）都不会被清除，
+# 直到所有子订单都关闭
+```
+:::
+
 #### 金融工具和货币
 
 ##### 金融工具
