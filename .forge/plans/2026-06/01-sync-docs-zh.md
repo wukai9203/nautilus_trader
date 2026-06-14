@@ -1,6 +1,6 @@
 # 01 - docs_zh 增量同步流程固化
 
-> **Status**: 🔲 Not started
+> **Status**: ⏳ In Progress
 > **Created**: 2026-06-14
 > **Project**: nautilus_trader (fork) — docs_zh 中文文档层
 > **For Claude**: Use `/forge:execute` to implement this plan.
@@ -111,9 +111,9 @@
 ## 进度追踪 (Progress)
 | Task | Status | Completed | Notes |
 |------|--------|-----------|-------|
-| 1 基础设施+状态 | 🔲 | | |
-| 2 detect | 🔲 | | |
-| 3 verify | 🔲 | | |
+| 1 基础设施+状态 | ✅ | 2026-06-14 | 2672c7e1d6；YAML→JSON 改进 |
+| 2 detect | ✅ | 2026-06-14 | 296218447d |
+| 3 verify | ✅ | 2026-06-14 | d0eccd9889 |
 | 4 structure-check+bump | 🔲 | | |
 | 5 slash command | 🔲 | | `.claude` 需 `git add -f` |
 | 6 close-out | 🔲 | | |
