@@ -2,49 +2,38 @@
 
 ## 简介
 
-NautilusTrader 是一个开源、高性能 (high-performance)、生产级的算法交易平台，
-为量化交易者 (quantitative traders) 提供使用事件驱动 (event-driven) 引擎 (engine) 在历史数据上回测 (backtest) 自动化交易策略 (strategy) 投资组合 (portfolio) 的能力，并且能够将相同的策略部署到实盘交易 (live trading) 中，无需更改代码。
+NautilusTrader 是一个开源、生产级、Rust 原生的引擎，面向多资产、多交易场所 (multi-venue) 的交易系统。
 
-该平台以 *AI 优先* 为理念，旨在在高性能且稳健的 Python 原生环境中开发和部署算法交易策略。这有助于解决保持 Python 研究/回测环境与生产实盘交易环境一致性的对等性挑战。
+该系统在单一的事件驱动 (event-driven) 架构中横跨研究、确定性模拟和实盘执行三个环节，其中 Python 充当策略逻辑、配置和编排的控制平面 (control plane)。
 
-NautilusTrader 的设计、架构 (architecture) 和实现理念将软件正确性和安全性置于最高优先级，旨在支持 Python 原生的、关键任务级的交易系统回测和实盘部署工作负载。
+这种分离既提供了编译型交易引擎的高性能与安全性，又保留了 Python 在系统组合和策略开发上的灵活性。交易系统也可以完全用 Rust 编写，以满足关键任务级的工作负载。
 
-该平台同时具备通用性和资产类别无关性 -- 任何 REST API 或 WebSocket 数据流都可以通过模块化的适配器 (adapter) 进行集成。它支持跨广泛资产类别和金融工具 (instrument) 类型的高频交易，包括外汇、股票、期货、期权、加密货币、DeFi 和博彩 -- 支持同时在多个交易场所 (venue) 上无缝运作。
+相同的执行语义和确定性时间模型在研究系统和实盘系统中保持一致运行。策略从研究环境部署到生产环境无需修改任何代码，从而实现研究到实盘的对等性 (research-to-live parity)，并减少通常会带来部署风险的差异。
+
+NautilusTrader 与资产类别无关。任何具备 REST API 或 WebSocket 数据流的交易场所都可以通过模块化的适配器 (adapter) 进行集成。当前的集成涵盖加密货币交易所（CEX 和 DEX）、传统市场（外汇、股票、期货、期权）以及博彩交易所。
 
 ## 特性
 
-- **快速**: 核心使用 Rust 编写，采用 [tokio](https://crates.io/crates/tokio) 实现异步网络通信。
-- **可靠**: Rust 驱动的类型安全和线程安全，可选 Redis 支持的状态持久化。
-- **可移植**: 操作系统无关，可在 Linux、macOS 和 Windows 上运行。支持 Docker 部署。
-- **灵活**: 模块化适配器意味着任何 REST API 或 WebSocket 数据流都可以集成。
-- **高级**: 有效期类型 `IOC`、`FOK`、`GTC`、`GTD`、`DAY`、`AT_THE_OPEN`、`AT_THE_CLOSE`，高级订单 (order) 类型和条件触发器。执行 (execution) 指令 `post-only`、`reduce-only` 和冰山订单。关联订单包括 `OCO`、`OUO`、`OTO`。
-- **可定制**: 添加用户自定义组件 (component)，或利用[缓存 (cache)](cache.md) 和[消息总线 (message bus)](message_bus.md) 从零构建完整系统。
-- **回测**: 使用历史报价 (quote) Tick、成交 (trade) Tick、K线 (Bar)、订单簿和自定义数据，支持多交易场所、多金融工具和多策略的纳秒级精度同步运行。
-- **实盘**: 回测和实盘部署之间使用完全相同的策略实现。
-- **多交易场所**: 多交易场所功能支持做市和统计套利策略。
-- **AI 训练**: 回测引擎速度足够快，可用于训练 AI 交易代理 (RL/ES)。
-
-![Nautilus](https://github.com/nautechsystems/nautilus_trader/blob/develop/assets/nautilus-art.png?raw=true "nautilus")
-> *nautilus - 源自古希腊语 'sailor'（水手）和 naus 'ship'（船）。*
->
-> *鹦鹉螺壳由模块化的腔室组成，其增长因子近似于对数螺旋。
-> 这个理念可以转化为设计和架构的美学。*
+- **快速**: Rust 核心，采用 [tokio](https://crates.io/crates/tokio) 实现异步网络通信。
+- **可靠**: 由 Rust 支撑的类型安全和线程安全，并可选 Redis 支持的状态持久化。
+- **可移植**: 可在 Linux、macOS 和 Windows 上运行。支持 Docker 部署。
+- **灵活**: 模块化适配器可集成任何 REST API 或 WebSocket 数据流。
+- **高级**: 有效期类型 (Time in force) `IOC`、`FOK`、`GTC`、`GTD`、`DAY`、`AT_THE_OPEN`、`AT_THE_CLOSE`，高级订单 (order) 类型和条件触发器。执行 (execution) 指令 `post-only`、`reduce-only` 和冰山订单。关联订单包括 `OCO`、`OUO`、`OTO`。
+- **可定制**: 用户自定义组件 (component)，或利用[缓存 (cache)](cache.md) 和[消息总线 (message bus)](message_bus.md) 从零组装完整系统。
+- **回测**: 使用历史报价 (quote) Tick、成交 (trade) Tick、K线 (Bar)、订单簿和自定义数据，支持多交易场所、多金融工具 (instrument) 和多策略的纳秒级精度同步运行。
+- **实盘**: 研究和实盘部署之间使用完全相同的策略实现。
+- **多交易场所**: 可同时在多个交易场所上运行做市和跨场所策略。
+- **AI 训练**: 引擎速度足够快，可用于训练 AI 交易代理 (RL/ES)。
 
 ## 为什么选择 NautilusTrader？
 
-- **高性能事件驱动 Python**: 原生二进制核心组件。
-- **回测与实盘交易的对等性**: 相同的策略代码。
-- **降低运营风险 (risk)**: 增强的风险管理功能、逻辑准确性和类型安全。
-- **高度可扩展**: 消息总线、自定义组件和 Actor、自定义数据、自定义适配器。
+交易策略研究通常在 Python 中使用向量化方法进行，而生产交易系统则使用编译型语言中的事件驱动架构单独构建。
 
-传统上，交易策略研究和回测可能使用 Python 的向量化方法进行，
-然后策略需要使用 C++、C#、Java 或其他静态类型语言以更加事件驱动的方式重新实现。
-原因在于向量化回测代码无法表达实时交易中细粒度的时间和事件依赖复杂性，
-而编译型语言由于其天然的更高性能和类型安全，已被证明更为适合。
+NautilusTrader 消除了这种分离。
 
-NautilusTrader 在这里的关键优势之一是，这个重新实现的步骤现在被规避了 -- 因为平台的关键核心组件全部使用 [Rust](https://www.rust-lang.org/) 或 [Cython](https://cython.org/) 编写。
-这意味着我们在使用正确的工具做正确的事，系统编程语言编译出高性能的二进制文件，
-CPython C 扩展模块则提供了 Python 原生环境，适合专业的量化交易者和交易公司使用。
+Rust 原生核心为研究和实盘执行同时提供了确定性的事件驱动运行时，而 Python 充当控制平面。相同的架构、执行语义和时间模型在两个环境中运行，使策略无需重新实现即可从研究环境迁移到生产环境。
+
+Python 绑定通过 [PyO3](https://pyo3.rs) 提供，并正在持续从 Cython 迁移。安装时无需 Rust 工具链。
 
 ## 使用场景
 
@@ -52,9 +41,9 @@ CPython C 扩展模块则提供了 Python 原生环境，适合专业的量化�
 
 - 在历史数据上回测交易系统（`backtest`）。
 - 使用实时数据和虚拟执行模拟交易系统（`sandbox`）。
-- 将交易系统部署到真实账户或模拟账户进行实盘交易（`live`）。
+- 将交易系统部署到真实账户或纸上交易账户进行实盘交易（`live`）。
 
-项目代码库提供了实现上述功能的软件层框架。你可以在相应命名的子包中找到默认的 `backtest` 和 `live` 系统实现。`sandbox` 环境可以使用 sandbox 适配器构建。
+项目代码库提供了实现上述功能的软件层框架。默认的 `backtest` 和 `live` 系统实现位于各自命名的子包中。`sandbox` 环境可以使用 sandbox 适配器构建。
 
 :::note
 
@@ -65,26 +54,26 @@ CPython C 扩展模块则提供了 Python 原生环境，适合专业的量化�
 
 ## 分布式
 
-该平台设计为易于集成到更大的分布式系统中。
-为此，几乎所有配置 (configuration) 和领域对象都可以使用 JSON、MessagePack 或 Apache Arrow (Feather) 进行序列化 (serialization)，以便通过网络通信。
+该平台可集成到更大的分布式系统中。
+几乎所有配置 (configuration) 和领域对象都可以使用 JSON、MessagePack 或 Apache Arrow (Feather) 进行序列化 (serialization)，以便通过网络通信。
 
 ## 公共核心
 
-公共系统核心被所有节点 (node) [环境上下文](/concepts/architecture.md#environment-contexts)（`backtest`、`sandbox` 和 `live`）所使用。
+公共系统核心被所有节点 (node) [环境上下文](architecture.md#environment-contexts)（`backtest`、`sandbox` 和 `live`）所使用。
 用户定义的 `Actor`、`Strategy` 和 `ExecAlgorithm` 组件在这些环境上下文中被一致地管理。
 
 ## 回测
 
-回测可以通过以下方式实现：首先将数据直接提供给 `BacktestEngine`，或通过更高层级的 `BacktestNode` 和 `ParquetDataCatalog` 提供数据，然后以纳秒级精度将数据通过系统运行。
+将数据直接提供给 `BacktestEngine`，或通过更高层级的 `BacktestNode` 和 `ParquetDataCatalog` 提供数据，然后以纳秒级精度将数据通过系统运行。
 
 ## 实盘交易
 
-`TradingNode` 可以从多个数据和执行客户端接收数据和事件，支持模拟/纸上交易账户和真实账户。通过在单个[事件循环](https://docs.python.org/3/library/asyncio-eventloop.html)上异步运行可以实现高性能，
-还可以利用 [uvloop](https://github.com/MagicStack/uvloop) 实现（适用于 Linux 和 macOS）进一步提升性能。
+`TradingNode` 从多个数据和执行客户端接收数据和事件，支持演示/纸上交易账户和真实账户。通过在单个[事件循环](https://docs.python.org/3/library/asyncio-eventloop.html)上异步运行可以实现高性能，
+还可以选择使用 [uvloop](https://github.com/MagicStack/uvloop) 实现（适用于 Linux 和 macOS）以获得额外的吞吐量。
 
 ## 领域模型
 
-该平台具有全面的交易领域模型，包括各种值类型（如 `Price` 和 `Quantity`），以及更复杂的实体（如 `Order` 和 `Position` 对象），这些对象用于聚合多个事件以确定状态。
+该平台具有一个交易领域模型，包括各种值类型（如 `Price` 和 `Quantity`），以及更复杂的实体（如 `Order` 和 `Position` 对象），这些对象用于聚合多个事件以确定状态。
 
 ## 时间戳
 
@@ -164,22 +153,8 @@ CPython C 扩展模块则提供了 Python 原生环境，适合专业的量化�
 - `VALUE_IMBALANCE`
 - `VALUE_RUNS`
 
-当前已实现的聚合方法：
-
-- `MILLISECOND`
-- `SECOND`
-- `MINUTE`
-- `HOUR`
-- `DAY`
-- `WEEK`
-- `MONTH`
-- `YEAR`
-- `TICK`
-- `VOLUME`
-- `VALUE`
-- `RENKO`
-
-上述列出但未在已实现列表中重复出现的聚合方法已计划但尚未可用。
+上述列出的所有聚合方法均已实现内部聚合。
+信息驱动的聚合方法需要 `TradeTick` 数据。
 
 :::note K 线聚合方法分类
 
@@ -190,13 +165,13 @@ NautilusTrader 支持的聚合方法可按触发维度分为四类：
 | **时间驱动** | `MILLISECOND`、`SECOND`、`MINUTE`、`HOUR`、`DAY`、`WEEK`、`MONTH`、`YEAR` | 固定时间间隔结束时触发 |
 | **成交量驱动** | `TICK`、`VOLUME`、`VALUE`（美元 K 线） | 累积到指定 Tick 数 / 成交量 / 成交金额时触发 |
 | **价格驱动** | `RENKO` | 价格移动指定幅度时触发（砖形图） |
-| **信息驱动（计划中）** | `TICK_IMBALANCE`、`TICK_RUNS`、`VOLUME_IMBALANCE`、`VOLUME_RUNS`、`VALUE_IMBALANCE`、`VALUE_RUNS` | 基于订单流不平衡程度触发 |
+| **信息驱动** | `TICK_IMBALANCE`、`TICK_RUNS`、`VOLUME_IMBALANCE`、`VOLUME_RUNS`、`VALUE_IMBALANCE`、`VALUE_RUNS` | 基于订单流不平衡程度触发 |
 
-信息驱动类型来自量化金融研究（微观结构分析），适合检测市场参与者的知情/非知情交易行为。这些方法已列在规格中但尚未实现，将在未来版本中逐步添加。
+信息驱动类型来自量化金融研究（微观结构分析），适合检测市场参与者的知情/非知情交易行为，需要 `TradeTick` 数据才能聚合。
 :::
 
 价格类型和 K线聚合可以通过 `BarSpecification` 以任意方式组合，步长 >= 1。
-这提供了最大的灵活性，现在允许为实盘交易聚合替代 K线。
+这允许为实盘交易聚合替代 K线。
 
 ## 账户类型
 

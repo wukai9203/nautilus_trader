@@ -1,6 +1,6 @@
 # 消息总线 (Message Bus)
 
-`MessageBus` 是平台的基础组件，通过消息传递 (message passing) 实现系统组件之间的通信。这种设计创建了一个松耦合的架构，使组件之间无需直接依赖即可进行交互。
+`MessageBus` 通过消息传递 (message passing) 实现系统组件之间的通信。这种设计创建了一个松耦合的架构，使组件之间无需直接依赖即可进行交互。
 
 *消息模式 (messaging patterns)* 包括：
 
@@ -34,13 +34,35 @@
 - 事件 (Events)
 - 命令 (Commands)
 
+## 主题层级 (Topic hierarchy)
+
+Nautilus 将市场数据主题保存在 `data` 根下。实时数据发布使用直接的 `data.<kind>...` 主题，例如 `data.book.deltas.XCME.ESZ24`。
+
+当被请求、回放或工作流生成的数据作为可按主题寻址的数据在消息总线上流动时，`DataEngine` 会将其发布在 `data.pipeline.<kind>...` 下。长请求、分组请求和聚合链可以在父请求完成之前对数据进行拆分、转换并重新汇聚。这些消息仍然是数据消息，但它们不主张与正常实时发布相同的实时排序和定时语义。例如，pipeline 路径上的盘口增量 (book deltas) 使用 `data.pipeline.book.deltas.XCME.ESZ24`。
+
+相关请求的响应通过以关联 ID (correlation ID) 为键的响应处理器进行投递。`data.response` 主题是响应发布的捕获通道，而非 pipeline 数据路径。
+
+## 消息完整性 (Message integrity)
+
+消息一旦创建，其字段就不得被修改。这包括容器字段，如 `params` 映射。组件可以读取消息并从中派生本地状态，但不得改写原始消息。
+
+不可变消息让每个消费者都看到相同的输入，保留消息发出时的真实情况，并消除一类共享状态竞争 (shared-state races)。回放、调试和审计都依赖于消息在分发后保持稳定。
+
+由此可得出三条所有权规则：
+
+- 调用方提供的请求选项保留在消息上。
+- 返回给调用方的响应元数据保留在响应上。
+- 组件工作流状态（有界日期范围、分组状态、回放游标、计数器、处理标志）保留在以消息或请求 ID 为键的、组件自有的上下文中。
+
+当组件需要派生消息时，它会用所需的值创建一条新消息，而不是改写原始消息。
+
 ## 数据和信号发布
 
 虽然 `MessageBus` 是一个较底层的组件，用户通常通过间接方式与之交互，`Actor` 和 `Strategy` 类提供了构建在其之上的便捷方法：
 
 ```python
 def publish_data(self, data_type: DataType, data: Data) -> None:
-def publish_signal(self, name: str, value, ts_event: int | None = None) -> None:
+def publish_signal(self, name: str, value, ts_event: int = 0) -> None:
 ```
 
 这些方法允许你高效地发布自定义数据和信号，无需直接使用 `MessageBus` 接口。
@@ -52,13 +74,12 @@ def publish_signal(self, name: str, value, ts_event: int | None = None) -> None:
 要直接发布自定义消息，你可以指定一个 `str` 类型的主题 (topic) 和任意 Python `object` 作为消息载荷，例如：
 
 ```python
-
 self.msgbus.publish("MyTopic", "MyMessage")
 ```
 
 ## 消息风格
 
-NautilusTrader 是一个**事件驱动 (event-driven)** 框架，组件之间通过发送和接收消息进行通信。理解不同的消息风格对于构建有效的交易系统至关重要。
+NautilusTrader 是一个**事件驱动 (event-driven)** 框架，组件之间通过发送和接收消息进行通信。理解不同的消息风格有助于构建交易系统。
 
 本指南介绍 NautilusTrader 中三种主要的消息模式：
 
@@ -68,7 +89,7 @@ NautilusTrader 是一个**事件驱动 (event-driven)** 框架，组件之间通
 | **基于 Actor - 发布/订阅数据**            | 结构化交易数据交换               | 交易指标、指示器、需要持久化的数据              |
 | **基于 Actor - 发布/订阅信号**            | 轻量级通知                       | 简单警报、标志、状态更新                        |
 
-每种方法服务于不同的目的，并提供独特的优势。本指南将帮助你在 NautilusTrader 应用中选择合适的消息模式。
+每种方法服务于不同的目的。本节将帮助你决定使用哪种模式。
 
 ### MessageBus 发布/订阅主题
 
@@ -132,7 +153,7 @@ def on_each_10th_bar(self, event: Each10thBarEvent):
 
 - **交换结构化交易数据**：如市场数据、指示器、自定义指标或期权希腊字母。
 - **正确的事件排序**：通过内置时间戳（`ts_event`、`ts_init`）实现，对回测准确性至关重要。
-- **数据持久化和序列化 (serialization)**：通过 `@customdataclass` 装饰器，与 NautilusTrader 的数据目录系统无缝集成。
+- **数据持久化和序列化 (serialization)**：通过 `@customdataclass` 装饰器，与 NautilusTrader 的数据目录系统集成。
 - **标准化的交易数据交换**：在系统组件之间进行。
 
 #### 注意事项
@@ -288,7 +309,7 @@ Redis 目前支持所有可序列化的外部发布消息。
 
 在底层，当配置了后端数据库（或任何其他兼容技术）时，所有外发消息首先被序列化，然后通过多生产者单消费者 (MPSC) 通道传输到一个独立线程（用 Rust 实现）。在该独立线程中，消息被写入其最终目的地，目前是 Redis 流。
 
-这种设计主要是出于性能考虑。通过将 I/O 操作卸载到独立线程，我们确保主线程保持畅通，不会被与数据库或客户端交互中可能耗时的操作所阻碍。
+将 I/O 卸载到独立线程使主线程保持畅通。
 
 ### 序列化
 
@@ -404,7 +425,6 @@ from nautilus_trader.model.data import TradeTick
 message_bus = MessageBusConfig(
     types_filter=[QuoteTick, TradeTick]
 )
-
 ```
 
 ### 流自动修剪
@@ -445,7 +465,10 @@ flowchart TB
 
 ```python
 message_bus=MessageBusConfig(
-    database=DatabaseConfig(timeout=2),
+    database=DatabaseConfig(
+        connection_timeout=2,
+        response_timeout=2,
+    ),
     use_trader_id=False,
     use_trader_prefix=False,
     use_instance_id=False,
@@ -464,7 +487,15 @@ data_engine=LiveDataEngineConfig(
     external_clients=[ClientId("BINANCE_EXT")],
 ),
 message_bus=MessageBusConfig(
-    database=DatabaseConfig(timeout=2),
+    database=DatabaseConfig(
+        connection_timeout=2,
+        response_timeout=2,
+    ),
     external_streams=["binance"],  # <---
 ),
 ```
+
+## 相关指南
+
+- [Actors](actors.md) - Actor 使用消息总线进行事件处理。
+- [架构](architecture.md) - 消息总线在系统架构中的角色。

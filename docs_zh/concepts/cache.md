@@ -1,9 +1,9 @@
 # 缓存 (Cache)
 
-`Cache` 是一个核心的内存数据库 (in-memory database)，自动存储和管理所有与交易相关的数据。
-可以将其视为交易系统的记忆——从市场数据到订单历史再到自定义计算，一切都存储在其中。
+`Cache` 是一个核心的内存数据库 (in-memory database)，存储和管理所有与交易相关的数据，
+从市场数据到订单历史，再到自定义计算。
 
-缓存具有以下几个关键用途：
+缓存具有以下多种用途：
 
 1. **存储市场数据**：
    - 存储近期的市场历史记录（例如订单簿 (order book)、报价 (quote)、成交 (trade)、K线 (bar)）。
@@ -24,17 +24,20 @@
 
 - 系统会在数据流转过程中自动将其添加到 `Cache`。
 - 在实盘 (live) 环境中，引擎异步地应用更新，因此在事件发生和其出现在 `Cache` 之间可能存在短暂延迟。
-- 所有数据在到达策略的回调函数之前都会先经过 `Cache`——参见下图：
+- 对于报价、成交和 K线，`DataEngine` 会在发布给订阅者之前先写入 `Cache`，因此当你的处理函数运行时，最新值已经可以在缓存中获取。订单簿增量 (delta) 和深度快照则直接发布，不经过缓存写入；订单簿状态通过 `BookUpdater` 订阅单独维护：
 
 ```mermaid
 flowchart LR
     data[Data]
     engine[DataEngine]
     cache[Cache]
-    callback["Strategy callback:<br/>on_data(...)"]
+    callback["Strategy callback:<br/>on_quote_tick(...)"]
 
     data --> engine --> cache --> callback
 ```
+
+完整的逐步追踪请参见
+[数据流：一个报价 Tick 的生命周期](architecture.md#data-flow-life-of-a-quote-tick)。
 
 ### 基本示例
 
@@ -108,6 +111,7 @@ cache_config = CacheConfig(
     encoding: str = "msgpack",               # 数据编码格式（'msgpack' 或 'json'）
     timestamps_as_iso8601: bool = False,     # 将时间戳存储为 ISO8601 字符串
     buffer_interval_ms: int | None = None,   # 批量操作的缓冲间隔
+    bulk_read_batch_size: int | None = None, # 批量读取的批次大小（例如 MGET）
     use_trader_prefix: bool = True,          # 在键中使用交易者前缀
     use_instance_id: bool = False,           # 在键中包含实例 ID
     flush_on_start: bool = False,            # 启动时清空数据库
@@ -142,7 +146,7 @@ cache_config = CacheConfig(
 
 在什么情况下使用持久化比较有用？
 
-- **长时间运行的系统**：如果你希望数据在系统重启、升级或意外故障后仍然保留，配置数据库有助于从上次中断处继续。
+- **长时间运行的系统**：如果你希望数据在系统重启、升级或意外故障后仍然保留，配置数据库有助于从上次中断处精确地继续。
 - **历史分析**：当你需要保存过去的交易数据以进行详细的事后分析或审计时。
 - **多节点或分布式部署**：如果多个服务或节点需要访问相同的状态，持久化存储有助于确保数据的共享和一致性。
 
@@ -151,10 +155,11 @@ from nautilus_trader.config import DatabaseConfig
 
 config = CacheConfig(
     database=DatabaseConfig(
-        type="redis",      # 数据库类型
-        host="localhost",  # 数据库主机
-        port=6379,         # 数据库端口
-        timeout=2,         # 连接超时（秒）
+        type="redis",            # 数据库类型
+        host="localhost",        # 数据库主机
+        port=6379,               # 数据库端口
+        connection_timeout=2,    # 连接超时（秒）
+        response_timeout=2,      # 响应超时（秒）
     ),
 )
 ```
@@ -307,10 +312,11 @@ orders_for_instrument = self.cache.orders(instrument_id=instrument_id)  # 特定
 
 ```python
 # 按当前状态获取订单
-open_orders = self.cache.orders_open()          # 当前在交易场所活跃的订单
-closed_orders = self.cache.orders_closed()      # 已完成生命周期的订单
-emulated_orders = self.cache.orders_emulated()  # 系统在本地模拟的订单
-inflight_orders = self.cache.orders_inflight()  # 已提交（或修改）到交易场所但尚未确认的订单
+open_orders = self.cache.orders_open()                       # 当前在交易场所活跃的订单
+closed_orders = self.cache.orders_closed()                   # 已完成生命周期的订单
+emulated_orders = self.cache.orders_emulated()               # 系统在本地模拟的订单
+inflight_orders = self.cache.orders_inflight()               # 已提交（或修改）到交易场所但尚未确认的订单
+local_active_orders = self.cache.orders_active_local()       # 仍由本地管理的订单（已初始化、已模拟或已释放）
 
 # 检查特定订单状态
 exists = self.cache.order_exists(client_order_id)            # 检查缓存中是否存在具有给定 ID 的订单
@@ -318,17 +324,19 @@ is_open = self.cache.is_order_open(client_order_id)          # 检查订单是�
 is_closed = self.cache.is_order_closed(client_order_id)      # 检查订单是否已关闭
 is_emulated = self.cache.is_order_emulated(client_order_id)  # 检查订单是否正在本地模拟
 is_inflight = self.cache.is_order_inflight(client_order_id)  # 检查订单是否已提交或修改但尚未确认
+is_active_local = self.cache.is_order_active_local(client_order_id)  # 检查订单是否仍由本地管理
 ```
 
 ##### 订单统计
 
 ```python
 # 获取不同状态的订单数量
-open_count = self.cache.orders_open_count()          # 未完成订单数量
-closed_count = self.cache.orders_closed_count()      # 已关闭订单数量
-emulated_count = self.cache.orders_emulated_count()  # 模拟订单数量
-inflight_count = self.cache.orders_inflight_count()  # 在途订单数量
-total_count = self.cache.orders_total_count()        # 系统中的订单总数
+open_count = self.cache.orders_open_count()                  # 未完成订单数量
+closed_count = self.cache.orders_closed_count()              # 已关闭订单数量
+emulated_count = self.cache.orders_emulated_count()          # 模拟订单数量
+inflight_count = self.cache.orders_inflight_count()          # 在途订单数量
+local_active_count = self.cache.orders_active_local_count()  # 本地活跃订单数量（已初始化、已模拟或已释放）
+total_count = self.cache.orders_total_count()                # 系统中的订单总数
 
 # 获取带筛选条件的订单数量
 buy_orders_count = self.cache.orders_open_count(side=OrderSide.BUY)  # 当前未完成的买入订单数量
@@ -390,25 +398,68 @@ instrument_positions_count = self.cache.positions_total_count(instrument_id=inst
 account = self.cache.account(account_id)       # 通过 ID 获取账户
 account = self.cache.account_for_venue(venue)  # 获取特定交易场所的账户
 account_id = self.cache.account_id(venue)      # 获取交易场所的账户 ID
-accounts = self.cache.accounts()               # 获取缓存中的所有账户
 ```
 
-#### 清除缓存状态
+#### 金融工具和货币
 
-缓存暴露了显式的维护钩子，用于移除已关闭或过期的对象，同时保留安全检查：
+##### 金融工具
 
-- `purge_closed_orders(ts_now, buffer_secs=0, purge_from_database=False)` 删除已不活跃至少 `buffer_secs` 秒的已关闭订单。关联的条件单 (contingency order) 会保留，直到所有依赖的子订单都已关闭。
-- `purge_closed_positions(ts_now, buffer_secs=0, purge_from_database=False)` 移除已超出缓冲窗口期的已平仓持仓，并删除关联的索引。
-- `purge_account_events(ts_now, lookback_secs=0, purge_from_database=False)` 修剪回溯窗口之外的账户事件历史，并可级联删除到后端数据库。
+```python
+# 获取金融工具信息
+instrument = self.cache.instrument(instrument_id) # 通过 ID 获取特定金融工具
+all_instruments = self.cache.instruments()        # 获取缓存中的所有金融工具
 
-关键安全机制：
+# 筛选金融工具
+venue_instruments = self.cache.instruments(venue=venue)              # 特定交易场所的金融工具
+instruments_by_underlying = self.cache.instruments(underlying="ES")  # 按标的资产筛选金融工具
 
-- 未完成订单和未平仓持仓永远不会被清除；缓存会记录警告并保持该项目不变。
-- 关联订单会将父订单保留在缓存中，直到所有子订单都已关闭，防止过早移除条件单链。
-- 索引和反向查找会与主对象一起清理，以避免悬空引用。
-- 只有当 `purge_from_database=True` 且已配置缓存数据库时，才会执行数据库删除，确保内存清除不会无声地擦除已持久化的数据。
+# 获取金融工具标识符
+instrument_ids = self.cache.instrument_ids()                   # 获取所有金融工具 ID
+venue_instrument_ids = self.cache.instrument_ids(venue=venue)  # 获取特定交易场所的金融工具 ID
+```
 
-在提供 `ts_now` 时使用交易时钟（例如 `self.clock.timestamp_ns()`）。仅在你打算同时从 Redis 或 PostgreSQL 中删除已持久化的记录时，才设置 `purge_from_database=True`。在实盘交易中，当执行引擎配置了清除间隔时，这些方法会自动运行；详见[内存管理](live.md#memory-management)中的调度器设置。
+### 清除缓存数据
+
+长时间运行的会话会累积已关闭的订单、已平仓的持仓、账户事件以及不再使用的金融工具。
+缓存提供了定向清除和批量清除方法，使策略和实盘交易引擎能够在不重启系统的情况下保持内存有界。
+
+#### 定向清除
+
+使用这些方法删除单个实体。每个方法在实体仍处于活跃状态时都会拒绝清除。
+
+- `cache.purge_order(client_order_id)`：移除该订单及每一个以订单为键的索引条目。
+  对未完成订单会跳过。
+- `cache.purge_position(position_id)`：移除该持仓、其快照以及以持仓为键的索引条目。
+  对未平仓持仓会跳过。
+- `cache.purge_instrument(instrument_id)`：移除该金融工具及每一个按金融工具维护的映射
+  （订单簿、报价、成交、标记/指数/资金费率价格、金融工具状态、希腊字母 (greeks)，以及
+  引用该金融工具的 K线）。只要存在任何关联订单处于非终态（任何尚未到达已关闭状态的订单，
+  包括已初始化、已提交、已接受、已模拟、已释放和在途订单）或任何关联持仓处于未平仓状态，
+  就会跳过。
+
+```python
+class HousekeepingStrategy(Strategy):
+    def on_start(self) -> None:
+        # 删除已不在监视列表中的金融工具。
+        for instrument_id in self.cache.instrument_ids(venue=self.venue):
+            if instrument_id not in self.watchlist:
+                self.cache.purge_instrument(instrument_id)
+```
+
+:::warning
+`purge_instrument` 适用于那些拥有自身生命周期逻辑、能够判断何时不再需要某个金融工具的
+Actor 和策略。清除其他组件仍依赖的金融工具会导致金融工具查找缺失并丢失市场数据历史。
+活跃的订阅归数据引擎管理，因此如果你不再需要更新，请在清除之前先取消订阅。
+:::
+
+#### 批量清除
+
+使用这些方法按时间清扫较旧的条目。它们接收当前时间戳以及一个以秒为单位的缓冲或回溯窗口。
+
+- `cache.purge_closed_orders(ts_now, buffer_secs)`：清除关闭时间戳早于 `buffer_secs` 的已关闭订单。
+- `cache.purge_closed_positions(ts_now, buffer_secs)`：清除关闭时间戳早于 `buffer_secs` 的已平仓持仓。
+- `cache.purge_account_events(ts_now, lookback_secs)`：清除早于 `lookback_secs` 的账户状态事件。
+  值为 `0` 时会清除所有事件。
 
 :::note OCO 条件单的缓存清除逻辑
 
@@ -432,30 +483,33 @@ self.cache.purge_closed_orders(
 ```
 :::
 
-#### 金融工具和货币
+#### 实盘交易中的自动清除
 
-##### 金融工具
-
-```python
-# 获取金融工具信息
-instrument = self.cache.instrument(instrument_id) # 通过 ID 获取特定金融工具
-all_instruments = self.cache.instruments()        # 获取缓存中的所有金融工具
-
-# 筛选金融工具
-venue_instruments = self.cache.instruments(venue=venue)              # 特定交易场所的金融工具
-instruments_by_underlying = self.cache.instruments(underlying="ES")  # 按标的资产筛选金融工具
-
-# 获取金融工具标识符
-instrument_ids = self.cache.instrument_ids()                   # 获取所有金融工具 ID
-venue_instrument_ids = self.cache.instrument_ids(venue=venue)  # 获取特定交易场所的金融工具 ID
-```
-
-##### 货币
+`LiveExecEngineConfig` 通过定时器调度批量清除。设置间隔以启用循环，设置缓冲或回溯窗口以控制
+保护多近期的条目不被清除。以下默认值适用于大多数实盘会话：
 
 ```python
-# 获取货币信息
-currency = self.cache.load_currency("USD")  # 加载 USD 的货币数据
+from nautilus_trader.config import LiveExecEngineConfig
+
+exec_engine = LiveExecEngineConfig(
+    purge_closed_orders_interval_mins=15,
+    purge_closed_orders_buffer_mins=60,
+    purge_closed_positions_interval_mins=15,
+    purge_closed_positions_buffer_mins=60,
+    purge_account_events_interval_mins=15,
+    purge_account_events_lookback_mins=60,
+)
 ```
+
+60 分钟的缓冲窗口在保留近期活动以供对账 (reconciliation) 的同时，仍能修剪长尾增长。
+对于高频交易 (HFT) 会话可调小这些值，如果你需要更长的历史回溯用于分析则可调大。
+完整的参数参考请参见
+[配置实盘交易：内存管理](../how_to/configure_live_trading.md)。
+
+:::note
+金融工具清除没有自动循环，因为何时删除某个金融工具的正确时机取决于策略状态而非时间长短。
+请从拥有该金融工具生命周期的 Actor 或策略中调用 `cache.purge_instrument`。
+:::
 
 ---
 
@@ -551,7 +605,6 @@ class MyStrategy(Strategy):
         # 这样，多个策略可以调用 self.cache.get("shared_strategy_info")
         # 来检索相同的数据
         self.cache.add("shared_strategy_info", pickle.dumps(shared_data))
-
 ```
 
 另一个策略可以按如下方式检索缓存的数据：
@@ -567,3 +620,9 @@ class AnotherStrategy(Strategy):
             shared_data = pickle.loads(data_bytes)
             self.log.info(f"Shared data retrieved: {shared_data}")
 ```
+
+## 相关指南
+
+- [数据 (Data)](data.md) - 缓存中存储的数据类型。
+- [策略 (Strategies)](strategies.md) - 策略访问缓存以获取市场数据和状态。
+- [报告 (Reports)](reports.md) - 从缓存数据生成报告。

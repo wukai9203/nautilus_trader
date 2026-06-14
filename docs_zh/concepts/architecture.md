@@ -1,4 +1,4 @@
-# 架构
+# 架构 (Architecture)
 
 本指南涵盖 NautilusTrader 的架构 (architecture) 原则与结构：
 
@@ -21,11 +21,11 @@ NautilusTrader 采用的主要架构技术和设计模式包括：
 - [端口与适配器 (adapter)](https://en.wikipedia.org/wiki/Hexagonal_architecture_(software))
 - [仅崩溃设计](#仅崩溃设计)
 
-这些技术被用于实现特定的架构质量属性。
+这些技术有助于实现特定的架构质量属性。
 
 ### 质量属性
 
-架构决策通常是在相互竞争的优先级之间进行权衡。以下列出了在做设计和架构决策时考虑的一些最重要的质量属性，大致按"权重"排序。
+架构决策通常是在相互竞争的优先级之间进行权衡。以下质量属性指导设计与架构决策，大致按权重排序。
 
 - 可靠性
 - 性能 (performance)
@@ -38,12 +38,12 @@ NautilusTrader 采用的主要架构技术和设计模式包括：
 
 NautilusTrader 正在逐步采用高保障思维：关键代码路径应携带可执行的不变量，以验证行为是否符合业务需求。实际上这意味着我们：
 
-- 识别故障影响范围最大的组件（核心领域 (domain) 类型、风险 (risk) 和执行 (execution) 流程），并用通俗语言记录其不变量。
+- 识别故障影响范围（blast radius）最大的组件（核心领域 (domain) 类型、风险 (risk) 和执行 (execution) 流程），并用通俗语言记录其不变量。
 - 将这些不变量编纂为可执行检查（单元测试、属性测试、模糊测试、静态断言），在 CI 中运行，保持反馈循环轻量。
 - 优先使用 Rust 内置的零成本安全技术（所有权、`Result` 表面、`panic = abort`），仅在确有价值时才添加有针对性的形式化工具。
 - 将"保障债务"与功能开发并行跟踪，使新集成扩展安全网而非绕过它。
 
-这种方法在保持平台交付节奏的同时，为关键任务流程提供了额外的审查力度。
+这种方法在保持平台交付节奏的同时，为关键任务流程提供了所需的额外审查力度。
 
 延伸阅读：[High Assurance Rust](https://highassurance.rs/)。
 
@@ -54,7 +54,7 @@ NautilusTrader 借鉴了[仅崩溃设计](https://en.wikipedia.org/wiki/Crash-on
 关键原则：
 
 - **统一恢复路径** - 启动和崩溃恢复共享同一代码路径，确保其经过充分测试。
-- **外部化状态** - 关键状态被持久化到外部（数据库、消息总线 (message bus)），因此崩溃不会丢失数据。
+- **外部化状态** - 关键状态在配置后被持久化到外部，从而降低数据丢失风险；持久性取决于后端存储。
 - **快速重启** - 系统被设计为在崩溃后能快速重启，最大限度减少停机时间。
 - **幂等操作** - 操作被设计为在重启后可安全重试。
 - **不可恢复错误快速失败** - 数据损坏或不变量违规会触发立即终止，而非试图在受损状态下继续运行。
@@ -68,7 +68,7 @@ NautilusTrader 借鉴了[仅崩溃设计](https://en.wikipedia.org/wiki/Crash-on
 **参考资料：**
 
 - [Crash-Only Software](https://www.usenix.org/conference/hotos-ix/crash-only-software) - Candea & Fox, HotOS 2003（原始研究论文）
-- [Microreboot—A Technique for Cheap Recovery](https://www.usenix.org/conference/osdi-04/microreboot—-technique-cheap-recovery) - Candea et al., OSDI 2004
+- [Microreboot: A technique for cheap recovery](https://www.usenix.org/events/osdi04/tech/candea.html) - Candea et al., OSDI 2004
 - [The properties of crash-only software](https://brooker.co.za/blog/2012/01/22/crash-only.html) - Marc Brooker 的博客
 - [Crash-only software: More than meets the eye](https://lwn.net/Articles/191059/) - LWN.net 文章
 - [Recovery-Oriented Computing (ROC) Project](http://roc.cs.berkeley.edu/) - UC Berkeley/Stanford 研究
@@ -95,12 +95,12 @@ NautilusTrader 在交易操作中优先考虑数据完整性而非可用性。�
 - 回测产生误导性的结果。
 - 静默的财务损失。
 
-通过在无效数据上立即崩溃，NautilusTrader 确保：
+通过在无效数据上立即崩溃，NautilusTrader 力求提供：
 
-1. **无静默损坏** - 无效数据永远不会在系统中传播。
+1. **无静默损坏** - 快速失败策略旨在防止无效数据传播；这依赖于覆盖输入的检查。
 2. **即时反馈** - 问题在开发和测试期间被发现，而非在生产环境中。
 3. **审计追踪** - 崩溃日志 (logging) 清楚地标识无效数据的来源。
-4. **确定性行为** - 相同的无效输入始终产生相同的失败。
+4. **确定性行为** - 在确定性排序和配置下，相同的无效输入应触发相同的失败；非确定性来源可能改变结果。
 
 #### 快速失败的适用场景
 
@@ -120,17 +120,17 @@ Result 或 Option 用于：
 #### 示例场景
 
 ```rust
-// 正确：溢出时 panic - 防止数据损坏
-let total_ns = timestamp1 + timestamp2; // 如果结果 > u64::MAX 则 panic
+// CORRECT: Panics on overflow - prevents data corruption
+let total_ns = timestamp1 + timestamp2; // Panics if result > u64::MAX
 
-// 正确：反序列化时拒绝 NaN
-let price = serde_json::from_str("NaN"); // 错误："must be finite"
+// CORRECT: Rejects NaN during deserialization
+let price = serde_json::from_str("NaN"); // Error: "must be finite"
 
-// 正确：需要时进行显式溢出处理
-let total_ns = timestamp1.checked_add(timestamp2)?; // 返回 Option<UnixNanos>
+// CORRECT: Explicit overflow handling when needed
+let total_ns = timestamp1.checked_add(timestamp2)?; // Returns Option<UnixNanos>
 ```
 
-此策略贯穿核心类型（`UnixNanos`、`Price`、`Quantity` 等），确保 NautilusTrader 在生产交易中保持最高标准的数据正确性。
+此策略贯穿核心类型（`UnixNanos`、`Price`、`Quantity` 等），帮助 NautilusTrader 在生产交易中保持强数据正确性。
 
 在生产部署中，系统通常在 release 构建中配置 `panic = abort`，确保任何 panic 都会导致干净的进程终止，由进程管理器或编排系统处理。这与[仅崩溃设计](#仅崩溃设计)原则一致，其中不可恢复错误导致立即重启，而非试图在潜在损坏的状态下继续运行。
 
@@ -142,11 +142,11 @@ NautilusTrader 代码库实际上既是一个用于组合交易系统的框架�
 
 ### 核心组件
 
-该平台围绕几个关键组件构建，它们协同工作以提供全面的交易系统：
+若干核心组件协同工作，组成交易系统：
 
 #### `NautilusKernel`
 
-负责中央编排的组件：
+负责中央编排的组件，其职责为：
 
 - 初始化和管理所有系统组件。
 - 配置消息基础设施。
@@ -192,7 +192,7 @@ NautilusTrader 代码库实际上既是一个用于组合交易系统的框架�
 
 #### `RiskEngine`
 
-提供全面的风险管理：
+提供风险管理：
 
 - 交易前风险检查和验证。
 - 持仓和敞口监控。
@@ -201,9 +201,9 @@ NautilusTrader 代码库实际上既是一个用于组合交易系统的框架�
 
 ### 环境上下文
 
-NautilusTrader 中的环境上下文定义了你正在使用的数据和交易场所的类型。理解这些上下文对于有效的回测、开发和实盘交易至关重要。
+NautilusTrader 中的环境上下文定义了你正在使用的数据和交易场所的类型。理解这些上下文对于回测、开发和实盘交易都很重要。
 
-以下是可用的环境：
+以下是可供使用的环境：
 
 - `Backtest`：历史数据与模拟交易场所。
 - `Sandbox`：实时数据与模拟交易场所。
@@ -217,25 +217,72 @@ NautilusTrader 中的环境上下文定义了你正在使用的数据和交易�
 
 ### 数据与执行流模式
 
-理解数据和执行如何在系统中流动，对于有效使用该平台至关重要：
+理解数据和执行如何在系统中流动，有助于你使用该平台。
 
-#### 数据流模式
+#### 数据流：一个 quote tick 的一生
 
-1. **外部数据摄取**：市场数据通过特定于交易场所的 `DataClient` 适配器进入并被标准化。
-2. **数据处理**：`DataEngine` 为内部组件处理数据。
-3. **缓存 (cache)**：处理后的数据存储在高性能 `Cache` 中以供快速访问。
-4. **事件发布**：数据事件被发布到 `MessageBus`。
-5. **消费者分发**：已订阅的组件（Actor、Strategy）接收相关数据事件。
+下面的追踪展示了 `QuoteTick` 从网络到你的策略所经历的每一步。成交（trade）和 K线（bar）遵循相同的"先缓存后发布"路径，只是处理器名称不同。订单簿增量（order book deltas）和深度快照（depth snapshots）走的是另一条路径（参见步骤下方的提示框）。
 
-#### 执行流模式
+```mermaid
+sequenceDiagram
+    participant Adapter as DataClient adapter
+    participant Channel as MPSC channel
+    participant DE as DataEngine
+    participant Cache as Cache
+    participant MB as MessageBus
+    participant Strategy as Strategy
 
-1. **命令生成**：用户策略 (strategy) 创建交易命令。
-2. **命令发布**：命令通过 `MessageBus` 发送。
-3. **风险验证**：`RiskEngine` 根据配置的风险规则验证交易命令。
-4. **执行路由**：`ExecutionEngine` 将命令路由到适当的交易场所。
-5. **外部提交**：`ExecutionClient` 向外部交易场所提交订单。
-6. **事件回流**：订单事件（成交、取消）通过系统回流。
-7. **状态更新**：投资组合 (portfolio) 和持仓状态根据执行事件进行更新。
+    Adapter->>Channel: DataEvent::Data(Data::Quote(quote))
+    Channel->>DE: process_data(Data::Quote)
+    DE->>DE: handle_quote(quote)
+    DE->>Cache: add_quote(quote)
+    DE->>MB: publish_quote(topic, quote)
+    MB->>Strategy: on_quote_tick(quote)
+```
+
+**逐步说明：**
+
+1. **适配器接收原始数据。** 特定于交易场所的 `DataClient`（例如 Binance、Bybit）接收 WebSocket 消息，对其解析，并构造一个 `QuoteTick`。
+2. **适配器发送数据事件。** 适配器通过 MPSC 通道发送 `DataEvent::Data(Data::Quote(quote))`。在实盘模式下这是一个异步无界通道；在回测中引擎直接馈送数据。
+3. **DataEngine 处理事件。** 通道接收方将事件路由到 `DataEngine::process_data`，后者再分派给 `handle_quote`。
+4. **Cache 存储 quote。** `handle_quote` 通过 `cache.add_quote(quote)` 将 quote 写入 `Cache`，使其可被任何组件通过 `self.cache.quote_tick(instrument_id)` 访问。
+5. **MessageBus 发布。** 引擎在一个由金融工具 ID 派生的 topic 上发布该 quote（例如 `data.quotes.BINANCE.BTCUSDT-PERP`）。`MessageBus` 找到所有订阅了该 topic 的处理器。
+6. **策略处理器触发。** 每个已订阅策略的 `on_quote_tick(quote)` 在单线程内核上运行。在处理器执行之前 quote 已经在缓存中，因此 `self.cache.quote_tick(instrument_id)` 返回的就是同一个 quote。
+
+:::tip
+对于报价、成交和 K线，"先缓存后发布"的顺序意味着你的策略处理器总能从缓存中读到最新值。订单簿增量和深度快照则是直接发布的；订单簿状态通过 `BookUpdater` 订阅单独维护。
+:::
+
+#### 执行流：一个订单的一生
+
+当策略提交订单时，它会经历验证、路由，再以执行事件的形式回流：
+
+```mermaid
+sequenceDiagram
+    participant Strategy as Strategy
+    participant RE as RiskEngine
+    participant EE as ExecutionEngine
+    participant EC as ExecutionClient
+    participant Venue as Venue
+
+    Strategy->>RE: submit_order(command)
+    RE->>RE: pre-trade risk checks
+    RE->>EE: route command
+    EE->>EC: submit_order
+    EC->>Venue: place order (REST/WS)
+    Venue-->>EC: OrderAccepted
+    EC->>EE: OrderAccepted event
+    EE->>Strategy: on_order_accepted(event)
+    Venue-->>EC: OrderFilled
+    EC->>EE: OrderFilled event
+    EE->>Strategy: on_order_filled(event)
+```
+
+1. **策略创建命令。** 策略调用 `self.submit_order(order)`。
+2. **RiskEngine 验证。** 运行交易前检查（持仓限额、名义金额限额、下单速率）。如果某项检查失败，策略会收到 `OrderDenied`，订单永远不会到达交易场所。
+3. **ExecutionEngine 路由。** 命令被路由到目标交易场所的 `ExecutionClient`。
+4. **ExecutionClient 提交。** 适配器通过 REST 或 WebSocket 将订单发送到交易场所。
+5. **事件回流。** 交易场所以确认和成交作出响应。每个事件（Accepted、Filled、Canceled、Rejected、Expired）通过 `ExecutionEngine` 回流，后者在 `Cache` 中更新订单状态，并将事件交付给策略的处理器。成交事件还会触发持仓和投资组合更新。
 
 #### 组件状态管理
 
@@ -401,7 +448,7 @@ classDiagram
 
 ### 消息传递
 
-为促进模块化和松耦合，一个极其高效的 `MessageBus` 在组件之间传递消息（数据、命令和事件）。
+为促进模块化和松耦合，一个高效的 `MessageBus` 在组件之间传递消息（数据、命令和事件）。
 
 #### 线程模型
 
@@ -412,7 +459,7 @@ classDiagram
 - 风险引擎 (engine) 检查和执行协调。
 - 缓存读写。
 
-这种单线程核心确保了确定性事件处理，并维护了回测与实盘的一致性 - 无论是针对历史数据还是实时市场运行，策略的行为都完全相同。组件以*类似于* [Actor 模型](https://en.wikipedia.org/wiki/Actor_model)的模式同步消费消息。
+这种单线程核心提供确定性事件排序，并有助于维护回测与实盘的一致性，尽管实盘输入和延迟仍可能导致行为差异。组件以*类似于* [Actor 模型](https://en.wikipedia.org/wiki/Actor_model)的模式同步消费消息。
 
 :::note
 值得关注的是 LMAX 交易所架构，它在单线程上实现了屡获殊荣的性能。你可以在 Martin Fowler 的[这篇有趣的文章](https://martinfowler.com/articles/lmax.html)中了解他们基于 *disruptor* 模式的架构。
@@ -442,7 +489,7 @@ Nautilus 的跨线程通信采用以下机制：
 
 ## 框架组织
 
-代码库按抽象层次进行组织，通常将内聚的概念分组到逻辑子包中。你可以从左侧导航菜单导航到每个子包的文档。
+代码库按抽象层次进行组织，将内聚的概念分组到逻辑子包中。你可以从左侧导航菜单导航到每个子包的文档。
 
 ### 核心 / 底层
 
@@ -487,7 +534,7 @@ flowchart TB
     subgraph trader["nautilus_trader<br/>Python / Cython"]
     end
 
-    subgraph core["nautilus_core<br/>Rust"]
+    subgraph core["crates<br/>Rust"]
     end
 
     trader -->|"C API"| core
@@ -580,9 +627,9 @@ Rust 和 Cython 都是构建依赖。构建产生的二进制 wheel 在运行时
 
 ### 类型安全
 
-平台的设计在最高层面优先考虑软件正确性和安全性。
+平台设计优先考虑软件正确性和安全性。
 
-`nautilus_core` 中的 Rust 代码库始终是类型安全和内存安全的，这由 `rustc` 编译器保证，因此是*构造即正确*的（除非显式标记为 `unsafe`，参见[开发者指南](../developer_guide/rust.md)的 Rust 部分）。
+`crates/` 下的 Rust 代码库依赖 `rustc` 编译器对安全代码的保证。任何 `unsafe` 块都是显式的退出点，我们必须自行维护所需的不变量（参见[开发者指南](../developer_guide/rust.md)的 Rust 部分）；整体内存和类型安全取决于这些不变量能否成立。
 
 Cython 在编译时和运行时都在 C 级别提供类型安全：
 
@@ -598,7 +645,7 @@ Cython 在编译时和运行时都在 C 级别提供类型安全：
 
 ### 错误与异常
 
-我们已尽一切努力准确记录 NautilusTrader 代码可能引发的异常及其触发条件。
+文档力求覆盖 NautilusTrader 代码可能引发的所有异常及其触发条件。
 
 :::warning
 Python 标准库或第三方库依赖可能会引发其他未记录的异常。
@@ -606,8 +653,8 @@ Python 标准库或第三方库依赖可能会引发其他未记录的异常。
 
 ### 进程与线程
 
-:::warning **每个进程一个节点**
-由于全局单例状态，不支持在同一进程中**并发**运行多个 `TradingNode` 或 `BacktestEngine` 实例：
+:::warning[每个进程一个节点]
+由于全局单例状态，不支持在同一进程中**并发**运行多个 `TradingNode` 或 `BacktestNode` 实例：
 
 - **回测强制停止标志** - `_FORCE_STOP` 全局标志在进程中所有引擎之间共享。
 - **日志模式和时间戳** - 日志子系统使用全局状态；回测在静态和实时模式之间切换。
@@ -618,3 +665,8 @@ Python 标准库或第三方库依赖可能会引发其他未记录的异常。
 对于生产部署，在一个进程的**单个 TradingNode** 中添加多个策略。
 对于并行执行或工作负载隔离，在各自独立的进程中运行每个节点。
 :::
+
+## 相关指南
+
+- [概览](overview.md) - NautilusTrader 的高层介绍。
+- [消息总线](message_bus.md) - 核心消息基础设施。

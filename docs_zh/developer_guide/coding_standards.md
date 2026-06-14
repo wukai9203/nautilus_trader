@@ -64,6 +64,10 @@
 
 2. **拼写**：使用 "hardcoded"（一个词）而非 "hard-coded" 或 "hard coded" -- 这是更现代和通用的拼写方式。
 
+3. **错误变量命名**：捕获的错误/异常使用单字母 `e`：
+   - Rust：使用 `Err(e)` 而非 `Err(err)` 或 `Err(error)`，闭包中使用 `|e|` 而非 `|err|`
+   - Python：使用 `except SomeError as e:` 而非 `as err:` 或 `as error:`
+
 ### 命名约定
 
 1. **内部字段**：私有/内部字段可以使用缩写（如 `_price_prec`、`_size_prec`）以保持热路径代码简洁。
@@ -117,7 +121,7 @@ uv pip install gitlint
 将 gitlint 启用为自动 commit-msg 钩子：
 
 ```bash
-pre-commit install --hook-type commit-msg
+prek install --hook-type commit-msg
 ```
 
 **手动使用**：检查最近一次提交消息：

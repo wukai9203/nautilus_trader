@@ -19,6 +19,10 @@
 - 对共享依赖使用工作区继承（workspace inheritance）（例如 `serde = { workspace = true }`）。
 - 仅对不属于工作区的 crate 特有依赖直接固定版本。
 - 将工作区提供的依赖分组放在 crate 专用依赖之前，以便继承关系易于审查。
+- 保持相关依赖对齐：`capnp`/`capnpc`（精确版本）、`arrow`/`parquet`（major.minor）、
+  `datafusion`/`object_store` 以及 `dydx-proto`/`prost`/`tonic`。pre-commit 会强制执行这一点。
+- 仅适配器使用的依赖应放在工作区 `Cargo.toml` 的 "Adapter dependencies" 部分。
+  pre-commit 会阻止核心 crate 使用它们。
 
 ## 特性标志约定
 
@@ -77,6 +81,32 @@ Python 扩展构建有意使用不同的特性（`extension-module` 是必需的
 
 添加新的构建目标或修改现有目标时，请与测试/代码检查组保持对齐，以维持快速增量构建。
 
+### 生成的 FFI 绑定与精度模式
+
+当启用 `ffi` 特性时，`nautilus-model` 构建脚本会重新生成 `nautilus_trader/core/includes/model.h` 和
+`nautilus_trader/core/rust/model.pxd`。这些文件编码了生成的 C/Cython 绑定是否使用高精度。
+已提交的生成文件使用高精度。使用 `ffi` 编译 `nautilus-model` 的本地 cargo 命令应当
+包含 `high-precision` 特性，或者避免重新生成这些文件。
+
+使用 `BASE_FEATURES` 的 make 目标（例如 `make build-debug-v2`）已经包含
+`high-precision`。漂移风险主要来自启用 `ffi` 但未使用对齐特性集的临时 cargo 命令。
+
+对于不包含完整对齐特性集的窄范围检查，可使用 Rust 特性。在命令中保留环境变量覆盖，
+以防陈旧的 shell 值强制使用标准精度绑定：
+
+```fish
+env HIGH_PRECISION=true cargo check -p nautilus-model --features ffi,python,high-precision
+```
+
+在提交 FFI 相关工作之前，验证这些生成文件没有发生漂移：
+
+```fish
+git diff -- nautilus_trader/core/includes/model.h nautilus_trader/core/rust/model.pxd
+```
+
+如果它们的更改仅仅是因为某个命令在未使用高精度的情况下运行，请使用 `HIGH_PRECISION=true`
+重新运行该 cargo 命令。不要手动编辑生成的文件。
+
 ## 模块组织
 
 - 保持模块专注于单一职责。
@@ -92,7 +122,7 @@ Python 扩展构建有意使用不同的特性（`extension-module` 是必需的
 
 ```rust
 // -------------------------------------------------------------------------------------------------
-//  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+//  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
 //  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
@@ -107,7 +137,7 @@ Python 扩展构建有意使用不同的特性（`extension-module` 是必需的
 // -------------------------------------------------------------------------------------------------
 ```
 
-:::info 自动化执行
+:::info[自动化执行]
 `check_copyright_year.sh` pre-commit 钩子会验证版权头是否包含当前年份。
 :::
 
@@ -159,18 +189,17 @@ pub fn process_symbol(symbol: Symbol) -> anyhow::Result<()> {
 }
 ```
 
-:::info 自动化执行
+:::info[自动化执行]
 `check_anyhow_usage.sh` pre-commit 钩子会自动执行这些 anyhow 约定。
 :::
 
 ### 日志记录
 
 - 完全限定日志宏以明确后端：
-  - 在同步核心 crate 中使用 `log::…`（`log::info!`、`log::warn!` 等）。
-  - 在异步运行时、适配器和外围组件中使用 `tracing::…`（`tracing::debug!`、`tracing::info!` 等）。
+  - 对所有 Rust 组件使用 `log::…`（`log::debug!`、`log::info!`、`log::warn!` 等）。
 - 消息以大写字母开头，优先使用完整句子，省略末尾句号（例如 `"Processing batch"`，而非 `"Processing batch."`）。
 
-:::info 自动化执行
+:::info[自动化执行]
 `check_logging_macro_usage.sh` pre-commit 钩子会强制使用完全限定的日志宏。
 :::
 
@@ -229,7 +258,7 @@ pub fn process_symbol(symbol: Symbol) -> anyhow::Result<()> {
    connect().context("BitMEX websocket did not become active")?;
    ```
 
-:::info 自动化执行
+:::info[自动化执行]
 `check_error_conventions.sh` 和 `check_anyhow_usage.sh` pre-commit 钩子会强制执行这些错误处理模式。
 :::
 
@@ -238,11 +267,62 @@ pub fn process_symbol(symbol: Symbol) -> anyhow::Result<()> {
 使用一致的 async/await 模式：
 
 1. **异步函数命名**：不需要特殊后缀；优先使用自然名称。
-2. **Tokio 用法**：使用 `tokio::spawn` 进行即发即忘的工作，并记录该后台任务预计何时完成。
+2. **Tokio 用法**：完全限定 tokio 类型（例如 `tokio::time::timeout`）。spawn 规则参见 [适配器运行时模式](#adapter-runtime-patterns)。
 3. **错误处理**：从异步函数返回 `anyhow::Result` 以与同步约定保持一致。
 4. **取消安全性（cancellation safety）**：说明函数是否是取消安全的，以及取消时哪些不变量仍然成立。
 5. **流处理**：使用 `tokio_stream`（或 `futures::Stream`）处理异步迭代器，以明确反压（back-pressure）。
 6. **超时模式**：使用超时（`tokio::time::timeout`）包装网络或长时间运行的 await，并传播或处理超时错误。
+
+### 适配器运行时模式
+
+适配器 crate（位于 `crates/adapters/` 下）由于 Python FFI 兼容性，在派生（spawn）异步任务时需要特殊处理：
+
+1. **使用 `get_runtime().spawn()` 而非 `tokio::spawn()`**：当从 Python 线程（它们没有 Tokio 上下文）调用时，`tokio::spawn()` 会 panic，因为它依赖线程本地存储。全局运行时模式提供了一个可从任何线程访问的显式引用。
+
+   ```rust
+   use nautilus_common::live::get_runtime;
+
+   // 正确 - 可从 Python 线程工作
+   get_runtime().spawn(async move {
+       // 异步工作
+   });
+
+   // 错误 - 从 Python 线程会 panic
+   tokio::spawn(async move {
+       // 异步工作
+   });
+   ```
+
+2. **使用更短的导入路径**：从 `live` 模块的重新导出处导入 `get_runtime`，而非完整路径：
+
+   ```rust
+   // 推荐 - 通过重新导出的更短路径
+   use nautilus_common::live::get_runtime;
+
+   // 避免 - 不必要的冗长
+   use nautilus_common::live::runtime::get_runtime;
+   ```
+
+3. **使用 `get_runtime().block_on()` 进行同步到异步的桥接**：当同步代码需要在适配器中调用异步函数时：
+
+   ```rust
+   fn sync_method(&self) -> anyhow::Result<()> {
+       get_runtime().block_on(self.async_implementation())
+   }
+   ```
+
+4. **在首次使用前安装自定义运行时**：拥有 `main()` 的 Rust 原生二进制文件可以在
+   `LiveNode::build()` 或任何适配器/客户端使用之前调用 `set_runtime()`。使用
+   `tokio::runtime::Builder::new_multi_thread().enable_all()` 构建自定义运行时；
+   当前线程（current-thread）运行时以及没有 I/O 或定时器驱动的运行时不满足适配器假设。
+   如果启用了 `python` 特性，请在构建运行时之前准备好 Python，或保留默认初始化器。
+
+5. **测试不受此约束**：使用 `#[tokio::test]` 的测试代码会创建自己的运行时上下文，因此
+   `tokio::spawn()` 可以正确工作。强制执行钩子会跳过测试文件和测试模块。
+
+:::info[自动化执行]
+`check_tokio_usage.sh` pre-commit 钩子会自动执行这些适配器运行时模式。
+:::
 
 ### 属性模式
 
@@ -254,6 +334,10 @@ pub fn process_symbol(symbol: Symbol) -> anyhow::Result<()> {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.model")
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct Symbol(Ustr);
 ```
@@ -281,7 +365,18 @@ pub struct Symbol(Ustr);
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.model")
+    pyo3::pyclass(
+        frozen,
+        eq,
+        eq_int,
+        module = "nautilus_trader.model",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
 )]
 pub enum AccountType {
     /// 仅包含无杠杆现金资产的账户。
@@ -291,49 +386,142 @@ pub enum AccountType {
 }
 ```
 
+### 类型桩注解
+
+Python 类型桩（`.pyi` 文件）使用
+[pyo3-stub-gen](https://github.com/Jij-Inc/pyo3-stub-gen) 从 Rust 源代码生成。每个
+暴露给 Python 的类型和函数都需要匹配的桩注解，以使生成的桩与绑定保持同步。
+
+**注解类型：**
+
+| PyO3 构造          | 桩注解                                            |
+| ----------------- | ------------------------------------------------ |
+| `#[pyclass]`      | `pyo3_stub_gen::derive::gen_stub_pyclass`        |
+| 枚举 `#[pyclass]` | `pyo3_stub_gen::derive::gen_stub_pyclass_enum`   |
+| `#[pymethods]`    | `pyo3_stub_gen::derive::gen_stub_pymethods`      |
+| `#[pyfunction]`   | `pyo3_stub_gen::derive::gen_stub_pyfunction`     |
+
+**放置规则：**
+
+- 在结构体和枚举上，使用 `#[cfg_attr(feature = "python", ...)]`，并将桩注解
+  放在 `pyo3::pyclass` 属性的正下方。
+- 在 `#[pymethods]` impl 块上，将 `#[pyo3_stub_gen::derive::gen_stub_pymethods]`
+  放在 `#[pymethods]` 的正下方。
+- 在函数上，将桩注解放在 `#[pyfunction]` 的正上方、所有文档注释之后。
+  使用完全限定路径而非导入它。
+
+```rust
+/// Converts a list of `Bar` into Arrow IPC bytes.
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.serialization")]
+#[pyfunction(name = "bars_to_arrow")]
+pub fn py_bars_to_arrow(data: Vec<Bar>) -> PyResult<Py<PyBytes>> {
+    // ...
+}
+```
+
+```rust
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl AccountState {
+    #[staticmethod]
+    #[pyo3(name = "from_dict")]
+    pub fn py_from_dict(values: &Bound<'_, PyDict>) -> PyResult<Self> {
+        // ...
+    }
+}
+```
+
+**Module 参数**：设置 `module = "nautilus_trader.<package>"` 以匹配导入该类型的
+Python 包。例如，model 类型使用 `nautilus_trader.model`，序列化函数使用
+`nautilus_trader.serialization`。
+
+**Cargo.toml**：将 `pyo3-stub-gen` 添加为可选依赖，并将其包含在 `python`
+特性列表中：
+
+```toml
+[features]
+python = ["pyo3", "pyo3-stub-gen"]
+
+[dependencies]
+pyo3-stub-gen = { workspace = true, optional = true }
+```
+
+**重新生成桩**：更改注解后运行 `make py-stubs-v2`（或 `python python/generate_stubs.py`）。
+后处理器会处理 `py_` 前缀剥离、`@property`/`@staticmethod`/`@classmethod` 装饰、
+关键字转义、去重以及 ruff 格式化。
+
 ### 构造函数模式
 
 一致地使用 `new()` vs `new_checked()` 约定：
 
 ```rust
-/// 创建一个带有正确性检查的新 [`Symbol`] 实例。
+/// Creates a new [`Symbol`] instance with correctness checking.
 ///
 /// # Errors
 ///
-/// 如果 `value` 不是有效字符串，则返回错误。
+/// Returns an error if `value` is not a valid string.
 ///
 /// # Notes
 ///
-/// PyO3 需要 `Result` 类型以在 Python 中正确处理错误和打印堆栈跟踪。
-pub fn new_checked<T: AsRef<str>>(value: T) -> anyhow::Result<Self> {
+/// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
+pub fn new_checked<T: AsRef<str>>(value: T) -> CorrectnessResult<Self> {
     // 实现
 }
 
-/// 创建一个新的 [`Symbol`] 实例。
+/// Creates a new [`Symbol`] instance.
 ///
 /// # Panics
 ///
-/// 如果 `value` 不是有效字符串，则 panic。
+/// Panics if `value` is not a valid string.
 pub fn new<T: AsRef<str>>(value: T) -> Self {
-    Self::new_checked(value).expect(FAILED)
+    Self::new_checked(value).expect_display(FAILED)
 }
 ```
 
-始终对与正确性检查相关的 `.expect()` 消息使用 `FAILED` 常量：
+始终对 `CorrectnessResult` 上的 `.expect_display()` 消息使用 `FAILED` 常量，
+并导入提供它的 trait：
 
 ```rust
-use nautilus_core::correctness::FAILED;
+use nautilus_core::correctness::{CorrectnessResult, CorrectnessResultExt, FAILED};
 ```
+
+### 类型转换模式
+
+对于从字符串解析的类型，同时提供可能失败和不可能失败的转换：
+
+1. **`FromStr`**：通过 `.parse()` 或 `from_str()` 进行可能失败的解析。返回 `Result`。
+
+2. **`From<T: AsRef<str>>`**：符合人体工程学的不可能失败的转换，直接接受 `&str`、`String`、`Cow<str>` 等，无需 `.as_str()`。
+
+```rust
+impl FromStr for Symbol {
+    type Err = SymbolParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // 解析逻辑
+    }
+}
+
+impl<T: AsRef<str>> From<T> for Symbol {
+    fn from(value: T) -> Self {
+        Self::from_str(value.as_ref()).expect(FAILED)
+    }
+}
+```
+
+**设计说明**：`From` 实现在输入无效时可能 panic。这是为了 API 人体工程学而有意为之。需要错误处理时使用 `FromStr` / `.parse()`。`From` 实现为已知输入有效的场景提供便利。
+
+**约束**：此模式不能用于自身实现 `AsRef<str>` 的类型（例如字符串包装类型），因为它会与一揽子实现 `impl<T> From<T> for T` 冲突。对于此类类型，应改为分别提供 `From<&str>` 和 `From<String>` 实现。
 
 ### 常量和命名约定
 
 常量使用 SCREAMING_SNAKE_CASE 并配以描述性名称：
 
 ```rust
-/// 一秒中的纳秒数。
+/// Number of nanoseconds in one second.
 pub const NANOSECONDS_IN_SECOND: u64 = 1_000_000_000;
 
-/// 1 分钟最后价格 K 线的规格。
+/// Bar specification for 1-minute last price bars.
 pub const BAR_SPEC_1_MINUTE_LAST: BarSpecification = BarSpecification {
     step: NonZero::new(1).unwrap(),
     aggregation: BarAggregation::Minute,
@@ -343,17 +531,58 @@ pub const BAR_SPEC_1_MINUTE_LAST: BarSpecification = BarSpecification {
 
 ### 哈希集合
 
-在性能关键的热路径（hot path）中使用 `ahash` crate 的 `AHashMap` 和 `AHashSet`。
-对于非性能关键的代码，优先使用标准 `HashMap`/`HashSet` 以保持简洁：
+三个考量驱动哈希集合的选择：
+
+- **迭代顺序确定性**（主要筛选条件）
+- **性能**
+- **线程安全性**
+
+先回答确定性问题，然后从剩余选项中基于性能进行选择。
+
+#### 迭代顺序确定性
+
+`AHash` 在每个进程中随机化其哈希器，因此 `AHashMap` / `AHashSet`
+的迭代顺序在不同运行之间会有所不同。当某个集合的迭代顺序在确定性
+仿真测试（deterministic simulation testing，DST）路径上馈入可观测状态
+（消息总线上发出的事件、公共方法返回的有序 `Vec`、有种子的 RNG 被消耗的
+顺序、下游效应触发的顺序）时，请改用 `indexmap` crate 中的 `IndexMap` /
+`IndexSet`。它们保留插入顺序，并且是 `AHash*` 集合的直接替换。
 
 ```rust
-// 热路径 - 使用 AHashMap/AHashSet
+use indexmap::{IndexMap, IndexSet};
+
+// 按插入顺序迭代；跨运行确定性
+let mut commissions: IndexMap<Currency, Money> = IndexMap::new();
+let mut subscribed: IndexSet<InstrumentId> = IndexSet::new();
+```
+
+pre-commit 钩子 `check-dst-conventions` 在 `crates/live/src/manager.rs` 和
+`crates/execution/src/matching_engine/engine.rs` 中强制使用 `IndexMap` /
+`IndexSet`，因为这两个文件经审计被认定对成交排序和对账（reconciliation）
+具有承重作用。其他调用点会逐个审查；已关闭的调用点和剩余允许的模式
+列在 [../concepts/dst.md](../concepts/dst.md) 的 "Implementation notes" 下。
+
+当集合是**仅查找**的（没有 `.iter()`、`.values()`、`.keys()`、
+`.into_iter()`、`.drain()` 或 `for x in map { ... }`）时，迭代顺序无关紧要，
+基于性能考量 `AHashMap` / `AHashSet` 是正确的选择。边界情况
+（例如克隆映射并让调用者迭代的公共 getter）应对照清单的分类规则进行审查。
+
+#### 性能
+
+对于迭代顺序不馈入可观测状态的查找密集型热路径，优先使用 `AHashMap` / `AHashSet`
+而非标准库：
+
+```rust
 use ahash::{AHashMap, AHashSet};
 
 let mut symbols: AHashSet<Symbol> = AHashSet::new();
 let mut prices: AHashMap<InstrumentId, Price> = AHashMap::new();
+```
 
-// 非热路径 - 标准库 HashMap/HashSet
+对于非性能关键、非迭代敏感的场景（工厂注册表、配置映射、测试夹具），
+标准 `HashMap` / `HashSet` 是可接受的，并且因其简洁性而常常更受青睐：
+
+```rust
 use std::collections::{HashMap, HashSet};
 
 let mut symbols: HashSet<Symbol> = HashSet::new();
@@ -372,6 +601,55 @@ let mut prices: HashMap<InstrumentId, Price> = HashMap::new();
 - **需要加密安全性**：当哈希洪泛攻击是隐患时（例如处理网络协议中的不可信用户输入），使用标准 `HashMap`。
 - **网络客户端**：对于面向网络的组件，优先使用标准 `HashMap`，因为安全考虑优先于性能收益。
 - **外部库边界**：与期望标准 `HashMap` 的外部库交互时使用它（例如 Arrow 序列化元数据）。
+
+#### AHashMap vs IndexMap 微基准测试
+
+下面的数字来自 `crates/core/benches/hash_map.rs`（release
+配置文件）。时间为每次操作的耗时；比率是 `IndexMap` 相对于
+`AHashMap` 的比值（低于 1.0 的值有利于 `IndexMap`）。
+
+| 模式                  | 大小 | AHashMap | IndexMap | 比率  |
+|-----------------------|-----:|---------:|---------:|------:|
+| Insert（构建映射）    |    4 |  40.8 ns |  49.8 ns | 1.22x |
+| Insert（构建映射）    |   32 | 192.4 ns | 348.2 ns | 1.81x |
+| Insert（构建映射）    |  256 |  1.01 us |  2.74 us | 2.72x |
+| Lookup（随机 get）    |    4 |  2.56 ns |  9.36 ns | 3.66x |
+| Lookup（随机 get）    |   32 |  2.49 ns |  7.95 ns | 3.19x |
+| Lookup（随机 get）    |  256 |  3.00 ns |  9.48 ns | 3.16x |
+| `.values().collect()` |    4 |  8.08 ns |  6.61 ns | 0.82x |
+| `.values().collect()` |   32 |  22.8 ns |  14.8 ns | 0.65x |
+| `.values().collect()` |  256 |   145 ns |   109 ns | 0.75x |
+| `.keys().collect()`   |    4 |  7.90 ns |  6.24 ns | 0.79x |
+| `.keys().collect()`   |   32 |  23.0 ns |  12.6 ns | 0.55x |
+| `.keys().collect()`   |  256 |   145 ns |   101 ns | 0.70x |
+| Clone                 |    4 |  8.48 ns |  17.8 ns | 2.10x |
+| Clone                 |   32 |  25.3 ns |  62.5 ns | 2.47x |
+| Clone                 |  256 |  71.0 ns |   247 ns | 3.48x |
+| Entry accumulate      |    4 |   122 ns |   159 ns | 1.30x |
+| Entry accumulate      |   32 |   439 ns |  1.10 us | 2.51x |
+| Entry accumulate      |  256 |  2.21 us |  7.83 us | 3.54x |
+
+对于单键移除，`IndexMap` 提供两个方法：`shift_remove`
+以 `O(n)` 成本保留插入顺序；`swap_remove` 是 `O(1)`，但
+会将最后一个条目交换到被移除的槽位，从而破坏迭代顺序。
+
+| 模式       | 大小 | AHashMap.remove | IndexMap.shift_remove | IndexMap.swap_remove |
+|------------|-----:|----------------:|----------------------:|---------------------:|
+| Remove one |    4 |         9.89 ns |               37.8 ns |              37.1 ns |
+| Remove one |   32 |         62.0 ns |                117 ns |              53.4 ns |
+| Remove one |  256 |         70.3 ns |                355 ns |               269 ns |
+
+如何阅读此表：
+
+- `AHashMap` 在纯查找上大约快 3 倍。在迭代顺序不流入可观测状态的热查找
+  路径上保留 `AHashMap`。
+- `IndexMap` 在 `.values().collect()` 和 `.keys().collect()` 上快 25% 到
+  45%。在迭代驱动可观测状态的地方，切换到 `IndexMap` 既是确定性的胜利，
+  也是一个小的性能胜利。
+- `IndexMap` 在 insert、clone 和 entry-modify-or-insert 上慢 1.3 到 3.5 倍。
+  在构建密集或每次成交累积的路径上保留 `AHashMap`。
+- 当移除后迭代顺序无关紧要时，优先使用 `swap_remove` 而非 `shift_remove`；
+  它与 `AHashMap` 移除保持竞争力。
 
 ### 线程安全哈希映射模式
 
@@ -440,23 +718,74 @@ cache.insert(other_key, other_value);  // 数据竞争
 
 **决策树：**
 
-- 构建后不可变 -> 使用 `Arc<AHashMap<K, V>>`
-- 需要并发访问 -> 使用 `Arc<DashMap<K, V>>`
-- 单线程访问 -> 使用普通的 `AHashMap<K, V>`
+1. 迭代顺序在 DST 路径上可观测？使用 `IndexMap<K, V>` / `IndexSet<T>`
+2. 否则，按访问模式：
+   - 构建后不可变：使用 `Arc<AHashMap<K, V>>`
+   - 需要并发访问：使用 `Arc<DashMap<K, V>>`
+   - 单线程访问：使用普通的 `AHashMap<K, V>`
+
+### 共享可变性存储
+
+从 Cython 移植的代码经常在修改容器中的值之前将其克隆出来。
+这种模式会产生静默陈旧（silent staleness）：本地克隆在另一个代码路径对
+规范条目应用事件的那一刻就与之产生分歧。
+
+仅当以下三个条件全部成立时，才使用 `Rc<RefCell<T>>`（单线程）或
+`Arc<RwLock<T>>`（多线程）存储：
+
+- 值在插入后会被修改。
+- 多个持有者需要观察彼此的写入。
+- 句柄必须比容器的借用作用域存活得更久。
+
+`Cache` 中的订单在内部使用这种形态进行每键借用跟踪。存储为
+`AHashMap<ClientOrderId, SharedCell<OrderAny>>`；智能指针泄漏保持
+在内部。公共访问器返回隐藏它的作用域 newtype：`Cache::order`
+返回 `OrderRef<'_>`（读借用），`Cache::order_mut` 返回 `OrderRefMut<'_>`
+（独占写借用，需要 `&mut Cache`），而 `Cache::order_owned` 在值必须
+跨越边界时返回一个拥有所有权的 `OrderAny` 快照。引擎在分发事件前
+丢弃借用，并在事件后重新读取缓存以获取事件后状态，这使得分发
+保持为干净的事务边界。
+
+`Cache::order_mut` 接受 `&mut Cache`，这意味着接收 `CacheView`
+（仅暴露不可变缓存借用）的策略和适配器无法触及它。订单修改
+保留给直接持有缓存的数据引擎和执行引擎；类型系统强制执行该契约。
+
+否则，优先使用更简单的形态：
+
+- 读为主且只设置一次：`Rc<T>` 或 `Arc<T>`（无内部可变性）。
+- 拥有所有权的快照对调用者足够：存储 `T`，读取时克隆。
+- 单一所有者，无修改：普通字段。
+
+采用 `Rc<RefCell<T>>` 之前值得权衡的成本：
+
+- 每次访问都要支付运行时借用检查。
+- 智能指针类型在写边界处泄漏。
+- 误用会在运行时 panic 而非编译失败。
+- `Rc<RefCell<T>>` 是 `!Send` 的；跨线程存储需要 `Arc<RwLock<T>>`
+  （或读取罕见时使用 `Arc<Mutex<T>>`）。
+
+**决策树：**
+
+1. 可变、多观察者，且句柄比容器借用存活得更久？
+   - 单线程：`Rc<RefCell<T>>`。
+   - 多线程：`Arc<RwLock<T>>`（或读取罕见时使用 `Arc<Mutex<T>>`）。
+2. 读为主且只设置一次：`Rc<T>` 或 `Arc<T>`。
+3. 拥有所有权的快照即可：存储 `T`，读取时克隆。
+4. 单一所有者，无修改：普通字段。
 
 ### 重新导出模式
 
 按字母顺序组织重新导出，并将其放在 lib.rs 文件末尾：
 
 ```rust
-// 重新导出
+// Re-exports
 pub use crate::{
     nanos::UnixNanos,
     time::AtomicTime,
     uuid::UUID4,
 };
 
-// 模块级重新导出
+// Module-level re-exports
 pub use crate::identifiers::{
     account_id::AccountId,
     actor_id::ActorId,
@@ -467,6 +796,18 @@ pub use crate::identifiers::{
 ### 文档标准
 
 所有文档注释使用第三人称陈述语气（例如 "Returns the account ID" 而非 "Return the account ID"）。
+
+#### 章节标题大小写
+
+Rustdoc 章节标题使用 Title Case，与 Rust 标准库约定保持一致：
+
+- `# Examples`
+- `# Errors`
+- `# Panics`
+- `# Safety`
+- `# Notes`
+- `# Thread Safety`
+- `# Feature Flags`
 
 #### 模块级文档
 
@@ -587,7 +928,7 @@ pub fn calculate_unrealized_pnl(&self, market_price: Price) -> anyhow::Result<Mo
 ///
 /// The caller must ensure that all input parameters are valid and properly initialized.
 pub unsafe fn from_raw_parts(ptr: *const u8, len: usize) -> Self {
-    // SAFETY: 调用者保证 ptr 有效且 len 正确
+    // SAFETY: Caller guarantees ptr is valid and len is correct
     Self {
         data: std::slice::from_raw_parts(ptr, len),
     }
@@ -599,9 +940,9 @@ pub unsafe fn from_raw_parts(ptr: *const u8, len: usize) -> Self {
 ```rust
 impl Send for MessageBus {
     fn send(&self) {
-        // SAFETY: 消息总线不应在线程间传递
+        // SAFETY: Message bus is not meant to be passed between threads
         unsafe {
-            // 此处为 unsafe 操作
+            // unsafe operation here
         }
     }
 }
@@ -613,7 +954,7 @@ Python 绑定通过 [PyO3](https://pyo3.rs) 提供，允许用户直接在 Pytho
 
 ### PyO3 命名约定
 
-通过 PyO3 将 Rust 函数暴露给 Python 时：
+**通过 PyO3** 将 Rust 函数暴露给 Python 时：
 
 1. Rust 符号**必须**以 `py_*` 为前缀，以在 Rust 代码库中明确其用途。
 2. 使用 `#[pyo3(name = "…")]` 属性发布**不带** `py_` 前缀的 *Python* 名称，以保持 Python API 的整洁。
@@ -625,9 +966,34 @@ pub fn py_do_something() -> PyResult<()> {
 }
 ```
 
-:::info 自动化执行
+:::info[自动化执行]
 `check_pyo3_conventions.sh` pre-commit 钩子会强制 PyO3 函数使用 `py_` 前缀。
 :::
+
+### PyO3 枚举约定
+
+暴露给 Python 的枚举应使用以下 `pyclass` 属性：
+
+- `frozen`：枚举是不可变的值类型。
+- `eq, eq_int`：启用与其他枚举实例和整数判别值的相等性比较。
+- `rename_all = "SCREAMING_SNAKE_CASE"`：标准化 Python 变体名称。
+- `from_py_object`：启用从 Python 对象的转换。
+
+:::warning[不要对 `eq_int` 枚举使用 `hash` pyclass 属性]
+PyO3 自动生成的 `__hash__` 使用 Rust 的 `DefaultHasher`，它产生的值与
+Python 的 `hash()` 对等效整数的结果不同。由于 `eq_int` 使得 `MyEnum.VARIANT == 1`
+为真，哈希契约（`a == b` 蕴含 `hash(a) == hash(b)`）将被违反。请改为
+提供一个直接返回判别值的手动 `__hash__`：
+:::
+
+```rust
+#[pymethods]
+impl MyEnum {
+    const fn __hash__(&self) -> isize {
+        *self as isize
+    }
+}
+```
 
 ### 测试约定
 
@@ -635,7 +1001,7 @@ pub fn py_do_something() -> PyResult<()> {
 - 一致地使用 `#[rstest]` 属性，这种标准化减少了认知负担。
 - 在 Rust 测试中**不要**使用 Arrange、Act、Assert 分隔注释。
 
-:::info 自动化执行
+:::info[自动化执行]
 `check_testing_conventions.sh` pre-commit 钩子会强制使用 `#[rstest]` 而非 `#[test]`。
 :::
 
@@ -654,6 +1020,104 @@ fn test_symbol_is_composite(#[case] input: &str, #[case] expected: bool) {
 }
 ```
 
+#### 测试规格（bon builders）
+
+对于具有许多构造参数的事件，规范的测试构建器是一个
+流式规格（fluent spec），它与事件一起定义在 `events/<event>/spec/<name>.rs` 下
+（参考实现见 `crates/model/src/events/order/spec/filled.rs`）。用
+`#[cfg(any(test, feature = "stubs"))]` 门控该 spec 模块，使其对 crate 内测试
+以及通过 `stubs` 特性选择启用的下游 crate 可用，但在生产构建中编译排除。
+spec 不得被生产代码引用。
+
+为什么使用自定义 spec 而非带 `builder(default)` 的 `derive_builder::Builder`：
+后者会绕过生产构造函数，因此后续添加的不变量不会被测试覆盖。spec 在每次
+`build()` 时都会流经生产构造函数。
+
+剖析：
+
+- 派生 `bon::Builder` 时使用 `finish_fn = into_spec`，使生成的 finish
+  方法不与自定义 `build()` 冲突。
+- 用字面量或 `TestDefault::test_default()` 调用将每个必需字段标记为
+  `#[builder(default = ...)]`。将可选字段保留为不带默认值的 `Option<T>`，
+  以便调用者要么设置它们，要么接受 `None`。
+- 将事件 ID 字段默认设置为 `crate::stubs` 中的 `test_uuid()`。这会产生
+  不同的、可复现的 UUID，而无需调用者管理状态。
+- 在生成的构建器上实现 `build()`，使其调用 `into_spec()` 并转发到
+  生产构造函数（例如 `OrderFilled::new`）。返回类型是事件本身，而非
+  `Result`，因为 spec 默认值在构造上是有效的。
+
+调用者用法：
+
+```rust
+let fill = OrderFilledSpec::builder()
+    .last_qty(Quantity::from(50_000))
+    .trade_id(TradeId::from("TRADE-1"))
+    .build();
+```
+
+仅覆盖测试关心的字段；其余采用 spec 默认值。
+不要在 `build()` 后写 `.unwrap()`。
+
+确定性：在 `cargo nextest` 下，每个测试运行在一个全新的进程中，因此
+每线程的 UUID 序列会自动重置。在普通的 `cargo test` 下，在任何比较
+跨抽取的 UUID 序列的测试开始处调用 `crate::stubs` 中的
+`reset_test_uuid_rng()`。
+
+用 spec 模块中的单个测试固定 spec 默认值，使任何字段的意外漂移
+在那里浮现，而非在下游测试中表现为静默的行为变化。
+
+#### 基于属性的测试
+
+对基于属性的测试使用 `proptest` crate。将它们放在一个单独的
+`property_tests` 模块中（而非 `mod tests` 内部），以使确定性单元
+测试与随机化属性测试分离：
+
+```rust
+#[cfg(test)]
+mod property_tests {
+    use proptest::prelude::*;
+    use rstest::rstest;
+
+    use super::*;
+
+    // Define strategies for generating test inputs
+    fn my_strategy() -> impl Strategy<Value = MyType> {
+        prop_oneof![
+            Just(MyType::VariantA),
+            Just(MyType::VariantB),
+        ]
+    }
+
+    fn value_strategy() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            -1000.0..1000.0,
+            Just(0.0),
+        ]
+    }
+
+    // Group all property tests inside the proptest! macro
+    proptest! {
+        #[rstest]
+        fn prop_construction_roundtrip(
+            value in value_strategy(),
+            variant in my_strategy()
+        ) {
+            // Test invariants that should hold for all generated inputs
+        }
+    }
+}
+```
+
+约定：
+
+- 将模块命名为 `property_tests`，与 `mod tests` 分离。
+- 导入 `proptest::prelude::*` 和 `rstest::rstest`。
+- 定义返回 `impl Strategy<Value = T>` 的策略函数。
+- 使用 `prop_oneof!` 将值范围与边界情况组合。
+- 使用 `prop_filter_map` 过滤无效组合。
+- 测试名称以 `prop_` 为前缀。
+- 用 `#[rstest]` 标记 `proptest!` 内的每个测试。
+
 #### 测试命名
 
 使用描述场景的测试名称：
@@ -662,6 +1126,27 @@ fn test_symbol_is_composite(#[case] input: &str, #[case] expected: bool) {
 fn test_sma_with_no_inputs()
 fn test_sma_with_single_input()
 fn test_symbol_is_composite()
+```
+
+### 框式横幅注释
+
+不要使用框式横幅或分隔注释。如果代码需要视觉分隔，
+可考虑将其拆分为单独的模块或文件。请改用：
+
+- 传达用途的清晰函数名称。
+- 用于逻辑分组的模块结构（`mod tests { mod fixtures { } }`）。
+- 用于分组相关方法的 impl 块。
+- 用于语义文档的文档注释（`///`）。
+- IDE 导航和代码折叠。
+
+应避免的模式：
+
+```rust
+// ============================================================================
+// Some Section
+// ============================================================================
+
+// ========== Test Fixtures ==========
 ```
 
 ## Rust-Python 内存管理
@@ -680,9 +1165,9 @@ fn test_symbol_is_composite()
 **有问题的模式示例**：
 
 ```rust
-// 避免：这会创建引用循环
+// AVOID: This creates reference cycles
 struct CallbackHolder {
-    handler: Option<Arc<PyObject>>,  // Arc 包装导致循环
+    handler: Option<Arc<PyObject>>,  // ❌ Arc wrapper causes cycles
 }
 ```
 
@@ -693,12 +1178,12 @@ struct CallbackHolder {
 ```rust
 use nautilus_core::python::clone_py_object;
 
-// 正确：使用不带 Arc 包装的普通 PyObject
+// CORRECT: Use plain PyObject without Arc wrapper
 struct CallbackHolder {
-    handler: Option<PyObject>,  // 无 Arc 包装
+    handler: Option<PyObject>,  // ✅ No Arc wrapper
 }
 
-// 使用 clone_py_object 的手动 Clone 实现
+// Manual Clone implementation using clone_py_object
 impl Clone for CallbackHolder {
     fn clone(&self) -> Self {
         Self {
@@ -713,23 +1198,23 @@ impl Clone for CallbackHolder {
 #### 1. 使用 `clone_py_object()` 克隆 Python 对象
 
 ```rust
-// 克隆 Python 回调时
+// When cloning Python callbacks
 let cloned_callback = clone_py_object(&original_callback);
 
-// 在手动 Clone 实现中
+// In manual Clone implementations
 self.py_handler.as_ref().map(clone_py_object)
 ```
 
 #### 2. 从回调持有结构体中移除 `#[derive(Clone)]`
 
 ```rust
-// 之前：自动 derive 导致 PyObject 问题
-#[derive(Clone)]  // 移除此行
+// BEFORE: Automatic derive causes issues with PyObject
+#[derive(Clone)]  // ❌ Remove this
 struct Config {
     handler: Option<PyObject>,
 }
 
-// 之后：使用适当克隆的手动实现
+// AFTER: Manual implementation with proper cloning
 struct Config {
     handler: Option<PyObject>,
 }
@@ -737,9 +1222,9 @@ struct Config {
 impl Clone for Config {
     fn clone(&self) -> Self {
         Self {
-            // 正常克隆普通字段
+            // Clone regular fields normally
             url: self.url.clone(),
-            // 对 Python 对象使用 clone_py_object
+            // Use clone_py_object for Python objects
             handler: self.handler.as_ref().map(clone_py_object),
         }
     }
@@ -749,21 +1234,21 @@ impl Clone for Config {
 #### 3. 更新函数签名以接受 `PyObject`
 
 ```rust
-// 之前：函数签名中的 Arc 包装
-fn spawn_task(handler: Arc<PyObject>) { ... }  // 避免
+// BEFORE: Arc wrapper in function signatures
+fn spawn_task(handler: Arc<PyObject>) { ... }  // ❌
 
-// 之后：普通 PyObject
-fn spawn_task(handler: PyObject) { ... }  // 推荐
+// AFTER: Plain PyObject
+fn spawn_task(handler: PyObject) { ... }  // ✅
 ```
 
 #### 4. 创建 Python 回调时避免 `Arc::new()`
 
 ```rust
-// 之前：包装在 Arc 中
-let callback = Arc::new(py_function);  // 避免
+// BEFORE: Wrapping in Arc
+let callback = Arc::new(py_function);  // ❌
 
-// 之后：直接使用
-let callback = py_function;  // 推荐
+// AFTER: Use directly
+let callback = py_function;  // ✅
 ```
 
 ### 为什么这有效
@@ -776,6 +1261,57 @@ let callback = py_function;  // 推荐
 - **通过适当的 GIL 管理维护线程安全**。
 
 这种方法允许 Rust 和 Python 垃圾回收器正确工作，消除引用循环导致的内存泄漏。
+
+## 契约式设计
+
+契约式设计（design by contract）规定了函数与其调用者之间的义务：
+
+- **前置条件（Preconditions）**：函数要求调用者满足什么。
+- **后置条件（Postconditions）**：函数作为回报保证什么。
+- **不变量（Invariants）**：其类型在多次调用之间维护哪些属性。
+
+优先依赖类型系统。所有权、生命周期、`Send`/`Sync`、`Result`/`Option`、
+穷尽匹配、newtype 和可见性在编译期编码了大多数契约，且在运行时零成本。
+仅在类型系统无法做到的地方使用运行时检查。
+
+对于大多数前置条件，使用 `nautilus_core::correctness` 模块：它是
+项目的契约式设计机制，应作为默认选择。`check_*`
+函数（`check_predicate_true`、`check_valid_string_ascii`、
+`check_positive_u64`、`check_in_range_inclusive_f64`、`check_equal_usize`、
+`check_key_in_map`，……）返回一个带类型的 `CorrectnessResult<()>`，其
+`CorrectnessError` 变体命名了每种违规类型。将 `new_checked()`（可能失败，返回
+`CorrectnessResult`）与通过 `.expect_display(FAILED)` panic 的 `new()`
+包装器配对用于已验证类型；这是 [构造函数模式](#constructor-patterns)
+约定，并产生以 `Condition failed: ...` 为前缀的 panic 消息。
+
+对于正确性模块未建模的*内部*不变量，使用 `debug_assert!`（以及
+`debug_assert_eq!`/`_ne!`）：字段关系、单调序列、CAS 后置条件、
+编码/解码往返、可证明在范围内的索引，以及对信任上游验证的内部
+辅助函数的前置条件。release 构建会剥离该检查，因此切勿对公共 API
+输入使用 `debug_assert!`。对于 `unsafe` 代码，对正确性关键（soundness-critical）
+的前置条件（null、对齐、出处）使用始终开启的 `assert!`，并将
+`debug_assert!` 保留给由设计维护的热路径前置条件。
+
+选择机制：
+
+| 情况                                                               | 使用                                              |
+|--------------------------------------------------------------------|---------------------------------------------------|
+| 针对命名前置条件的公共 API 输入                                     | `nautilus_core::correctness` 中的 `check_*`       |
+| 已验证的构造函数（可能失败 + panic 配对）                          | `new_checked()` / `new()`                         |
+| 可恢复的非验证错误（I/O、解析、网络）                              | `Result<T, DomainError>`                          |
+| 编译器无法证明的内部不变量                                          | `debug_assert!`                                   |
+| 无匹配 `CorrectnessError` 的始终开启的内部不变量                   | `assert!`                                         |
+| 正确性关键的 `unsafe` 前置条件                                      | `assert!`（始终开启）                             |
+| 由设计维护的热路径 `unsafe` 前置条件                              | `debug_assert!` 加上记录在案的 `Safety` 子句     |
+
+风格：
+
+- 将 `debug_assert!` 消息以 `Invariant:` 为前缀，并陈述正面规则，
+  而非失败：`debug_assert!(next > last, "Invariant: time is strictly monotonic across CAS")`。
+- `Condition failed: ...`（来自 `FAILED` 常量）标记调用者提供的
+  输入违规；`Invariant: ...` 标记内部契约 bug。
+- 将断言放在不变量首次被假设的地方。当不变量跨越热循环成立时，
+  在边界处断言一次，而非在循环内部。
 
 ## 常见反模式
 
@@ -820,9 +1356,9 @@ Rust 语言设计者对未定义行为的定义可以在[语言参考](https://d
 4. 优先使用运行时强制执行（断言、`Result` 返回）而非仅依赖文档保证。
 
 ```rust
-// SAFETY: 包含非线程安全的 Rc<RefCell<...>>。
-// 通过回测引擎架构保证单线程访问。
-// WARNING: 实际跨线程发送是未定义行为。
+// SAFETY: Contains Rc<RefCell<...>> which is not thread-safe.
+// Single-threaded access guaranteed by the backtest engine architecture.
+// WARNING: Actually sending across threads is undefined behavior.
 #[allow(unsafe_code)]
 unsafe impl Send for BacktestDataClient {}
 ```
@@ -836,12 +1372,75 @@ unsafe impl Send for BacktestDataClient {}
 - **RAII 守卫**：确保在正常返回和 panic 路径上都进行清理。
 - **运行时检查**：当不变量被违反时快速失败，而非继续不安全地执行。
 
+### 运行时不变量
+
+若干核心子系统依赖运行时不变量而非编译期保证。测试验证下面前三个
+契约。守卫使用规则按约定强制执行。任何触及 `UnsafeCell`、
+注册表、`unsendable` 或 live-node 线程的 PR 都应确认不变量测试
+仍然通过。
+
+#### 线程本地注册表
+
+actor 注册表、组件注册表和消息总线各自使用
+`thread_local!` 存储。在一个线程上注册的对象永远不会从另一个线程
+可见。live node 事件循环运行在单个线程上，所有注册表和消息总线
+访问都发生在该线程上。
+
+`LiveNodeHandle` 是唯一预期的跨线程控制面。它使用
+`Arc<AtomicBool>` 进行停止信号传递，使用 `Arc<AtomicU8>` 表示状态，
+两者都使用 `Ordering::Relaxed`。
+
+#### Actor 注册表 vs 组件注册表
+
+两个注册表都在线程本地映射中存储 `Rc<UnsafeCell<dyn Trait>>`，但
+在处理别名访问的方式上有所不同：
+
+| 属性              | Actor 注册表                       | 组件注册表                         |
+|-------------------|------------------------------------|------------------------------------|
+| 别名              | 允许（多个守卫）                   | 禁止（`BorrowGuard` + 集合）       |
+| 重入访问          | 是，回调所需                       | 否，生命周期操作是顺序的           |
+| 错误处理          | 查找失败时 panic 或返回 `None`     | 出错时返回 `anyhow::Result`        |
+| 守卫类型          | `ActorRef<T>`（Rc 支撑）           | 栈本地 `BorrowGuard`               |
+
+actor 注册表选择重入访问而非别名防止，因为
+消息处理器经常回调进注册表以查找其他
+actor。组件注册表可以强制严格别名，因为生命周期
+操作（start、stop、reset、dispose）是非重入的。
+
+#### `ActorRef` 使用规则
+
+`ActorRef` 守卫必须：
+
+- 在单个同步作用域内获取和丢弃。
+- 永不存储在结构体字段中。
+- 永不跨越 `.await` 点持有。
+- 永不发送到另一个线程。
+
+规范模式在闭包中捕获 actor 的 `Ustr` ID，并在每次回调触发时
+查找该 actor：
+
+```rust
+let actor_id = actor.actor_id().inner();
+let handler = TypedHandler::from(move |quote: &QuoteTick| {
+    if let Some(mut actor) = try_get_actor_unchecked::<MyActor>(&actor_id) {
+        actor.handle_quote(quote);
+    }
+});
+```
+
 ## 工具配置
 
 项目使用多种工具保障代码质量：
 
 - **rustfmt**：自动代码格式化（参见 `rustfmt.toml`）。
 - **clippy**：代码检查和最佳实践（参见 `clippy.toml`）。
+  在抑制 `missing_panics_doc` 或 `missing_errors_doc` 时，包含一个 `reason`
+  解释为什么该 lint 不适用：
+
+  ```rust
+  #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+  ```
+
 - **cbindgen**：FFI 的 C 头文件生成。
 
 ## Rust 版本管理
@@ -855,10 +1454,10 @@ rustup update       # 更新到最新稳定版 Rust
 rustup show         # 验证正确的工具链处于活动状态
 ```
 
-如果 pre-commit 在本地通过但在 CI 中失败，清除 pre-commit 缓存并重新运行：
+如果 pre-commit 在本地通过但在 CI 中失败，清除 prek 缓存并重新运行：
 
 ```bash
-pre-commit clean    # 清除缓存环境
+prek clean    # 清除缓存环境
 make pre-commit     # 重新运行所有检查
 ```
 
@@ -878,7 +1477,7 @@ make pre-commit     # 重新运行所有检查
 
 ### 安装 Cap'n Proto
 
-在使用 schema 之前安装 Cap'n Proto 编译器。所需版本在仓库根目录的 `capnp-version` 文件中指定。
+在使用 schema 之前安装 Cap'n Proto 编译器。所需版本在仓库根目录的 `tools.toml` 文件中指定。
 
 有关各平台的详细安装说明，请参阅[环境设置](environment_setup.md#capn-proto)指南。
 
@@ -889,7 +1488,7 @@ Ubuntu 默认的 `capnproto` 包版本过旧。Linux 用户必须从源代码安
 验证安装：
 
 ```bash
-capnp --version  # 应与 capnp-version 中的版本匹配
+capnp --version  # 应与 tools.toml 中的版本匹配
 ```
 
 ### Schema 开发工作流
@@ -909,7 +1508,7 @@ Schema 文件位于 `crates/serialization/schemas/capnp/`：
    ```bash
    make regen-capnp
    # 或
-   ./scripts/regen_capnp.sh
+   ./scripts/regen-capnp.sh
    ```
 
 3. 审查更改：
@@ -945,11 +1544,11 @@ make check-capnp-schemas
 
 此目标会：
 
-1. 重新生成所有 schema 文件。
-2. 验证不存在未提交的更改。
-3. 如果 schema 不同步则失败。
+1. 如果未安装 `capnp` 则带警告跳过（对本地开发可接受）。
+2. 如果重新生成出错（例如版本不匹配）则失败。
+3. 重新生成 schema，并在生成的文件与已提交版本不同时失败。
 
-CI 会自动运行此检查以捕获偏差。
+CI 会自动运行此检查以捕获漂移（capnp 在 CI 中始终安装）。
 
 ### 使用 capnp 特性进行测试
 

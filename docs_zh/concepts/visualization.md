@@ -1,10 +1,10 @@
 # 可视化 (Visualization)
 
-NautilusTrader 提供交互式 HTML 分析报告页 (tearsheet)，用于通过基于 Plotly 构建的可扩展可视化系统分析回测 (backtest) 结果。该系统强调可配置性和可扩展性，让你只需少量代码即可生成全面的绩效报告，同时保留添加自定义图表 (chart) 和主题的灵活性。
+NautilusTrader 提供交互式 HTML 分析报告页 (tearsheet)，通过基于 Plotly 构建的可扩展可视化系统分析回测 (backtest) 结果。你只需少量代码即可生成报告，并能添加自定义图表 (chart) 和主题。
 
 ## 概述
 
-可视化系统建立在三个核心支柱之上：
+可视化系统由三部分组成：
 
 1. **图表注册表 (Chart Registry)** - 解耦的图表定义，可通过自定义可视化进行扩展。
 2. **主题系统 (Theme System)** - 使用内置和自定义主题实现一致的样式。
@@ -29,21 +29,20 @@ uv pip install "plotly>=6.3.1"
 
 ## 分析报告页 (Tearsheet)
 
-分析报告页是一份全面的绩效报告，将多个图表和统计数据组合成单个交互式可视化。报告页在完成回测运行后生成，提供策略 (strategy) 绩效的即时视觉反馈。
+分析报告页是一份绩效报告，将多个图表和统计数据组合成单个交互式可视化。报告页在完成回测运行后生成，提供策略 (strategy) 绩效的即时视觉反馈。
 
 ### 快速开始
 
 使用默认设置生成分析报告页：
 
 ```python
+from nautilus_trader.analysis import create_tearsheet
 from nautilus_trader.backtest.engine import BacktestEngine
 
 # 运行回测后
 engine.run()
 
 # 生成分析报告页
-from nautilus_trader.analysis.tearsheet import create_tearsheet
-
 create_tearsheet(
     engine=engine,
     output_path="backtest_results.html",
@@ -58,9 +57,18 @@ create_tearsheet(
 
 ```python
 from nautilus_trader.analysis import TearsheetConfig
+from nautilus_trader.analysis import TearsheetDrawdownChart
+from nautilus_trader.analysis import TearsheetEquityChart
+from nautilus_trader.analysis import TearsheetRunInfoChart
+from nautilus_trader.analysis import TearsheetStatsTableChart
 
 config = TearsheetConfig(
-    charts=["run_info", "stats_table", "equity", "drawdown"],
+    charts=[
+        TearsheetRunInfoChart(),
+        TearsheetStatsTableChart(),
+        TearsheetEquityChart(),
+        TearsheetDrawdownChart(),
+    ],
     theme="nautilus_dark",
     height=2000,
 )
@@ -98,13 +106,13 @@ create_tearsheet(
 | `stats_table`      | 表格          | 绩效统计数据（盈亏、收益率、通用指标）。                       |
 | `equity`           | 折线图        | 随时间变化的累计收益率，可选基准对比。                         |
 | `drawdown`         | 面积图        | 从权益曲线 (equity curve) 峰值的回撤 (drawdown) 百分比。     |
-| `monthly_returns`  | 热力图        | 按年份组织的月度收益率百分比。                                |
+| `monthly_returns`  | 热力图        | 按年份组织的月度组合收益率百分比。                            |
 | `distribution`     | 直方图        | 单次收益值的分布情况。                                       |
 | `rolling_sharpe`   | 折线图        | 60 天滚动夏普比率。                                         |
 | `yearly_returns`   | 柱状图        | 年度收益率百分比。                                           |
-| `bars_with_fills`  | K线图         | 价格 K线 (bar)（OHLC）叠加订单 (order) 成交 (trade) 标记。  |
+| `bars_with_fills`  | K线图         | 价格 K线 (bar)（OHLC）叠加订单 (order) 成交标记。           |
 
-所有图表都注册在图表注册表中，可以在 `TearsheetConfig.charts` 中按名称引用。
+所有图表都注册在图表注册表中，并通过 `TearsheetConfig.charts` 里的图表对象进行配置（每个图表对象映射到一个内置图表名称）。
 
 ### 运行信息表
 
@@ -120,7 +128,7 @@ create_tearsheet(
 
 ### 绩效统计表
 
-`stats_table` 图表显示按类别组织的全面绩效指标 (indicator)：
+`stats_table` 图表显示按类别组织的绩效指标 (indicator)：
 
 - **盈亏统计**（按货币）：总盈亏、胜率、盈利因子等。
 - **收益率统计**：夏普比率、索提诺比率、最大回撤等。
@@ -130,7 +138,7 @@ create_tearsheet(
 
 ### 权益曲线
 
-`equity` 图表绑图 (plot) 回测期间的累计收益率。当向 `create_tearsheet()` 提供 `benchmark_returns` 时，基准线会叠加显示以供对比。
+`equity` 图表绘制回测期间的累计收益率。当向 `create_tearsheet()` 提供 `benchmark_returns` 时，基准线会叠加显示以供对比。
 
 ```python
 import pandas as pd
@@ -147,7 +155,7 @@ create_tearsheet(
 )
 ```
 
-基准序列按原样绑图；请确保索引与策略的收益日期对齐以获得准确对比。
+基准序列按原样绘制；请确保索引与策略的收益日期对齐以获得准确对比。
 
 ## 主题
 
@@ -174,7 +182,7 @@ create_tearsheet(engine=engine, config=config)
 注册自定义主题以在所有可视化中保持一致的品牌风格：
 
 ```python
-from nautilus_trader.analysis.themes import register_theme
+from nautilus_trader.analysis import register_theme
 
 register_theme(
     name="corporate",
@@ -205,10 +213,18 @@ config = TearsheetConfig(theme="corporate")
 `TearsheetConfig` 类提供对报告页生成的声明式控制：
 
 ```python
-from nautilus_trader.analysis import TearsheetConfig, GridLayout
+from nautilus_trader.analysis import GridLayout
+from nautilus_trader.analysis import TearsheetConfig
+from nautilus_trader.analysis import TearsheetDrawdownChart
+from nautilus_trader.analysis import TearsheetEquityChart
+from nautilus_trader.analysis import TearsheetStatsTableChart
 
 config = TearsheetConfig(
-    charts=["equity", "drawdown", "stats_table"],
+    charts=[
+        TearsheetEquityChart(),
+        TearsheetDrawdownChart(),
+        TearsheetStatsTableChart(),
+    ],
     theme="nautilus_dark",
     title="Q4 2024 Strategy Performance",
     height=1800,
@@ -228,7 +244,7 @@ config = TearsheetConfig(
 
 | 参数                 | 类型                           | 默认值                             | 描述                                           |
 |---------------------|-------------------------------|-----------------------------------|-----------------------------------------------|
-| `charts`            | `list[str]`                   | 所有内置图表                        | 要包含的图表名称列表。                            |
+| `charts`            | `list[TearsheetChart]`        | 所有内置图表                        | 要包含的图表对象列表（按顺序）。                   |
 | `theme`             | `str`                         | `"plotly_white"`                  | 样式主题名称。                                   |
 | `layout`            | `GridLayout`                  | `None`（自动计算）                  | 自定义子图网格布局。                              |
 | `title`             | `str`                         | 自动生成（含策略/时间）               | 报告页标题。                                     |
@@ -236,13 +252,12 @@ config = TearsheetConfig(
 | `benchmark_name`    | `str`                         | `"Benchmark"`                     | 基准的显示名称。                                  |
 | `height`            | `int`                         | `1500`                            | 总高度（像素）。                                  |
 | `show_logo`         | `bool`                        | `True`                            | 显示 NautilusTrader 标志（预留供将来使用）。        |
-| `chart_args`        | `dict[str, dict[str, Any]]`   | `None`                            | 特定图表的参数（例如 `bars_with_fills` 的 `bar_type`）。|
 
 当 `layout` 为 `None` 时，网格维度和行高根据图表数量自动计算。对于 8 个图表（默认值），使用 4x2 网格，行高为 `[0.50, 0.22, 0.16, 0.12]`，为顶行表格提供更多空间。
 
 ## 自定义图表
 
-注册表模式使添加自定义图表变得简单直接。图表是将轨迹 (trace) 渲染到 Plotly 图形对象上的函数。
+注册表模式让你能够添加自定义图表。图表是将轨迹 (trace) 渲染到 Plotly 图形对象上的函数。
 
 ### 注册自定义图表
 
@@ -282,20 +297,23 @@ def my_custom_chart(returns, output_path=None, title="Custom Chart", theme="plot
 
     return fig
 
-# 注册图表以在报告页中使用
+# 注册图表以供独立使用（通过 `get_chart()` / `list_charts()`）
 register_chart("my_custom", my_custom_chart)
-
-# 在报告页配置中包含它
-config = TearsheetConfig(
-    charts=["stats_table", "equity", "my_custom"],
-)
 ```
 
 ### 报告页集成
 
-要实现完整的报告页集成并正确放置在网格中，可使用底层注册方式：
+要实现完整的报告页集成并正确放置在网格中，可使用底层注册方式。
+
+:::warning
+`_register_tearsheet_chart` 函数是内部 API，可能在不同版本之间发生变化。在大多数使用场景下，应优先使用 `register_chart` 注册独立图表，或将新的内置图表贡献到上游。
+:::
 
 ```python
+from nautilus_trader.analysis import TearsheetConfig
+from nautilus_trader.analysis import TearsheetCustomChart
+from nautilus_trader.analysis import TearsheetEquityChart
+from nautilus_trader.analysis import TearsheetStatsTableChart
 from nautilus_trader.analysis.tearsheet import _register_tearsheet_chart
 
 def _render_my_metric(fig, row, col, returns, theme_config, **kwargs):
@@ -342,7 +360,14 @@ _register_tearsheet_chart(
     renderer=_render_my_metric,
 )
 
-# 现在可以在 TearsheetConfig.charts 中使用 "volatility"
+# 现在可以在 TearsheetConfig.charts 中使用 "volatility"：
+config = TearsheetConfig(
+    charts=[
+        TearsheetStatsTableChart(),
+        TearsheetEquityChart(),
+        TearsheetCustomChart(chart="volatility"),
+    ],
+)
 ```
 
 渲染器函数接收所有必要数据（收益率、统计数据、主题配置），并直接渲染到指定的子图位置。
@@ -388,7 +413,7 @@ create_tearsheet_from_stats(
 ### 主题使用
 
 - 专业报告和演示使用 `plotly_white`。
-- 官方材料或低光环境使用 `nautilus_dark`。
+- 官方材料或低光环境查看使用 `nautilus_dark`。
 - 创建自定义主题以匹配内部规范或个人偏好。
 
 ### 性能考虑
@@ -458,7 +483,12 @@ create_tearsheet_from_stats(
 `create_bars_with_fills` 函数生成叠加订单成交标记的 K线图，用于在价格走势中直观分析策略执行情况。它既可独立使用，也可包含在报告页中：
 
 ```python
-from nautilus_trader.analysis.tearsheet import create_bars_with_fills
+from nautilus_trader.analysis import create_bars_with_fills
+from nautilus_trader.analysis import create_tearsheet
+from nautilus_trader.analysis import TearsheetBarsWithFillsChart
+from nautilus_trader.analysis import TearsheetConfig
+from nautilus_trader.analysis import TearsheetEquityChart
+from nautilus_trader.analysis import TearsheetStatsTableChart
 from nautilus_trader.model.data import BarType
 
 # 独立使用
@@ -473,15 +503,36 @@ fig.write_html("bars_with_fills.html")  # 或保存为文件
 
 # 包含在报告页中
 config = TearsheetConfig(
-    charts=["stats_table", "equity", "bars_with_fills"],
-    chart_args={
-        "bars_with_fills": {"bar_type": "ESM4.XCME-1-MINUTE-LAST-EXTERNAL"},
-    },
+    charts=[
+        TearsheetStatsTableChart(),
+        TearsheetEquityChart(),
+        TearsheetBarsWithFillsChart(
+            bar_type="ESM4.XCME-1-MINUTE-LAST-EXTERNAL",
+            title="Bars with Fills",
+        ),
+    ],
+)
+create_tearsheet(engine=engine, config=config)
+
+# 在同一报告页中包含多个带成交标记的 K线图
+config = TearsheetConfig(
+    charts=[
+        TearsheetStatsTableChart(),
+        TearsheetEquityChart(),
+        TearsheetBarsWithFillsChart(
+            bar_type=f"{instrument.id}-5-MINUTE-MID-INTERNAL",
+            title=f"Bars with Order Fills - {instrument.id}",
+        ),
+        TearsheetBarsWithFillsChart(
+            bar_type=f"{other_instrument.id}-5-MINUTE-MID-INTERNAL",
+            title=f"Bars with Order Fills - {other_instrument.id}",
+        ),
+    ],
 )
 create_tearsheet(engine=engine, config=config)
 ```
 
-该可视化显示 OHLC 价格走势的 K线，并以竖条表示订单成交（按买/卖方向着色）。`TearsheetConfig` 中的 `chart_args` 参数允许向需要标准报告页数据之外的额外配置的图表传递自定义参数。
+该可视化以 K线显示 OHLC 价格走势，并用三角形标记表示订单成交（绿色向上三角形表示买入，红色向下三角形表示卖出）。需要额外配置的图表（如 `bar_type`）直接在图表对象上接收这些参数（例如 `TearsheetBarsWithFillsChart(bar_type=...)`）。
 
 其他单独的图表函数包括 `create_equity_curve`、`create_drawdown_chart`、`create_monthly_returns_heatmap` 等。完整列表请参阅 API 参考文档。
 

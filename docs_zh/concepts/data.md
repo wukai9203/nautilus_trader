@@ -1,7 +1,6 @@
 # 数据 (Data)
 
-NautilusTrader 提供了一组专门为交易领域设计的内置数据类型 (data types)。
-这些数据类型包括：
+常见的内置数据类型 (data types) 包括：
 
 - `OrderBookDelta` (L1/L2/L3)：表示最细粒度的订单簿 (order book) 更新。
 - `OrderBookDeltas` (L1/L2/L3)：将多个订单簿增量数据批量处理以提高效率。
@@ -15,8 +14,15 @@ NautilusTrader 提供了一组专门为交易领域设计的内置数据类型 (
 - `InstrumentStatus`：金融工具级别的状态事件。
 - `InstrumentClose`：金融工具的收盘价。
 
-NautilusTrader 主要设计用于处理细粒度的订单簿数据，为回测 (backtest) 中的执行模拟提供最高的真实度。
-不过，回测也可以基于任何受支持的行情数据 (market data) 类型进行，具体取决于所需的模拟精度。
+完整的内置数据类和包装器集合请参见 API 参考文档。
+
+NautilusTrader 主要设计用于处理细粒度的订单簿数据，为执行模拟提供最高的真实度。
+回测 (backtest) 也可以基于任何受支持的行情数据 (market data) 类型进行，具体取决于所需的模拟精度。
+
+当数据通过消息总线 (message bus) 流动时，可按主题寻址的数据都位于 `data`
+根之下。实时数据流使用 `data.<kind>...`；数据管道路径使用
+`data.pipeline.<kind>...`。主题层级 (topic hierarchy) 详见
+[消息总线](message_bus.md#topic-hierarchy)。
 
 ## 订单簿
 
@@ -32,57 +38,29 @@ NautilusTrader 提供了一个用 Rust 实现的高性能订单簿，可根据�
 盘口数据（如 `QuoteTick`、`TradeTick` 和 `Bar`）也可用于回测，市场将以 `L1_MBP` 簿类型运行。
 :::
 
+### 增量标志与事件边界
+
+每个 `OrderBookDelta` 都携带一个 `flags` 字段，使用 `RecordFlag` 位掩码值
+向 `DataEngine` 标示事件边界：
+
+- `F_LAST`：标记一个逻辑事件组中的最后一个增量。当启用 `buffer_deltas`
+  时，`DataEngine` 会累积增量，仅在遇到 `F_LAST` 时才向订阅者发布。
+  每个事件组**必须**以一个设置了 `F_LAST` 的增量结束。
+- `F_SNAPSHOT`：标记属于快照（而非增量更新）的增量。快照序列以一个
+  `Clear` 动作开始，随后是一系列重建完整簿状态的 `Add` 增量。快照中的最后一个
+  增量同时设置了 `F_SNAPSHOT | F_LAST`。
+
+:::warning
+事件组中最后一个增量缺失 `F_LAST` 会导致带缓冲的消费者无限累积增量而不发布。
+这同时适用于增量更新和快照，包括仅发出一个 `Clear` 增量的空簿快照。
+:::
+
 ## 金融工具
 
-NautilusTrader 支持涵盖现货、衍生品和特殊市场的多种金融工具类型：
+所有行情数据都归属于某个金融工具。金融工具定义提供了使数据具有意义的身份标识、
+精度、价格和数量增量、限制、货币以及合约语义。
 
-```mermaid
-flowchart TD
-    I[金融工具类型]
-    I --> Spot[现货]
-    I --> Derivatives[衍生品]
-    I --> Other[其他]
-
-    Spot --> Equity[股票]
-    Spot --> CurrencyPair[货币对]
-    Spot --> Commodity[商品]
-    Spot --> IndexInstrument[指数工具]
-
-    Derivatives --> Futures[期货]
-    Derivatives --> Options[期权]
-    Derivatives --> Cfd[差价合约]
-
-    Futures --> FuturesContract[期货合约]
-    Futures --> FuturesSpread[期货价差]
-    Futures --> CryptoFuture[加密货币期货]
-    Futures --> CryptoPerpetual[加密货币永续合约]
-
-    Options --> OptionContract[期权合约]
-    Options --> OptionSpread[期权价差]
-    Options --> CryptoOption[加密货币期权]
-    Options --> BinaryOption[二元期权]
-
-    Other --> BettingInstrument[博彩工具]
-    Other --> SyntheticInstrument[合成工具]
-```
-
-| 金融工具             | 描述                                                                           |
-|----------------------|----------------------------------------------------------------------------------|
-| `Equity`             | 通用股票工具。                                                                   |
-| `CurrencyPair`       | 现货/现金市场中的货币对。                                                         |
-| `Commodity`          | 现货/现金市场中的商品。                                                           |
-| `IndexInstrument`    | 现货指数（参考价格，不可直接交易）。                                               |
-| `FuturesContract`    | 通用可交割期货合约。                                                              |
-| `FuturesSpread`      | 可交割期货价差。                                                                  |
-| `CryptoFuture`       | 以加密资产作为标的和结算的可交割期货。                                              |
-| `CryptoPerpetual`    | 加密货币永续期货（永续互换）。                                                     |
-| `OptionContract`     | 通用期权合约。                                                                    |
-| `OptionSpread`       | 通用期权价差。                                                                    |
-| `CryptoOption`       | 加密货币期权合约。                                                                |
-| `BinaryOption`       | 二元期权工具。                                                                    |
-| `Cfd`                | 差价合约 (CFD)。                                                                  |
-| `BettingInstrument`  | 博彩市场中的工具。                                                                |
-| `SyntheticInstrument`| 合成工具，其价格通过公式从组成工具的价格推导而来。                                   |
+金融工具的分类法及各类型的指南请参见[金融工具](instruments/)。
 
 ## K线与聚合
 
@@ -110,26 +88,52 @@ NautilusTrader 中的数据聚合将细粒度的行情数据转换为结构化�
 
 平台实现了多种聚合方法：
 
-| 名称               | 描述                                                                           | 类别         |
+| 名称               | 描述                                                                       | 类别         |
 |:-------------------|:---------------------------------------------------------------------------|:-------------|
-| `TICK`             | 按一定数量的 Tick 进行聚合。                                                    | 阈值         |
-| `TICK_IMBALANCE`   | 按 Tick 的买卖不平衡进行聚合。                                                  | 阈值         |
-| `TICK_RUNS`        | 按 Tick 的连续买卖序列进行聚合。                                                | 信息         |
-| `VOLUME`           | 按成交量进行聚合。                                                              | 阈值         |
-| `VOLUME_IMBALANCE` | 按成交量的买卖不平衡进行聚合。                                                  | 阈值         |
-| `VOLUME_RUNS`      | 按成交量的连续买卖序列进行聚合。                                                | 信息         |
-| `VALUE`            | 按交易名义价值进行聚合（也称为"美元 K线"）。                                     | 阈值         |
-| `VALUE_IMBALANCE`  | 按名义价值的买卖不平衡进行聚合。                                                | 信息         |
-| `VALUE_RUNS`       | 按名义价值的连续买卖序列进行聚合。                                              | 阈值         |
-| `RENKO`            | 基于固定价格变动（以 Tick 为砖块大小）进行聚合。                                  | 阈值         |
-| `MILLISECOND`      | 按毫秒粒度的时间间隔聚合。                                                      | 时间         |
-| `SECOND`           | 按秒粒度的时间间隔聚合。                                                        | 时间         |
-| `MINUTE`           | 按分钟粒度的时间间隔聚合。                                                      | 时间         |
-| `HOUR`             | 按小时粒度的时间间隔聚合。                                                      | 时间         |
-| `DAY`              | 按天粒度的时间间隔聚合。                                                        | 时间         |
-| `WEEK`             | 按周粒度的时间间隔聚合。                                                        | 时间         |
-| `MONTH`            | 按月粒度的时间间隔聚合。                                                        | 时间         |
-| `YEAR`             | 按年粒度的时间间隔聚合。                                                        | 时间         |
+| `TICK`             | 按一定数量的 Tick 进行聚合。                                                | 阈值         |
+| `TICK_IMBALANCE`   | 按 Tick 的买卖不平衡进行聚合。                                              | 阈值         |
+| `TICK_RUNS`        | 按 Tick 的连续买卖序列进行聚合。                                            | 信息         |
+| `VOLUME`           | 按成交量进行聚合。                                                          | 阈值         |
+| `VOLUME_IMBALANCE` | 按成交量的买卖不平衡进行聚合。                                              | 阈值         |
+| `VOLUME_RUNS`      | 按成交量的连续买卖序列进行聚合。                                            | 信息         |
+| `VALUE`            | 按交易名义价值进行聚合（也称为"美元 K线"）。                                | 阈值         |
+| `VALUE_IMBALANCE`  | 按名义价值交易的买卖不平衡进行聚合。                                        | 阈值         |
+| `VALUE_RUNS`       | 按名义价值交易的连续买卖序列进行聚合。                                      | 信息         |
+| `RENKO`            | 基于固定价格变动（以 Tick 为砖块大小）进行聚合。                            | 阈值         |
+| `MILLISECOND`      | 按毫秒粒度的时间间隔聚合。                                                  | 时间         |
+| `SECOND`           | 按秒粒度的时间间隔聚合。                                                    | 时间         |
+| `MINUTE`           | 按分钟粒度的时间间隔聚合。                                                  | 时间         |
+| `HOUR`             | 按小时粒度的时间间隔聚合。                                                  | 时间         |
+| `DAY`              | 按天粒度的时间间隔聚合。                                                    | 时间         |
+| `WEEK`             | 按周粒度的时间间隔聚合。                                                    | 时间         |
+| `MONTH`            | 按月粒度的时间间隔聚合。                                                    | 时间         |
+| `YEAR`             | 按年粒度的时间间隔聚合。                                                    | 时间         |
+
+### 信息驱动型 K线
+
+信息驱动型 K线根据市场活跃度调整其采样频率，而非使用固定间隔。它们基于*主动方
+(aggressor side)*（即成交的发起方是买方还是卖方）的概念，分为两个系列：**不平衡 (imbalance)**
+和**连续 (runs)**。
+
+**不平衡 K线**在*净*买卖活动达到阈值时收线。每笔成交贡献一个带符号的值：买方发起的成交为正，
+卖方发起的为负。当不平衡的绝对值达到配置的步长时，K线收线。这意味着方向相反的成交会相互抵消，
+因此不平衡 K线在均衡市场中形成较慢，而在单边行情中形成较快。
+
+**连续 K线**在来自同一主动方的*连续*活动达到阈值时收线。与不平衡 K线不同，连续 K线在
+主动方切换时会重置计数器。这使它对持续的单边压力（而非净不平衡）更为敏感。
+
+两个系列根据所衡量的对象各有三个变体：
+
+| 变体    | 不平衡             | 连续          | 衡量对象                            |
+|:--------|:-------------------|:--------------|:------------------------------------|
+| Tick    | `TICK_IMBALANCE`   | `TICK_RUNS`   | 成交笔数（每笔成交计为 1）           |
+| Volume  | `VOLUME_IMBALANCE` | `VOLUME_RUNS` | 成交量（数量）                       |
+| Value   | `VALUE_IMBALANCE`  | `VALUE_RUNS`  | 名义价值（价格 x 数量）              |
+
+:::note
+信息驱动型 K线需要 `TradeTick` 数据，因为它们需要 `aggressor_side` 字段来对每笔成交进行分类。
+它们无法仅从 `QuoteTick` 数据聚合得到。
+:::
 
 ### 聚合类型
 
@@ -157,7 +161,17 @@ NautilusTrader 基于以下组件定义唯一的 *K线类型 (bar type)*（`BarT
   - `aggregation`：指定数据聚合所使用的方法（见上表）。
   - `price_type`：指示 K线的价格基准（如 bid、ask、mid、last）。
 - **聚合来源** (`AggregationSource`)：指示 K线是在内部（Nautilus 内部）聚合的，
-- 还是在外部（由交易场所 (venue) 或数据提供商）聚合的。
+  还是在外部（由交易场所 (venue) 或数据提供商）聚合的。
+
+:::note
+`BarSpecification` 会校验固定子单位的时间聚合，以确保 K线能与其父级时钟或日历单位整齐对齐。
+`MILLISECOND` 步长必须能整除 1000 且小于 1000；`SECOND` 和 `MINUTE` 步长必须能整除 60 且小于 60；
+`HOUR` 步长必须能整除 24 且小于 24；`MONTH` 步长必须能整除 12 且小于 12。当步长等于一个父级单位时，
+请使用更大的聚合方法，例如用 `1-HOUR` 而非 `60-MINUTE`。`DAY`、`WEEK`、`YEAR`、阈值、信息和
+`RENKO` 型 K线不受此固定子单位规则限制。
+
+未来版本将允许高级用户为不对齐到时钟或日历边界的任意 K线周期覆盖此校验。
+:::
 
 K线类型还可以分为*标准型*或*复合型*：
 
@@ -229,9 +243,10 @@ def on_start(self) -> None:
     # 定义从 TradeTick 对象聚合的 K线类型
     # 使用 price_type=LAST 表示以 TradeTick 数据为源
     bar_type = BarType.from_str("6EH4.XCME-50-VOLUME-LAST-INTERNAL")
+    start = self.clock.utc_now() - timedelta(days=30)
 
     # 请求历史数据（将在 on_historical_data 处理器中接收 K线）
-    self.request_bars(bar_type)
+    self.request_bars(bar_type, start=start)
 
     # 订阅实时数据（将在 on_bar 处理器中接收 K线）
     self.subscribe_bars(bar_type)
@@ -249,9 +264,10 @@ def on_start(self) -> None:
 
     # 从 MID 价格（QuoteTick 对象中 ASK 和 BID 价格的中间值）创建1分钟 K线
     bar_type_mid = BarType.from_str("6EH4.XCME-1-MINUTE-MID-INTERNAL")
+    start = self.clock.utc_now() - timedelta(days=30)
 
     # 请求历史数据并订阅实时数据
-    self.request_bars(bar_type_ask)    # 历史 K线在 on_historical_data 中处理
+    self.request_bars(bar_type_ask, start=start)  # 历史 K线在 on_historical_data 中处理
     self.subscribe_bars(bar_type_ask)  # 实时 K线在 on_bar 中处理
 ```
 
@@ -263,9 +279,10 @@ def on_start(self) -> None:
     # 格式：target_bar_type@source_bar_type
     # 注意：价格类型 (LAST) 仅在左侧目标部分需要，源部分不需要
     bar_type = BarType.from_str("6EH4.XCME-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL")
+    start = self.clock.utc_now() - timedelta(days=30)
 
-    # 请求历史数据（在 on_historical_data(...) 处理器中处理）
-    self.request_bars(bar_type)
+    # 通过提供依赖顺序的聚合链请求历史数据
+    self.request_aggregated_bars([bar_type], start=start)
 
     # 订阅实时更新（在 on_bar(...) 处理器中处理）
     self.subscribe_bars(bar_type)
@@ -292,8 +309,14 @@ hourly_bar_type = BarType.from_str("6EH4.XCME-1-HOUR-LAST-INTERNAL@5-MINUTE-INTE
 
 NautilusTrader 提供两种不同的 K线操作方式：
 
-- **`request_bars()`**：获取历史数据，由 `on_historical_data()` 处理器 (handler) 处理。
+- **`request_bars()`**：获取标准 `BarType` 的历史数据，由 `on_historical_data()`
+  处理器处理。
+- **`request_aggregated_bars()`**：获取依赖顺序的 K线类型列表的历史数据，
+  并即时构建内部 K线。
 - **`subscribe_bars()`**：建立实时数据流，由 `on_bar()` 处理器处理。
+  它要求 `BarType` 对应的金融工具已经加载到缓存 (cache) 中。
+
+报价、成交、订单簿及其他实时订阅同样适用上述缓存前提条件。
 
 这些方法在典型工作流中配合使用：
 
@@ -306,24 +329,25 @@ NautilusTrader 提供两种不同的 K线操作方式：
 def on_start(self) -> None:
     # 定义 K线类型
     bar_type = BarType.from_str("6EH4.XCME-5-MINUTE-LAST-INTERNAL")
+    start = self.clock.utc_now() - timedelta(days=30)
+
+    # 在请求历史数据之前注册指标，以便它们也能接收历史更新
+    self.register_indicator_for_bars(bar_type, self.my_indicator)
 
     # 请求历史数据以初始化指标
     # 这些 K线将传递到策略的 on_historical_data(...) 处理器
-    self.request_bars(bar_type)
+    self.request_bars(bar_type, start=start)
 
     # 订阅实时更新
     # 新 K线将传递到策略的 on_bar(...) 处理器
     self.subscribe_bars(bar_type)
-
-    # 注册指标以接收 K线更新（它们将自动更新）
-    self.register_indicator_for_bars(bar_type, self.my_indicator)
 ```
 
 策略中接收数据所需的处理器：
 
 ```python
 def on_historical_data(self, data):
-    # 处理来自 request_bars() 的历史 K线批量数据
+    # 处理来自 request_bars() 或 request_aggregated_bars() 的历史 Data 对象
     # 注意：通过 register_indicator_for_bars 注册的指标
     # 会自动使用历史数据进行更新
     pass
@@ -336,24 +360,29 @@ def on_bar(self, bar):
 
 ### 带聚合的历史数据请求
 
-在为回测或初始化指标请求历史 K线时，可以使用 `request_bars()` 方法，该方法同时支持直接请求和聚合：
+在为回测或初始化指标请求历史 K线时，对标准 K线类型使用 `request_bars()`，
+对即时聚合使用 `request_aggregated_bars()`：
 
 ```python
+start = self.clock.utc_now() - timedelta(days=30)
+
 # 请求原始1分钟 K线（由 LAST 价格类型指示，从 TradeTick 对象聚合）
-self.request_bars(BarType.from_str("6EH4.XCME-1-MINUTE-LAST-EXTERNAL"))
+self.request_bars(
+    BarType.from_str("6EH4.XCME-1-MINUTE-LAST-EXTERNAL"),
+    start=start,
+)
+
+# 请求从历史成交 Tick 聚合的 K线
+self.request_aggregated_bars(
+    [BarType.from_str("6EH4.XCME-100-VOLUME-LAST-INTERNAL")],
+    start=start,
+)
 
 # 请求从1分钟 K线聚合的5分钟 K线
-self.request_bars(BarType.from_str("6EH4.XCME-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL"))
-```
-
-如果需要历史聚合 K线，可以使用专门的请求方法 `request_aggregated_bars()`：
-
-```python
-# 请求从历史成交 Tick 聚合的 K线
-self.request_aggregated_bars([BarType.from_str("6EH4.XCME-100-VOLUME-LAST-INTERNAL")])
-
-# 请求从其他 K线聚合的 K线
-self.request_aggregated_bars([BarType.from_str("6EH4.XCME-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL")])
+self.request_aggregated_bars(
+    [BarType.from_str("6EH4.XCME-5-MINUTE-LAST-INTERNAL@1-MINUTE-EXTERNAL")],
+    start=start,
+)
 ```
 
 ### 常见陷阱
@@ -361,13 +390,54 @@ self.request_aggregated_bars([BarType.from_str("6EH4.XCME-5-MINUTE-LAST-INTERNAL
 **在请求数据之前注册指标**：确保在请求历史数据之前注册指标，以便它们能正确更新。
 
 ```python
+start = self.clock.utc_now() - timedelta(days=30)
+
 # 正确顺序
 self.register_indicator_for_bars(bar_type, self.ema)
-self.request_bars(bar_type)
+self.request_bars(bar_type, start=start)
 
 # 错误顺序
-self.request_bars(bar_type)  # 指标将不会接收到历史数据
+self.request_bars(bar_type, start=start)  # 指标将不会接收到历史数据
 self.register_indicator_for_bars(bar_type, self.ema)
+```
+
+### 性能考量
+
+K线聚合器通过定点 `Price` 类型跟踪 OHLC 价格。Tick 和成交量聚合器的阈值比较使用整数运算，
+而基于价值的聚合器以及不平衡/连续聚合器目前对名义价值和带符号累加使用 `f64`（这些正在迁移到
+定点整数运算）。聚合方法的选择对每次更新的开销有适度影响：
+
+- **时间 K线**对高吞吐量数据最为高效。聚合器在每次更新时累积 OHLCV 状态；K线的发出由定时器
+  驱动，而非逐 Tick 逻辑。
+- **阈值 K线**（Tick、成交量、价值）在每次更新时增加一个轻量级的计数器或累加器检查。当单笔大额成交
+  超过剩余阈值时，成交量和价值型 K线可能会将其拆分到多根 K线中。
+- **信息驱动型 K线**（不平衡、连续）需要在每次更新时跟踪主动方和带符号累加。其开销略高于阈值 K线，
+  但仍然很小。
+- **Renko K线**由价格驱动，单次大幅价格变动可发出多根 K线。除此之外，其每次更新的成本与阈值 K线相当。
+- **复合 K线**（K线到 K线）是在已有较低时间框架 K线时生成更高时间框架 K线的最高效方式，因为每根输入
+  K线代表的是一个已聚合的时段，而非单个 Tick。
+
+### 时间 K线配置
+
+时间 K线的行为通过 `DataEngineConfig` 控制。以下选项适用于所有基于时间的聚合（从毫秒到年）：
+
+| 选项                                | 类型   | 默认值        | 描述                                                                                                          |
+|:------------------------------------|:-------|:--------------|:------------------------------------------------------------------------------------------------------------|
+| `time_bars_interval_type`           | `str`  | `"left-open"` | `"left-open"`：排除起点、包含终点。`"right-open"`：包含起点、排除终点。                                       |
+| `time_bars_timestamp_on_close`      | `bool` | `True`        | 为 `True` 时，`ts_event` 为 K线收盘时间。为 `False` 时，`ts_event` 为 K线开盘时间。                          |
+| `time_bars_skip_first_non_full_bar` | `bool` | `False`       | 当聚合从某个时段中途开始时跳过该 K线的发出，避免启动时出现不完整的 K线。                                      |
+| `time_bars_build_with_no_updates`   | `bool` | `True`        | 为 `True` 时，即使该时段内没有市场更新到达，也会发出 K线。                                                    |
+| `time_bars_origin_offset`           | `dict` | `None`        | 将 `BarAggregation` 类型映射到 `pd.Timedelta` 或 `pd.DateOffset` 值，用于偏移 K线对齐（如对齐到 09:30 开盘）。 |
+| `time_bars_build_delay`             | `int`  | `0`           | 构建 K线前的延迟（微秒）。在回测中很有用，可确保 K线边界时间戳处的数据在定时器触发前已被处理。                |
+
+```python
+from nautilus_trader.data.config import DataEngineConfig
+
+config = DataEngineConfig(
+    time_bars_timestamp_on_close=True,
+    time_bars_build_with_no_updates=False,
+    time_bars_skip_first_non_full_bar=True,
+)
 ```
 
 ## 时间戳
@@ -386,13 +456,14 @@ self.register_indicator_for_bars(bar_type, self.ema)
 | `QuoteTick`      | 报价在交易所发生的时间。                                | Nautilus 接收到报价数据的时间。 |
 | `OrderBookDelta` | 订单簿更新在交易所发生的时间。                          | Nautilus 接收到订单簿更新的时间。 |
 | `Bar`            | K线收盘的时间（精确到分钟/小时）。                       | Nautilus 生成（内部 K线）或接收到 K线数据（外部 K线）的时间。 |
+| `DefiData`       | 区块或资金池事件发生的时间。                            | Nautilus 从链上数据创建对象的时间。 |
 | `OrderFilled`    | 订单在交易所被成交的时间。                              | Nautilus 接收并处理成交确认的时间。 |
 | `OrderCanceled`  | 撤单在交易所被处理的时间。                              | Nautilus 接收并处理撤单确认的时间。 |
 | `NewsEvent`      | 新闻发布的时间。                                       | Nautilus 中事件对象被创建（内部事件）或接收（外部事件）的时间。 |
 | 自定义事件       | 事件条件实际发生的时间。                                | Nautilus 中事件对象被创建（内部事件）或接收（外部事件）的时间。 |
 
 :::note
-`ts_init` 字段表示的概念比"接收时间"更为广泛。
+`ts_init` 字段表示的概念比事件的"接收时间"更为广泛。
 它表示对象（如数据点或命令）在 Nautilus 内部被初始化时的时间戳。
 这一区分很重要，因为 `ts_init` 不仅限于"接收的事件"——它适用于任何内部初始化过程。
 
@@ -413,18 +484,21 @@ self.register_indicator_for_bars(bar_type, self.ema)
 #### 回测环境
 
 - 数据按 `ts_init` 使用稳定排序进行排序。
+- DeFi 数据 (`DefiData`) 在 `ts_init` 相同时按链上位置（区块号、交易索引、日志索引）打破平局，
+  以使来自同一区块的事件按规范的链上顺序回放。
 - 此行为确保了确定性的处理顺序，并模拟了包含延迟在内的真实系统行为。
 
 #### 实盘交易环境
 
 - 系统在数据到达时即进行处理，以最小化延迟并实现实时决策。
-  - `ts_init` 字段记录 Nautilus 实时接收数据的确切时刻。
+  - 对于来自交易场所的数据，`ts_init` 通常是 Nautilus 在收到更新后创建本地对象的时间。
   - `ts_event` 反映事件在外部发生的时间，便于在外部事件时间和系统接收时间之间进行准确比较。
 - 可以使用 `ts_init` 和 `ts_event` 之间的差值来检测网络或处理延迟。
 
 ### 其他注意事项
 
-- 对于来自外部源的数据，`ts_init` 始终等于或晚于 `ts_event`。
+- 对于来自外部源的数据，`ts_init` 通常是本地接收或归一化的时间，但由于时钟偏差，不能保证它一定
+  大于或等于 `ts_event`。
 - 对于在 Nautilus 内部创建的数据，`ts_init` 和 `ts_event` 可以相同，因为对象的初始化与事件发生在同一时刻。
 - 并非每个具有 `ts_init` 字段的类型都一定有 `ts_event` 字段。这反映了以下情况：
   - 对象的初始化与事件本身同时发生。
@@ -432,16 +506,21 @@ self.register_indicator_for_bars(bar_type, self.ema)
 
 #### 持久化数据
 
-`ts_init` 字段指示消息最初被接收的时间。
+`ts_init` 字段保留了原始的初始化时间戳。对于交易场所数据，这通常是接收时间；对于内部创建的数据，
+则是该对象的创建时间。
 
 ## 数据流
 
-平台通过在所有系统[环境上下文](/concepts/architecture.md#environment-contexts)
-（如 `backtest`、`sandbox`、`live`）中使用相同的数据通道来确保一致性。数据主要通过消息总线 (MessageBus) 传输到 DataEngine，
-然后分发到已订阅 (subscription) 或已注册的处理器。
+从 `DataEngine` 开始，无论
+[环境上下文](architecture.md#environment-contexts)（回测、沙盒、实盘）如何，
+数据都遵循相同的路径。在实盘和沙盒模式下，交易场所适配器创建一个归一化的数据
+对象并通过通道发送；在回测中，引擎直接馈送数据。无论哪种方式，`DataEngine`
+都会将其存储到 `Cache`（针对可缓存类型）中，并在 `MessageBus` 上发布给已订阅的处理器。
+逐步追踪及时序图请参见
+[数据流：一个报价 Tick 的一生](architecture.md#data-flow-life-of-a-quote-tick)。
 
 对于需要更多灵活性的用户，平台还支持创建自定义数据类型。
-有关如何实现用户自定义数据类型的详情，请参见下方的[自定义数据](#自定义数据)部分。
+有关如何实现用户自定义数据类型的详情，请参见下方的[自定义数据](#custom-data)部分。
 
 ## 加载数据
 
@@ -466,19 +545,57 @@ NautilusTrader 为三种主要用例提供数据加载和转换功能：
 ### 数据整理器
 
 数据整理器按特定的 Nautilus 数据类型实现，可在 `nautilus_trader.persistence.wranglers` 模块中找到。
-目前包括：
+常见的 v1 整理器包括：
 
 - `OrderBookDeltaDataWrangler`
-- `OrderBookDepth10DataWrangler`
 - `QuoteTickDataWrangler`
 - `TradeTickDataWrangler`
 - `BarDataWrangler`
+
+对于 Arrow v2 / PyO3 工作流，v2 模块还提供了 `OrderBookDepth10DataWranglerV2`。
 
 :::warning
 有一些 **DataWrangler v2** 组件，它们接收通常具有不同固定宽度 Nautilus Arrow v2 模式的 `pd.DataFrame`，
 并输出仅与当前正在开发的新版 Nautilus 核心兼容的 PyO3 Nautilus 对象。
 
-**这些 PyO3 提供的数据对象与当前使用旧版 Cython 对象的位置不兼容（例如，直接添加到 `BacktestEngine`）。**
+**这些 PyO3 数据对象与期望 v1 旧版 Cython 对象的位置不兼容（例如，直接添加到 `BacktestEngine`）。**
+:::
+
+### 定点精度与原始值
+
+NautilusTrader 对 `Price` 和 `Quantity` 类型使用定点运算，以实现无浮点误差的精确金融计算。
+在创建数据或使用目录时，理解原始值的工作方式至关重要。
+
+#### 原始值要求
+
+使用 `from_raw()` 构造 `Price` 或 `Quantity` 时，原始值**必须**是给定精度下缩放因子的有效倍数。
+有效的原始值应来自：
+
+- 访问现有值的 `.raw` 字段（如 `price.raw`）。
+- 使用 Nautilus 定点转换函数。
+- 来自 Nautilus 生成的 Arrow 数据的值。
+
+:::warning
+非有效倍数的原始值会导致 panic。原始值必须能被 `10^(FIXED_PRECISION - precision)` 整除，
+其中 `FIXED_PRECISION` 为 9（标准模式）或 16（高精度模式）。
+:::
+
+#### 自动原始值修正
+
+目录数据可能包含带有浮点精度误差的原始值。当原始值用 `int(value * FIXED_SCALAR)`
+而非精度感知转换产生时，就会发生这种情况：
+
+```python
+int(value * FIXED_SCALAR)             # 引入浮点误差
+round(value * 10**precision) * scale  # 正确的精度感知转换
+```
+
+例如，`int(0.67068 * 1e9)` 产生 `670680000000001`，而非预期的 `670680000000000`。
+
+Arrow 解码路径会通过四舍五入到最近的有效倍数来自动修正这些值，因此受影响的目录无需数据迁移即可正常工作。
+
+:::note
+此修正会在数据解码期间增加少量开销。
 :::
 
 ### 转换管道
@@ -494,7 +611,7 @@ NautilusTrader 为三种主要用例提供数据加载和转换功能：
 
 ```mermaid
 flowchart LR
-    raw["原始数据 (CSV)"]
+    raw["Raw data (CSV)"]
     loader[DataLoader]
     wrangler[DataWrangler]
     output["Nautilus list[Data]"]
@@ -541,7 +658,9 @@ NautilusTrader 数据目录建立在双后端架构之上，将 Rust 的高性�
 **核心组件：**
 
 - **ParquetDataCatalog**：数据操作的主要 Python 接口。
-- **Rust 后端**：针对核心数据类型（OrderBookDelta、QuoteTick、TradeTick、Bar、MarkPriceUpdate）的高性能查询引擎。
+- **Rust 后端**：针对核心数据类型（`OrderBookDelta`、`OrderBookDeltas`、
+  `OrderBookDepth10`、`QuoteTick`、`TradeTick`、`Bar`、`MarkPriceUpdate`）
+  以及已注册的同二进制 Rust 自定义数据的高性能查询引擎。
 - **PyArrow 后端**：用于自定义数据类型和高级过滤的灵活备选方案。
 - **fsspec 集成**：支持本地和云存储（S3、GCS、Azure 等）。
 
@@ -560,17 +679,14 @@ NautilusTrader 数据目录建立在双后端架构之上，将 Rust 的高性�
 - 支持模式演进，适应数据模型变更。
 - 跨语言兼容性（Python、Rust、Java、C++ 等）。
 
-用于 Parquet 格式的 Arrow 模式主要在核心 `persistence` Rust crate 中统一定义，部分旧版模式可从 `/serialization/arrow/schema.py` 模块获取。
-
-:::note
-当前计划是最终淘汰 Python 模式模块，使所有模式统一在 Rust 核心中定义，以保持一致性和性能。
-:::
+用于 Parquet 格式的 Arrow 模式在两处定义：核心行情数据类型在 Rust 的 `model` 和 `persistence` crate 中定义，
+其余类型在 Python 的 `serialization/arrow/schema.py` 模块中定义。
 
 ### 初始化
 
 数据目录可以通过 `NAUTILUS_PATH` 环境变量进行初始化，也可以通过显式传入路径对象来初始化。
 
-:::note NAUTILUS_PATH 环境变量
+:::note[NAUTILUS_PATH 环境变量]
 `NAUTILUS_PATH` 环境变量应指向包含 Nautilus 数据的**根**目录。目录会自动在此路径后追加 `/catalog`。
 
 例如：
@@ -683,7 +799,7 @@ catalog = ParquetDataCatalog.from_uri("s3://my-bucket/nautilus-data/")
 # 带存储选项
 catalog = ParquetDataCatalog.from_uri(
     "s3://my-bucket/nautilus-data/",
-    storage_options={
+    fs_storage_options={
         "access_key_id": "your-key",
         "secret_access_key": "your-secret"
     }
@@ -711,19 +827,21 @@ catalog.write_data(bars, skip_disjoint_check=True)
 
 ### 文件命名与数据组织
 
-目录根据写入数据的时间戳范围自动生成文件名。文件使用 `{start_timestamp}_{end_timestamp}.parquet` 模式命名，时间戳为 ISO 格式。
+目录根据写入数据的时间戳范围自动生成文件名。文件使用 `{start_timestamp}_{end_timestamp}.parquet`
+模式命名，其中每个时间戳都是一个 ISO 8601 值，通过将 `:` 和 `.` 替换为 `-` 转换为文件名安全的形式。
 
-数据按数据类型和金融工具 ID 组织在目录中：
+数据按数据类型和标识符（金融工具 ID、K线类型或自定义标识符）组织在目录中。标识符通过移除 `/`
+变为 URI 安全形式：
 
 ```
 catalog/
 ├── data/
 │   ├── quote_ticks/
-│   │   └── eurusd.sim/
-│   │       └── 20240101T000000000000000_20240101T235959999999999.parquet
+│   │   └── EURUSD.SIM/
+│   │       └── 2024-01-01T00-00-00-000000000Z_2024-01-01T23-59-59-999999999Z.parquet
 │   └── trade_ticks/
-│       └── btcusd.binance/
-│           └── 20240101T000000000000000_20240101T235959999999999.parquet
+│       └── BTCUSD.BINANCE/
+│           └── 2024-01-01T00-00-00-000000000Z_2024-01-01T23-59-59-999999999Z.parquet
 ```
 
 **Rust 后端数据类型（增强性能）：**
@@ -739,7 +857,8 @@ catalog/
 - `MarkPriceUpdate`。
 
 :::warning
-默认情况下，与现有文件重叠的数据将导致断言错误，以维护数据完整性。在需要时可使用 `write_data()` 中的 `skip_disjoint_check=True` 来绕过此检查。
+默认情况下，重叠写入将引发 `ValueError` 以维护数据完整性。在需要时可使用 `write_data()` 中的
+`skip_disjoint_check=True` 来绕过此检查。
 :::
 
 ### 读取数据
@@ -757,13 +876,12 @@ quotes = catalog.query(
     end="2024-01-02T00:00:00Z"
 )
 
-# 带过滤条件查询成交 Tick
+# 查询特定金融工具和时间范围的成交 Tick
 trades = catalog.query(
     data_cls=TradeTick,
     identifiers=["BTC/USD.BINANCE"],
     start="2024-01-01",
     end="2024-01-02",
-    where="price > 50000"
 )
 ```
 
@@ -782,6 +900,7 @@ trades = catalog.query(
 
 - `catalog_fs_protocol`：文件系统协议（'file'、's3'、'gcs' 等）。
 - `catalog_fs_storage_options`：特定于存储的选项（凭证、区域等）。
+- `catalog_fs_rust_storage_options`：Rust 后端的特定于存储的选项。
 - `instrument_id`：要加载数据的特定金融工具。
 - `instrument_ids`：金融工具列表（替代单个 instrument_id）。
 - `start_time`：数据过滤的起始时间（ISO 字符串或 UNIX 纳秒）。
@@ -789,8 +908,10 @@ trades = catalog.query(
 - `filter_expr`：额外的 PyArrow 过滤表达式。
 - `client_id`：自定义数据类型的客户端 ID。
 - `metadata`：数据查询的附加元数据。
-- `bar_spec`：K线数据的 K线规格（如 "1-MINUTE-LAST"）。
-- `bar_types`：K线类型列表（替代 bar_spec）。
+- `bar_spec`：K线数据的 K线规格（如 `"1-MINUTE-LAST"`）。当与 `instrument_id` 或
+  `instrument_ids` 结合使用时，会构建 `...-EXTERNAL` K线标识符。
+- `bar_types`：完整 K线类型的显式列表。用于 `INTERNAL` 型 K线或复合 K线。
+- `optimize_file_loading`：在受支持时加载目录而非单个文件。
 
 #### 基本用法示例
 
@@ -828,7 +949,7 @@ data_config = BacktestDataConfig(
     catalog_path="/path/to/catalog",
     data_cls=Bar,
     instrument_id=InstrumentId.from_str("AAPL.NASDAQ"),
-    bar_spec="5-MINUTE-LAST",
+    bar_spec="5-MINUTE-LAST",  # 加载 AAPL.NASDAQ-5-MINUTE-LAST-EXTERNAL
     start_time="2024-01-01",
     end_time="2024-01-31",
 )
@@ -851,7 +972,6 @@ data_config = BacktestDataConfig(
     instrument_id=InstrumentId.from_str("BTC/USD.COINBASE"),
     start_time="2024-01-01T09:30:00Z",
     end_time="2024-01-01T16:00:00Z",
-    filter_expr="side == 'BUY'",  # 仅买方增量数据
 )
 ```
 
@@ -935,6 +1055,7 @@ run_config = BacktestRunConfig(
 
 - `fs_protocol`：文件系统协议（'file'、's3'、'gcs'、'azure' 等）。
 - `fs_storage_options`：特定于协议的存储选项。
+- `fs_rust_storage_options`：Rust 后端的特定于协议的存储选项。
 - `name`：目录配置的可选名称标识符。
 
 #### 基本用法示例
@@ -988,7 +1109,7 @@ catalog_config = DataCatalogConfig(
 # 在交易节点配置中使用
 node_config = TradingNodeConfig(
     # ... 其他配置
-    catalog=catalog_config,  # 启用历史数据访问
+    catalogs=[catalog_config],  # 启用历史数据访问
 )
 ```
 
@@ -1005,7 +1126,7 @@ streaming_config = StreamingConfig(
     fs_protocol="file",
     flush_interval_ms=1000,  # 每秒刷新一次
     replace_existing=False,
-    rotation_mode=RotationMode.DAILY,
+    rotation_mode=RotationMode.INTERVAL,
     rotation_interval=pd.Timedelta(hours=1),
     max_file_size=1024 * 1024 * 100,  # 最大文件大小 100MB
 )
@@ -1033,7 +1154,7 @@ streaming_config = StreamingConfig(
 
 ### 查询系统与双后端架构
 
-目录的查询系统利用了一套复杂的双后端架构，根据数据类型和查询参数自动选择最优的查询引擎。
+目录的查询系统使用双后端架构，根据数据类型和查询参数选择查询引擎。
 
 #### 后端选择逻辑
 
@@ -1042,6 +1163,7 @@ streaming_config = StreamingConfig(
 - **支持的类型**：OrderBookDelta、OrderBookDeltas、OrderBookDepth10、QuoteTick、TradeTick、Bar、MarkPriceUpdate。
 - **条件**：当 `files` 参数为 None（自动文件发现）时使用。
 - **优势**：优化的性能、内存效率、原生 Arrow 集成。
+  已注册的同二进制 Rust 自定义数据类型也可以使用此路径。
 
 **PyArrow 后端（灵活）：**
 
@@ -1059,10 +1181,12 @@ catalog.query(
     identifiers=["EUR/USD.SIM"],           # 金融工具标识符
     start="2024-01-01T00:00:00Z",         # 起始时间（支持多种格式）
     end="2024-01-02T00:00:00Z",           # 结束时间
-    where="bid > 1.1000",                 # PyArrow 过滤表达式
-    files=None,                           # 指定文件（强制使用 PyArrow 后端）
+    files=None,                           # 留空以自动发现文件
 )
 ```
+
+- `where=` 向 Rust 支持的查询传入一个 DataFusion SQL 谓词。
+- `filter_expr=` 向 PyArrow 支持的查询传入一个已解析的 PyArrow 数据集表达式。
 
 **时间格式支持：**
 
@@ -1071,26 +1195,11 @@ catalog.query(
 - Pandas Timestamps：`pd.Timestamp("2024-01-01", tz="UTC")`。
 - Python datetime 对象（建议使用时区感知对象）。
 
-**高级过滤示例：**
+**过滤说明：**
 
-```python
-# 复杂的 PyArrow 表达式
-catalog.query(
-    data_cls=TradeTick,
-    identifiers=["BTC/USD.BINANCE"],
-    where="price > 50000 AND size > 1.0",
-    start="2024-01-01",
-    end="2024-01-02",
-)
-
-# 多金融工具与元数据过滤
-catalog.query(
-    data_cls=Bar,
-    identifiers=["AAPL.NASDAQ", "MSFT.NASDAQ"],
-    where="volume > 1000000",
-    metadata={"bar_type": "1-MINUTE-LAST"},
-)
-```
+- 对 Rust 支持的内置行情数据查询使用 `where=`。
+- 对 PyArrow 支持的查询使用 `filter_expr=`，包括自定义数据以及通过 `files=`
+  强制走 PyArrow 路径的查询。
 
 ### 目录操作
 
@@ -1406,9 +1515,9 @@ from nautilus_trader.core import Data
 
 class MyDataPoint(Data):
     """
-    这是一个用户自定义数据类的示例，继承自基类 `Data`。
+    This is an example of a user-defined data class, inheriting from the base class `Data`.
 
-    此类中的字段 `label`、`x`、`y` 和 `z` 是任意用户数据的示例。
+    The fields `label`, `x`, `y`, and `z` in this class are examples of arbitrary user data.
     """
 
     def __init__(
@@ -1430,7 +1539,7 @@ class MyDataPoint(Data):
     @property
     def ts_event(self) -> int:
         """
-        数据事件发生时的 UNIX 时间戳（纳秒）。
+        UNIX timestamp (nanoseconds) when the data event occurred.
 
         Returns
         -------
@@ -1442,7 +1551,7 @@ class MyDataPoint(Data):
     @property
     def ts_init(self) -> int:
         """
-        对象初始化时的 UNIX 时间戳（纳秒）。
+        UNIX timestamp (nanoseconds) when the object was initialized.
 
         Returns
         -------
@@ -1450,7 +1559,6 @@ class MyDataPoint(Data):
 
         """
         return self._ts_init
-
 ```
 
 `Data` 抽象基类作为系统内的契约，要求所有数据类型具有两个属性：`ts_event` 和 `ts_init`。
@@ -1464,7 +1572,7 @@ class MyDataPoint(Data):
 :::
 
 现在可以在回测和实盘交易中使用此数据类型。例如，
-可以创建一个适配器 (adapter) 来解析和创建此类型的对象——并将其发送回 DataEngine 供订阅者消费。
+可以创建一个适配器 (adapter) 来解析和创建此类型的对象——并将其发送回 `DataEngine` 供订阅者消费。
 
 可以在 actor/策略中使用消息总线以下列方式发布自定义数据类型：
 
@@ -1506,15 +1614,15 @@ self.subscribe_data(
 
 ```python
 def on_data(self, data: Data) -> None:
-    # 首先检查数据类型
+    # First check the type of data
     if isinstance(data, MyDataPoint):
-        # 对数据进行处理
+        # Do something with the data
 ```
 
 ### 发布和接收信号数据
 
-以下是从 actor 或策略使用消息总线发布和接收信号数据的示例。
-信号是一种自动生成的自定义数据，由名称标识，包含一个基本类型
+以下是从 actor 或策略使用 `MessageBus` 发布和接收信号数据的示例。
+信号是一种自动生成的自定义数据，由名称标识，只包含一个基本类型
 （str、float、int、bool 或 bytes）的值。
 
 ```python
@@ -1522,7 +1630,7 @@ self.publish_signal("signal_name", value, ts_event)
 self.subscribe_signal("signal_name")
 
 def on_signal(self, signal):
-    print("Signal", data)
+    print("Signal", signal)
 ```
 
 ### 期权希腊值示例
@@ -1606,7 +1714,7 @@ class GreeksData(Data):
 
 #### 发布和接收数据
 
-以下是从 actor 或策略使用消息总线发布和接收数据的示例：
+以下是从 actor 或策略使用 `MessageBus` 发布和接收数据的示例：
 
 ```python
 register_serializable_type(GreeksData, GreeksData.to_dict, GreeksData.from_dict)
@@ -1675,9 +1783,49 @@ GreeksTestData(
 )
 ```
 
+#### 配合 PyO3 目录的纯 Python 自定义数据
+
+要将自定义数据用于 Rust 支持的目录（来自 `nautilus_pyo3` 的 `ParquetDataCatalog`），
+请使用 `@customdataclass_pyo3()` 装饰器而非 `@customdataclass`。它会添加 Rust 目录所需的方法
+（JSON 和 Arrow IPC 序列化）。定义类之后，需要将其注册一次。可以传入**类型**（推荐）
+或一个**样本实例**：
+
+```python
+from nautilus_trader.core.nautilus_pyo3 import ParquetDataCatalog
+from nautilus_trader.core.nautilus_pyo3.model import CustomData
+from nautilus_trader.core.nautilus_pyo3.model import DataType
+from nautilus_trader.core.nautilus_pyo3.model import register_custom_data_class
+from nautilus_trader.model.custom import customdataclass_pyo3
+
+
+@customdataclass_pyo3()
+class MarketTickPython:
+    symbol: str = ""
+    price: float = 0.0
+    volume: int = 0
+
+
+# Register by type (no instance needed; call once, e.g. at startup)
+register_custom_data_class(MarketTickPython)
+
+catalog = ParquetDataCatalog("/path/to/catalog")
+data_type = DataType("MarketTickPython", metadata={"exchange": "NASDAQ"})
+wrapped = [
+    CustomData(
+        data_type,
+        MarketTickPython(ts_event=1, ts_init=1, symbol="AAPL", price=150.5, volume=1000),
+    ),
+]
+catalog.write_custom_data(wrapped)
+result = catalog.query("MarketTickPython")
+ticks = [item.data for item in result]
+```
+
+详情请参见 `nautilus_trader.model.custom.customdataclass_pyo3`。
+
 #### 自定义数据类型存根
 
-为了增强开发便利性并改善 IDE 中的代码建议，可以创建一个 `.pyi` 存根文件，
+为了获得更好的 IDE 代码建议，可以创建一个 `.pyi` 存根文件，
 其中包含自定义数据类型的正确构造函数签名以及属性的类型提示。
 当构造函数在运行时动态生成时，这特别有用，因为它允许 IDE 识别并提供类的方法和属性建议。
 
@@ -1701,3 +1849,11 @@ class GreeksData(Data):
         delta: float = 0.0,
   ) -> GreeksData: ...
 ```
+
+## 相关指南
+
+- [金融工具](instruments/) - 数据所引用的金融工具。
+- [期权](options.md) - 期权工具、期权链订阅和行权价过滤。
+- [希腊值](greeks.md) - 交易场所提供的和本地计算的期权希腊值。
+- [缓存](cache.md) - 数据的存储和检索。
+- [适配器](adapters.md) - 数据源与连接。

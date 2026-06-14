@@ -36,6 +36,10 @@ uv sync --all-extras
 
 在实现你的交易策略之前，请确保 TWS（Trader Workstation）或 IB Gateway 正在运行。你可以使用凭证登录其中一个独立应用，或通过 `DockerizedIBGateway` 以编程方式连接。
 
+:::warning
+在连接 NautilusTrader 之前，请将 TWS 或 IB Gateway 配置为以 UTC 返回市场数据时间戳。此设置必须由用户在 TWS/IB Gateway 中启用，因为 NautilusTrader 设计为使用 UTC 时间戳工作。
+:::
+
 ### 连接方式
 
 连接到 Interactive Brokers 有两种主要方式：
@@ -112,16 +116,16 @@ print(gateway.container.logs())
 
 ### 连接管理
 
-适配器包含强大的连接管理功能：
+适配器包含连接管理功能：
 
 - **自动重连**：通过 `IB_MAX_CONNECTION_ATTEMPTS` 环境变量配置重试次数。
 - **连接超时**：通过 `connection_timeout` 参数调整超时时间（默认：300 秒）。
 - **连接看门狗**：监控连接健康状态，在需要时自动触发重连。
-- **优雅的错误处理**：通过全面的错误分类处理各种连接场景。
+- **优雅的错误处理**：通过错误分类处理各种连接场景。
 
 ## 概述
 
-Interactive Brokers 适配器提供了与 IB TWS API 的全面集成。适配器包含几个主要组件：
+Interactive Brokers 适配器提供了与 IB TWS API 的集成。适配器包含几个主要组件：
 
 ### 核心组件
 
@@ -134,7 +138,7 @@ Interactive Brokers 适配器提供了与 IB TWS API 的全面集成。适配器
 ### 辅助组件
 
 - **`DockerizedIBGateway`**：管理 Docker 化的 IB Gateway 实例，用于自动化部署。
-- **配置类**：为所有组件提供全面的配置选项。
+- **配置类**：为所有组件提供配置选项。
 - **工厂类**：创建和配置客户端实例及必要的依赖项。
 
 ### 支持的资产类别
@@ -151,9 +155,9 @@ Interactive Brokers 适配器提供了与 IB TWS API 的全面集成。适配器
 
 ## Interactive Brokers 客户端
 
-`InteractiveBrokersClient` 是 IB 适配器的核心组件，负责管理一系列关键功能。这些功能包括建立和维护连接、处理 API 错误、执行交易，以及收集各类数据（如市场数据、合约/金融工具数据和账户详情）。
+`InteractiveBrokersClient` 是 IB 适配器的核心组件，负责管理一系列功能。这些功能包括建立和维护连接、处理 API 错误、执行交易，以及收集各类数据（如市场数据、合约/金融工具数据和账户详情）。
 
-为了高效管理这些多样化的职责，`InteractiveBrokersClient` 被划分为几个专门的 mixin 类。这种模块化方法增强了可管理性和清晰度。
+`InteractiveBrokersClient` 被划分为几个专门的 mixin 类，每个类处理一项特定职责。
 
 ### 客户端架构
 
@@ -171,7 +175,7 @@ Interactive Brokers 适配器提供了与 IB TWS API 的全面集成。适配器
 - 处理所有 API 错误和警告。
 - 按类型对错误进行分类（客户端错误、连接问题、请求错误）。
 - 处理订阅和请求特定的错误场景。
-- 提供全面的错误日志和调试信息。
+- 提供错误日志和调试信息。
 
 #### 账户管理 (`InteractiveBrokersClientAccountMixin`)
 
@@ -204,7 +208,7 @@ Interactive Brokers 适配器提供了与 IB TWS API 的全面集成。适配器
 ### 关键特性
 
 - **异步操作**：所有操作完全使用 Python asyncio 异步执行。
-- **强大的错误处理**：全面的错误分类和处理。
+- **错误处理**：错误分类和处理。
 - **连接韧性**：可配置重试逻辑的自动重连。
 - **消息处理**：高效的消息队列处理，适用于高吞吐量场景。
 - **状态管理**：对连接、订阅和请求进行适当的状态跟踪。
@@ -263,6 +267,7 @@ Interactive Brokers 适配器提供了与 IB TWS API 的全面集成。适配器
 
 - `IBUS30=CFD.IBCFD`
 - `XAUUSD=CMDTY.IBCMDTY`
+- `EUR.USD=CASH.IDEALPRO`
 - `AAPL=STK.SMART`
 
 此配置确保明确的金融工具识别，并支持来自任何地区的金融工具，特别是那些使用非标准符号体系、简化解析可能失败的情况。
@@ -284,24 +289,29 @@ instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
 
 **MIC 转换示例：**
 
-- `CME` → `XCME`（芝加哥商品交易所）
-- `NASDAQ` → `XNAS`（纳斯达克股票市场）
-- `NYSE` → `XNYS`（纽约证券交易所）
-- `LSE` → `XLON`（伦敦证券交易所）
+- `CME` -> `XCME`（芝加哥商品交易所）
+- `NASDAQ` -> `XNAS`（纳斯达克股票市场）
+- `NYSE` -> `XNYS`（纽约证券交易所）
+- `LSE` -> `XLON`（伦敦证券交易所）
 
 #### `symbol_to_mic_venue`
 
-对于自定义交易场所映射，使用 `symbol_to_mic_venue` 字典覆盖默认转换：
+按标的代码前缀覆盖 MIC 交易场所。在交易场所解析中**最先**应用，与 `convert_exchange_to_mic_venue` 无关。当合约的标的代码匹配某个已配置的前缀时，就使用对应的 MIC 交易场所；否则解析使用交易所（如果 `convert_exchange_to_mic_venue` 为 True，可选地进行 MIC 转换）。这对于交易所为 SMART 的 OPT 合约（例如 SPX -> XCBO）以及与 databento 风格的金融工具 ID 对齐很有用。
 
 ```python
 instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
-    convert_exchange_to_mic_venue=True,
     symbol_to_mic_venue={
-        "ES": "XCME",  # 所有 ES 期货/期权使用 CME MIC
-        "SPY": "ARCX", # SPY 特定使用 ARCA
+        "SPX": "XCBO",  # 交易所为 SMART 的 OPT -> XCBO
+        "ES": "XCME",   # 所有 ES 期货/期权使用 CME MIC
+        "SPY": "ARCX",  # SPY 特定使用 ARCA
     },
 )
+# convert_exchange_to_mic_venue 可以为 True 或 False；symbol_to_mic_venue 会被最先应用
 ```
+
+#### 交易场所解析与 `_process_contract_details`
+
+通过 `IBContract` 加载金融工具时，提供者会将 `venue=None` 传入 `_process_contract_details`，因此每个合约详情会获得各自的交易场所（通过 `symbol_to_mic_venue`、validExchanges 和 MIC 转换）。传入单个交易场所字符串的调用方仍会让所有详情使用同一个交易场所。当你有混合或 SMART 路由的结果、需要逐详情解析时，请传入 `venue=None`。
 
 ### 支持的金融工具格式
 
@@ -355,7 +365,7 @@ instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
 
 #### 合约详情 (`IBContractDetails`)
 
-- 包含全面的合约信息，包括：
+- 包含合约信息，包括：
   - 支持的订单类型
   - 交易时间和日历
   - 保证金要求
@@ -372,9 +382,13 @@ instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
 
 加载金融工具有两种主要方法：
 
+Interactive Brokers 不支持使用 `load_all=True` 加载完整的 IB 金融工具全集。请为节点在启动时所需的金融工具配置 `load_ids` 或 `load_contracts`，或在订阅某个金融工具的市场数据之前显式请求它。
+
 #### 1. 使用 `load_ids`（推荐）
 
 使用 `symbology_method=SymbologyMethod.IB_SIMPLIFIED`（默认）配合 `load_ids`，获得简洁、直观的金融工具标识：
+
+对于外汇金融工具，请使用斜杠分隔的标的代码，例如 `EUR/USD.IDEALPRO`。带点的本地标的代码形式属于原始符号体系，例如 `EUR.USD=CASH.IDEALPRO`。
 
 ```python
 from nautilus_trader.adapters.interactive_brokers.config import InteractiveBrokersInstrumentProviderConfig
@@ -523,8 +537,8 @@ IBContract(
 
 ```python
 # 连续期货示例
-IBContract(secType='CONTFUT', exchange='CME', symbol='ES')  # → ES.CME
-IBContract(secType='CONTFUT', exchange='NYMEX', symbol='CL') # → CL.NYMEX
+IBContract(secType='CONTFUT', exchange='CME', symbol='ES')  # -> ES.CME
+IBContract(secType='CONTFUT', exchange='NYMEX', symbol='CL') # -> CL.NYMEX
 
 # 启用 MIC 交易场所转换
 instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
@@ -546,7 +560,7 @@ instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
 
 ## 期权价差
 
-Interactive Brokers 通过 BAG 合约支持期权价差（option spreads），将多个期权腿组合成一个可交易的金融工具。NautilusTrader 提供了创建、加载和交易期权价差的全面支持。
+Interactive Brokers 通过 BAG 合约支持期权价差（option spreads），将多个期权腿组合成一个可交易的金融工具。NautilusTrader 提供了创建、加载和交易期权价差的支持。
 
 ### 创建期权价差金融工具 ID
 
@@ -608,7 +622,7 @@ def on_instrument(self, instrument):
 
 ## 历史数据与回测
 
-`HistoricInteractiveBrokersClient` 提供了从 Interactive Brokers 检索历史数据的全面方法，用于回测和研究目的。
+`HistoricInteractiveBrokersClient` 提供了从 Interactive Brokers 检索历史数据的方法，用于回测和研究目的。
 
 ### 支持的数据类型
 
@@ -655,7 +669,7 @@ instruments = await client.request_instruments(contracts=contracts)
 
 #### 期权链检索并存储到目录
 
-你可以在策略中使用 `request_instruments` 下载整个期权链，并通过 `update_catalog=True` 将数据保存到目录：
+你可以在策略中使用 `request_instruments` 下载整个期权链，并通过 `update_catalog=True` 将数据保存到目录这一额外好处：
 
 ```python
 # 在策略的 on_start 方法中
@@ -664,7 +678,6 @@ def on_start(self):
         venue=IB_VENUE,
         update_catalog=True,
         params={
-            "update_catalog": True,
             "ib_contracts": (
                 # SPY 期权
                 {
@@ -694,6 +707,34 @@ def on_start(self):
                     "build_options_chain": True,
                     "min_expiry_days": 0,
                     "max_expiry_days": 60,
+                },
+                # SPX 指数期权
+                {
+                    "secType": "IND",
+                    "symbol": "SPX",
+                    "exchange": "CBOE",
+                    "build_options_chain": True,
+                    "min_expiry_days": 0,
+                    "max_expiry_days": 5,
+                },
+                # ES 期货链和期货期权
+                {
+                    "secType": "CONTFUT",
+                    "exchange": "CME",
+                    "symbol": "ES",
+                    "build_futures_chain": True,
+                    "build_options_chain": True,
+                    "min_expiry_days": 0,
+                    "max_expiry_days": 2,
+                },
+                # ESTX50 指数期权（Eurex）
+                {
+                    "secType": "IND",
+                    "exchange": "EUREX",
+                    "symbol": "ESTX50",
+                    "build_options_chain": True,
+                    "min_expiry_days": 0,
+                    "max_expiry_days": 2,
                 },
             ),
         },
@@ -725,9 +766,9 @@ bars = await client.request_bars(
 ### 检索历史 tick 数据
 
 ```python
-# 请求历史 tick 数据
+# 请求历史 tick 数据（报价 tick 使用 tick_type="TRADES" 或 "BID_ASK"）
 ticks = await client.request_ticks(
-    tick_types=["TRADES", "BID_ASK"],  # 成交 tick 和报价 tick
+    tick_type="TRADES",
     start_date_time=datetime.datetime(2023, 11, 6, 9, 30),
     end_date_time=datetime.datetime(2023, 11, 6, 16, 30),
     tz_name="America/New_York",
@@ -798,7 +839,7 @@ async def download_historical_data():
 
     # 请求 tick 数据
     ticks = await client.request_ticks(
-        tick_types=["TRADES"],
+        tick_type="TRADES",
         start_date_time=datetime.datetime(2023, 11, 6, 14, 0),
         end_date_time=datetime.datetime(2023, 11, 6, 15, 0),
         tz_name="America/New_York",
@@ -858,7 +899,7 @@ Interactive Brokers 强制执行节奏限制；过多的历史数据或订单请
 
 ### InstrumentProvider 配置
 
-`InteractiveBrokersInstrumentProvider` 作为访问 IB 金融工具数据的桥梁。它支持加载单个金融工具、期权链和期货链。
+`InteractiveBrokersInstrumentProvider` 提供对 IB 金融工具数据的访问。它支持加载单个金融工具、期权链和期货链。
 
 #### 基本配置
 
@@ -922,6 +963,17 @@ advanced_config = InteractiveBrokersInstrumentProviderConfig(
 )
 ```
 
+#### 过滤证券类型
+
+使用 `filter_sec_types` 忽略特定的 IB `secType` 值。任何 `secType` 匹配此 frozenset 中条目的合约都会被跳过并记录警告（例如 `WAR` 或 `IOPT` 等不受支持的类型）：
+
+```python
+instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
+    load_ids=frozenset(["SPY.ARCA"]),
+    filter_sec_types=frozenset({"WAR", "IOPT"}),  # 排除不受支持的资产类型
+)
+```
+
 ### 与外部数据提供商的集成
 
 Interactive Brokers 适配器可以与其他数据提供商一起使用，以增强市场数据覆盖范围。使用多个数据源时：
@@ -965,7 +1017,7 @@ data_client_config = InteractiveBrokersDataClientConfig(
     ignore_quote_tick_size_updates=False,  # 包含仅数量变化的更新
     instrument_provider=instrument_provider_config,
     connection_timeout=300,  # 5 分钟
-    request_timeout=60,      # 1 分钟
+    request_timeout_secs=60,      # 1 分钟
 )
 ```
 
@@ -984,7 +1036,7 @@ production_data_config = InteractiveBrokersDataClientConfig(
     instrument_provider=instrument_provider_config,
     dockerized_gateway=dockerized_gateway_config,  # 如果使用 Docker
     connection_timeout=300,
-    request_timeout=60,
+    request_timeout_secs=60,
 )
 ```
 
@@ -999,9 +1051,10 @@ production_data_config = InteractiveBrokersDataClientConfig(
 | `use_regular_trading_hours`     | `True`                                          | 为 `True` 时，请求限于常规交易时段的 K 线。 |
 | `market_data_type`              | `REALTIME`                                      | 市场数据类型（`REALTIME`、`DELAYED`、`DELAYED_FROZEN` 等）。 |
 | `ignore_quote_tick_size_updates`| `False`                                         | 为 `True` 时，过滤仅数量变化的报价 tick。 |
+| `handle_revised_bars`           | `False`                                         | 为 `True` 时，处理来自 IB 的 K 线修订（K 线在初次发布后可能会更新）。 |
 | `dockerized_gateway`            | `None`                                          | 可选的 `DockerizedIBGatewayConfig`，用于容器化设置。 |
 | `connection_timeout`            | `300`                                           | 等待初始 API 连接的秒数。 |
-| `request_timeout`               | `60`                                            | 历史数据请求超时的秒数。 |
+| `request_timeout_secs`          | `60`                                            | 历史数据请求超时前等待的秒数。 |
 
 #### 说明
 
@@ -1009,7 +1062,7 @@ production_data_config = InteractiveBrokersDataClientConfig(
 - **`ignore_quote_tick_size_updates`**：为 `True` 时，过滤掉仅数量变化（非价格变化）的报价 tick，减少数据量。
 - **`handle_revised_bars`**：为 `True` 时，处理来自 IB 的 K 线修订（K 线在初次发布后可能会更新）。
 - **`connection_timeout`**：等待初始连接建立的最大时间。
-- **`request_timeout`**：等待历史数据请求的最大时间。
+- **`request_timeout_secs`**：等待历史数据请求的最大时间。
 
 ### 执行客户端配置选项
 
@@ -1022,12 +1075,13 @@ production_data_config = InteractiveBrokersDataClientConfig(
 | `account_id`                            | `None`                                          | Interactive Brokers 账户标识符（回退到 `TWS_ACCOUNT` 环境变量）。 |
 | `dockerized_gateway`                    | `None`                                          | 可选的 `DockerizedIBGatewayConfig`，用于容器化设置。 |
 | `connection_timeout`                    | `300`                                           | 等待初始 API 连接的秒数。 |
+| `request_timeout_secs`                  | `60`                                            | 等待请求响应（合约详情等）的秒数。 |
 | `fetch_all_open_orders`                 | `False`                                         | 为 `True` 时，拉取所有 API 客户端 ID 的未完成订单（不仅是当前会话）。 |
 | `track_option_exercise_from_position_update` | `False`                                    | 为 `True` 时，订阅实时持仓更新以检测期权行权。 |
 
 ### 执行客户端配置
 
-`InteractiveBrokersExecutionClient` 处理交易执行、订单管理、账户信息和持仓跟踪。它提供全面的订单生命周期管理和实时账户更新。
+`InteractiveBrokersExecutionClient` 处理交易执行、订单管理、账户信息和持仓跟踪。它提供订单生命周期管理和实时账户更新。
 
 #### 支持的功能
 
@@ -1151,6 +1205,16 @@ exec_config = InteractiveBrokersExecClientConfig(
 )
 ```
 
+#### 订单参数
+
+执行适配器在订单提交、订单列表提交和订单修改命令上支持 `params["exchange"]`。使用它可以为当前订单的路由覆盖 IB 合约交易所，同时保留缓存的金融工具合约：
+
+```python
+self.submit_order(order, params={"exchange": "IEX"})
+```
+
+将 `exchange` 保持未设置，或将其设置为空字符串，以使用缓存的合约交易所。
+
 #### 订单标签和高级功能
 
 适配器通过订单标签支持 IB 特定的订单参数：
@@ -1180,7 +1244,7 @@ order = order_factory.limit(
 
 #### OCA（全部撤销）订单
 
-适配器通过 `IBOrderTags` 的显式配置为 OCA 订单提供全面支持：
+适配器通过 `IBOrderTags` 的显式配置为 OCA 订单提供支持：
 
 ### 基本 OCA 配置
 
@@ -1480,7 +1544,7 @@ order_tags = IBOrderTags(
 
 ### 完整交易节点配置
 
-设置完整的交易环境需要配置 `TradingNodeConfig` 及其所有必要组件。以下是针对不同场景的完整示例。
+设置完整的交易环境需要配置 `TradingNodeConfig` 及其所有必要组件。以下是针对不同场景的示例。
 
 #### 模拟交易配置
 
@@ -1556,7 +1620,6 @@ node = TradingNode(config=config_node)
 node.add_data_client_factory(IB, InteractiveBrokersLiveDataClientFactory)
 node.add_exec_client_factory(IB, InteractiveBrokersLiveExecClientFactory)
 node.build()
-node.portfolio.set_specific_venue(IB_VENUE)
 
 if __name__ == "__main__":
     try:
@@ -1634,6 +1697,185 @@ exec_client_config = InteractiveBrokersExecClientConfig(
 )
 ```
 
+### 用于不同账户的多个 IB 执行客户端
+
+NautilusTrader 支持同时使用多个 Interactive Brokers 执行客户端，每个客户端连接到不同的 IB 账户。当你需要使用多个账户进行交易时，这很有用，例如：
+
+- 为不同策略使用独立账户
+- 同时运行模拟交易和实盘交易账户
+- 同一 IB 登录下的多个受管账户
+
+要配置多个 IB 执行客户端，请在 `exec_clients` 字典中提供具有唯一键的多个条目。每个条目指定不同的 `account_id`：
+
+```python
+from nautilus_trader.adapters.interactive_brokers.config import (
+    InteractiveBrokersDataClientConfig,
+    InteractiveBrokersExecClientConfig,
+    InteractiveBrokersInstrumentProviderConfig,
+    SymbologyMethod,
+    IBMarketDataTypeEnum,
+)
+from nautilus_trader.live.config import TradingNodeConfig, RoutingConfig, LoggingConfig
+from nautilus_trader.model.identifiers import AccountId, Venue, ClientId
+
+# 共享的金融工具提供者配置
+instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
+    symbology_method=SymbologyMethod.IB_SIMPLIFIED,
+)
+
+# 数据客户端（所有账户共享）
+data_client_config = InteractiveBrokersDataClientConfig(
+    ibg_host="127.0.0.1",
+    ibg_port=7497,
+    ibg_client_id=1,
+    market_data_type=IBMarketDataTypeEnum.REALTIME,
+    instrument_provider=instrument_provider_config,
+)
+
+# 多个 IB 执行客户端的配置
+config_node = TradingNodeConfig(
+    trader_id="MULTI-ACCOUNT-001",
+    logging=LoggingConfig(log_level="INFO"),
+
+    # 所有账户共享单个数据客户端
+    data_clients={
+        "IB": data_client_config,
+    },
+
+    # 多个执行客户端，每个账户一个
+    exec_clients={
+        # 第一个账户：模拟交易账户
+        "IB-PAPER": InteractiveBrokersExecClientConfig(
+            ibg_host="127.0.0.1",
+            ibg_port=7497,
+            ibg_client_id=2,  # 唯一的 IB API 客户端 ID
+            account_id="DU123456",  # 模拟交易账户 ID
+            instrument_provider=instrument_provider_config,
+            routing=RoutingConfig(default=False),  # 非默认
+        ),
+
+        # 第二个账户：实盘交易账户
+        "IB-LIVE": InteractiveBrokersExecClientConfig(
+            ibg_host="127.0.0.1",
+            ibg_port=7497,
+            ibg_client_id=3,  # 唯一的 IB API 客户端 ID
+            account_id="U987654",  # 实盘账户 ID
+            instrument_provider=instrument_provider_config,
+            routing=RoutingConfig(default=True),  # 设为默认
+        ),
+
+        # 第三个账户：另一个受管账户
+        "IB-ACCOUNT3": InteractiveBrokersExecClientConfig(
+            ibg_host="127.0.0.1",
+            ibg_port=7497,
+            ibg_client_id=4,  # 唯一的 IB API 客户端 ID
+            account_id="U456789",  # 另一个账户 ID
+            instrument_provider=instrument_provider_config,
+            routing=RoutingConfig(default=False),
+        ),
+    },
+)
+```
+
+**多个 IB 执行客户端的要点：**
+
+1. **唯一键**：`exec_clients` 中的每个条目必须有唯一的键（例如 `"IB-PAPER"`、`"IB-LIVE"`）。此键将成为该客户端的 `account_issuer`。
+
+2. **唯一客户端 ID**：每个执行客户端必须使用不同的 `ibg_client_id`（2、3、4 等）。IB Gateway/TWS 要求每个 API 连接使用唯一的客户端 ID。
+
+3. **账户 ID**：每个执行客户端必须指定与登录 IB Gateway/TWS 的账户匹配的不同 `account_id`。
+
+4. **账户标识符**：系统会创建如下的 `AccountId` 实例：
+   - `AccountId("IB-PAPER-DU123456")`
+   - `AccountId("IB-LIVE-U987654")`
+   - `AccountId("IB-ACCOUNT3-U456789")`
+
+5. **路由**：订单和查询会根据以下条件自动路由到正确的执行客户端：
+   - 命令中显式的 `client_id`
+   - `account_id` 签发者（对于 `QueryAccount` 命令或设置了 account_id 的订单）
+   - 默认客户端（如果某个客户端标记为 `routing=RoutingConfig(default=True)`）
+
+6. **投资组合查询**：查询投资组合属性时，你可以指定：
+   - `account_id` 用于账户特定查询：`portfolio.realized_pnls(account_id=AccountId("IB-PAPER-DU123456"))`
+   - `venue` 用于跨该交易场所所有账户的聚合查询：`portfolio.realized_pnls(venue=Venue("IB-PAPER"))`
+
+**示例：在策略中使用多个 IB 执行客户端：**
+
+```python
+from nautilus_trader.model.identifiers import AccountId, ClientId
+from nautilus_trader.trading.strategy import Strategy
+
+class MultiAccountStrategy(Strategy):
+    """使用多个 IB 账户的示例策略。"""
+
+    def on_start(self):
+        # 定义账户 ID 以便引用
+        self.paper_account = AccountId("IB-PAPER-DU123456")
+        self.live_account = AccountId("IB-LIVE-U987654")
+
+        # 查询模拟账户余额
+        paper_account_state = self.cache.account(self.paper_account)
+        if paper_account_state:
+            self.log.info(f"Paper account balance: {paper_account_state.balance_total()}")
+
+        # 查询实盘账户余额
+        live_account_state = self.cache.account(self.live_account)
+        if live_account_state:
+            self.log.info(f"Live account balance: {live_account_state.balance_total()}")
+
+    def submit_order_to_paper(self, order):
+        """向模拟交易账户提交订单。"""
+        self.submit_order(order, client_id=ClientId("IB-PAPER"))
+
+    def submit_order_to_live(self, order):
+        """向实盘交易账户提交订单。"""
+        self.submit_order(order, client_id=ClientId("IB-LIVE"))
+
+    def check_paper_pnl(self, instrument_id):
+        """检查模拟账户的已实现盈亏。"""
+        pnl = self.portfolio.realized_pnl(
+            instrument_id=instrument_id,
+            account_id=self.paper_account
+        )
+        return pnl
+
+    def check_live_pnl(self, instrument_id):
+        """检查实盘账户的已实现盈亏。"""
+        pnl = self.portfolio.realized_pnl(
+            instrument_id=instrument_id,
+            account_id=self.live_account
+        )
+        return pnl
+```
+
+**示例：使用多个 IB 客户端查询账户信息：**
+
+```python
+from nautilus_trader.model.identifiers import AccountId
+
+# 查询特定账户
+paper_account = cache.account(AccountId("IB-PAPER-DU123456"))
+live_account = cache.account(AccountId("IB-LIVE-U987654"))
+
+# 使用 account_id 查询账户（推荐方法）
+paper_account_by_id = cache.account(AccountId("IB-PAPER-DU123456"))
+
+# 备选方案：使用 account_id 参数查询账户（同样有效）
+paper_account_via_account_id = cache.account_for_venue(
+    account_id=AccountId("IB-PAPER-DU123456")
+)
+
+# 按账户查询投资组合属性
+paper_realized_pnl = portfolio.realized_pnl(
+    instrument_id=instrument_id,
+    account_id=AccountId("IB-PAPER-DU123456")
+)
+
+# 查询跨所有 IB 账户聚合的投资组合属性
+# 注意：这会跨具有相同交易场所的所有账户进行聚合
+all_ib_realized_pnl = portfolio.realized_pnls(venue=Venue("IB"))
+```
+
 ### 运行交易节点
 
 ```python
@@ -1646,9 +1888,6 @@ def run_trading_node():
         node.add_data_client_factory(IB, InteractiveBrokersLiveDataClientFactory)
         node.add_exec_client_factory(IB, InteractiveBrokersLiveExecClientFactory)
         node.build()
-
-        # 设置投资组合的交易场所
-        node.portfolio.set_specific_venue(IB_VENUE)
 
         # 在此添加你的策略
         # node.trader.add_strategy(YourStrategy())
@@ -1754,7 +1993,7 @@ data_config = InteractiveBrokersDataClientConfig(
 # 设置合理的超时时间
 config = InteractiveBrokersDataClientConfig(
     connection_timeout=300,  # 5 分钟
-    request_timeout=60,      # 1 分钟
+    request_timeout_secs=60,      # 1 分钟
     # ... 其他配置
 )
 ```
@@ -1834,3 +2073,10 @@ if not instruments:
 - **NautilusTrader 示例**：[GitHub Examples](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/interactive_brokers)
 - **IB 合约搜索**：[Contract Information Center](https://pennies.interactivebrokers.com/cstools/contract_info/)
 - **市场数据订阅**：[IB Market Data](https://www.interactivebrokers.com/en/pricing/market-data-pricing.php)
+
+## 贡献
+
+:::info
+如需更多功能或为 Interactive Brokers 适配器做贡献，请参阅我们的
+[贡献指南](https://github.com/nautechsystems/nautilus_trader/blob/develop/CONTRIBUTING.md)。
+:::

@@ -22,13 +22,19 @@ Rust 的 panic 绝不能跨 `extern "C"` 函数进行栈展开 (unwind)。向 C 
 如果遗漏步骤 **3**，分配的内存将在进程的剩余生命周期内泄漏；如果步骤 **3** 被执行**两次**，程序将发生双重释放并很可能崩溃。
 :::
 
+## 类型化的 CVec 封装与 Send
+
+`CVec` 是无类型的所有权元数据。不要为原始的 `CVec` 类型实现 `Send`：它可以表示任意 `T` 的 `Vec<T>`，包括非 `Send` 的元素类型。当 PyO3 要求某个 capsule 载荷实现 `Send` 时，应为具体的载荷类型引入一个狭窄的封装，并仅在记录清楚该载荷的不变式 (invariant) 之后，才在该封装上添加 `unsafe impl Send`。
+
+举例来说，DataFFI 流式 capsule 使用 `DataFfiCVec`，它是围绕 `CVec` 的透明封装，其内存分配始终来自 `Vec<DataFFI>`。
+
 ## Python 侧创建的 Capsule
 
 若干 Cython 辅助函数使用 `PyMem_Malloc` 分配临时 C 缓冲区，将其封装为 `CVec`，并将地址包装在 `PyCapsule` 中返回。**每个此类 capsule 在创建时都注册了析构函数** (`capsule_destructor` 或 `capsule_destructor_deltas`)，用于释放缓冲区和 `CVec`。因此调用者*不得*手动释放内存——否则会导致双重释放。
 
 ## Rust 侧创建的 Capsule *（PyO3 绑定 (binding)）*
 
-当 Rust 代码将堆分配的值传递给 Python 时，**必须**使用 `PyCapsule::new_with_destructor`，以便 Python 知道在 capsule 不可达时如何释放该分配。闭包/析构函数负责重建原始的 `Box<T>` 或 `Vec<T>` 并让其析构。
+当 Rust 代码将堆分配的值传递给 Python 且 Python 成为最终所有者时，**必须**使用 `PyCapsule::new_with_destructor`，以便 Python 知道在 capsule 不可达时如何释放该分配。闭包/析构函数负责重建原始的 `Box<T>` 或 `Vec<T>` 并让其析构。
 
 ```rust
 use pyo3::types::PyCapsule;
@@ -54,7 +60,23 @@ Python::attach(|py| {
 });
 ```
 
-**不要**使用 `PyCapsule::new(…, None)`；该变体*不会*注册析构函数，除非接收方手动提取并释放指针 (pointer)（而我们从不依赖这种做法），否则会泄漏内存。代码库已在所有位置更新以遵循此规则——新增的 FFI 模块必须遵循相同模式。
+**不要**使用 `PyCapsule::new(…, None)`；该变体*不会*注册析构函数，除非接收方手动提取并释放指针 (pointer)，否则会泄漏内存。
+
+### 带显式 drop 的 Rust 所有权 CVec capsule
+
+Rust 所有权的 `CVec` 批量 capsule 是上述"析构函数拥有所有权"模式的一个显式例外。仅当 Python/Cython 消费者必须先将批量数据提取为 Python 对象、然后再显式释放 Rust 分配时，才使用此模式。
+
+此模式的要求如下：
+
+1. 将原始 `CVec` 封装在类型特定的 capsule 载荷中，例如 `DataFfiCVec`。
+2. 在将 capsule 指针强制转换回 `*mut CVec` 之前，将该封装标记为相对于 `CVec` 的 `#[repr(transparent)]`，或使用 `#[repr(C)]` 并将 `CVec` 作为第一个字段。
+3. 为该 capsule 赋予一个稳定、显式的名称，例如 `nautilus.DataFFI.CVec`。此模式下不要使用默认的无名 capsule。
+4. 要求所有消费者在读取指针之前都检查相同的 capsule 名称。
+5. 暴露一个类型特定的 drop 函数，例如 `drop_cvec_pycapsule`。
+6. 仅对作为 `CVec` 批量创建的 capsule 调用该 drop 函数。绝不要将单值 capsule（例如由 `data_to_pycapsule` 创建的 capsule）传给 `CVec` 的 drop 函数。
+7. 校验 `len <= cap`，拒绝非空的空指针，并处理空 `CVec` 值。
+8. 在调用 `Vec::from_raw_parts` 之前，将存储的 `CVec` 元数据重置为 `CVec::empty()`，这样清理路径就可以多次调用该 drop 函数而不会发生双重释放。
+9. 为错误的 capsule 名称、无效的元数据、空 capsule 以及重复 drop 添加测试。
 
 ## 为何不再有通用的 `cvec_drop`
 

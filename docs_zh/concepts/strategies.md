@@ -1,7 +1,6 @@
 # 策略 (Strategies)
 
-NautilusTrader 用户体验的核心在于编写和使用交易策略 (strategy)。
-定义策略需要继承 `Strategy` 类，并实现策略逻辑所需的方法。
+策略继承 `Strategy` 类，并实现其逻辑所需的方法。
 
 **核心能力**：
 
@@ -15,13 +14,11 @@ NautilusTrader 用户体验的核心在于编写和使用交易策略 (strategy)
 我们建议在深入策略开发之前，先阅读 [Actors](actors.md) 指南。
 :::
 
-策略可以在任何[环境上下文](/concepts/architecture.md#environment-contexts)中添加到 Nautilus 系统，系统启动后会立即根据策略逻辑开始发送命令和接收事件。
+策略可以在任何[环境上下文](architecture.md#environment-contexts)中添加到 Nautilus 系统，系统一旦启动，就会立即根据其逻辑开始发送命令和接收事件。
 
-利用数据 (data) 摄取、事件处理和订单管理这些基本构建模块（我们将在下文讨论），可以实现任何类型的策略，包括方向性、动量、再平衡、配对交易、做市等。
+利用数据 (data) 摄取、事件处理和订单管理这些基本构建模块（我们将在下文讨论），可以构建任何类型的策略，包括方向性、动量、再平衡、配对交易、做市等。
 
-:::info
-请参阅 `Strategy` [API 参考](../api_reference/trading.md)，获取所有可用方法的完整说明。
-:::
+请参阅 [`Strategy` API 参考](/docs/python-api-latest/trading.html)，获取所有可用方法。
 
 Nautilus 交易策略由两个主要部分组成：
 
@@ -43,7 +40,7 @@ Nautilus 交易策略由两个主要部分组成：
 
 ## 策略实现
 
-由于交易策略是继承自 `Strategy` 的类，你必须定义一个构造函数来处理初始化。至少需要初始化基类/父类：
+交易策略继承自 `Strategy`，因此你必须定义一个构造函数。至少需要初始化基类：
 
 ```python
 from nautilus_trader.trading.strategy import Strategy
@@ -56,22 +53,22 @@ class MyStrategy(Strategy):
 在此基础上，你可以根据需要实现处理器 (handler)，以便根据状态 (state) 转换和事件执行相应操作。
 
 :::warning
-不要在 `__init__` 构造函数中调用 `clock` 和 `logger` 等组件 (component)（此时尚未注册）。
+不要在 `__init__` 构造函数中（注册之前）调用 `clock` 和 `logger` 等组件 (component)。
 这是因为系统时钟和日志子系统尚未初始化。
 :::
 
 ### 处理器
 
-处理器是 `Strategy` 类中的方法，可根据不同类型的事件或状态变化执行相应操作。
-这些方法以 `on_*` 为前缀命名。你可以根据策略的具体目标和需求，选择实现其中任意或全部处理器方法。
+处理器是 `Strategy` 类中的方法，可根据事件或状态变化执行相应操作。
+这些方法以 `on_*` 为前缀。你可以根据策略的需求实现其中任意或全部处理器。
 
-为类似类型的事件提供多个处理器的目的是提供处理粒度上的灵活性。
-这意味着你可以选择使用专用处理器响应特定事件，也可以使用更通用的处理器来响应一系列相关事件（使用典型的 switch 语句逻辑）。
-处理器按照从最具体到最通用的顺序依次调用。
+为类似类型的事件提供多个处理器，是为了让你能够控制处理粒度。
+你可以用专用处理器响应特定事件，也可以用通用处理器响应一系列相关事件（使用典型的 switch 语句逻辑）。
+系统按照从最具体到最通用的顺序依次调用处理器。
 
 #### 状态动作
 
-这些处理器由 `Strategy` 的生命周期 (lifecycle) 状态变化触发。建议：
+生命周期 (lifecycle) 状态变化会触发这些处理器。建议：
 
 - 使用 `on_start` 方法初始化策略（例如获取金融工具 (instrument)、订阅数据）。
 - 使用 `on_stop` 方法执行清理任务（例如取消未完成订单、关闭已开持仓、取消数据订阅）。
@@ -91,7 +88,6 @@ def on_load(self, state: dict[str, bytes]) -> None:
 #### 数据处理
 
 这些处理器接收数据更新，包括内置的行情数据 (market data) 和用户自定义数据。
-你可以使用这些处理器定义收到数据对象实例时的操作。
 
 ```python
 from nautilus_trader.core import Data
@@ -102,6 +98,8 @@ from nautilus_trader.model import TradeTick
 from nautilus_trader.model import OrderBookDeltas
 from nautilus_trader.model import InstrumentClose
 from nautilus_trader.model import InstrumentStatus
+from nautilus_trader.model import OptionChainSlice
+from nautilus_trader.model import OptionGreeks
 from nautilus_trader.model.instruments import Instrument
 
 def on_order_book_deltas(self, deltas: OrderBookDeltas) -> None:
@@ -112,6 +110,8 @@ def on_bar(self, bar: Bar) -> None:
 def on_instrument(self, instrument: Instrument) -> None:
 def on_instrument_status(self, data: InstrumentStatus) -> None:
 def on_instrument_close(self, data: InstrumentClose) -> None:
+def on_option_greeks(self, greeks: OptionGreeks) -> None:
+def on_option_chain(self, chain: OptionChainSlice) -> None:
 def on_historical_data(self, data: Data) -> None:
 def on_data(self, data: Data) -> None:  # 自定义数据传递给此处理器
 def on_signal(self, signal: Data) -> None:  # 自定义信号传递给此处理器
@@ -204,6 +204,8 @@ def on_event(self, event: Event) -> None:
 - 请求历史数据（用于填充指标）。
 - 订阅实时数据。
 
+缓存检查在实盘交易中很重要。直接订阅假设金融工具已经由 instrument provider 配置加载，或由先前的金融工具请求加载。
+
 ```python
 def on_start(self) -> None:
     """
@@ -231,9 +233,7 @@ def on_start(self) -> None:
 
 策略可以访问一个 `Clock`，它提供了多种方法来创建不同的时间戳，以及设置时间提醒或定时器来触发 `TimeEvent`。
 
-:::info
-请参阅 `Clock` [API 参考](../api_reference/common.md)，获取所有可用方法的完整列表。
-:::
+请参阅 [`Clock` API 参考](/docs/python-api-latest/common.html)，获取所有可用方法。
 
 #### 当前时间戳
 
@@ -288,8 +288,8 @@ self.clock.set_timer(
 
 ### 缓存访问
 
-可以访问交易实例的中央 `Cache` 来获取数据和执行对象（订单、持仓等）。
-有许多可用方法，通常带有过滤功能，这里我们介绍一些基本用例。
+交易实例的中央 `Cache` 存储数据和执行对象（订单、持仓等）。
+有许多可用方法，通常带有过滤功能，这里介绍一些基本用例。
 
 #### 获取数据
 
@@ -309,16 +309,13 @@ last_bar = self.cache.bar(bar_type)
 ```python
 order = self.cache.order(client_order_id)
 position = self.cache.position(position_id)
-
 ```
 
-:::info
-请参阅 `Cache` [API 参考](../api_reference/cache.md)，获取所有可用方法的完整说明。
-:::
+请参阅 [`Cache` API 参考](/docs/python-api-latest/cache.html)，获取所有可用方法。
 
 ### 投资组合访问
 
-可以访问交易的中央 `Portfolio` 来获取账户和持仓信息。
+交易实例的中央 `Portfolio` 提供账户和持仓信息。
 以下展示了可用方法的概览。
 
 #### 账户和持仓信息
@@ -352,29 +349,18 @@ def is_flat(self, instrument_id: InstrumentId) -> bool
 def is_completely_flat(self) -> bool
 ```
 
-:::info
-请参阅 `Portfolio` [API 参考](../api_reference/portfolio.md)，获取所有可用方法的完整说明。
-:::
+请参阅 [`Portfolio` API 参考](/docs/python-api-latest/portfolio.html)，获取所有可用方法。
 
 #### 报告与分析
 
-`Portfolio` 还提供了一个 `PortfolioAnalyzer`，可以输入灵活数量的数据（以适应不同的回溯窗口）。分析器可以提供绩效指标和统计数据的跟踪和生成。
+`Portfolio` 还提供了一个 `PortfolioAnalyzer`，可以接受灵活数量的数据（以适应不同的回溯窗口）。该分析器会跟踪并生成绩效指标和统计数据。
 
-:::info
-请参阅 `PortfolioAnalyzer` [API 参考](../api_reference/analysis.md)，获取所有可用方法的完整说明。
-:::
-
-:::info
-请参阅[投资组合统计](portfolio.md#portfolio-statistics)指南。
-:::
+请参阅 [`PortfolioAnalyzer` API 参考](/docs/python-api-latest/analysis.html)和[投资组合统计](portfolio.md#portfolio-statistics)指南。
 
 ### 交易命令
 
-NautilusTrader 提供了一套全面的交易命令，支持为算法交易量身定制的精细订单管理。这些命令对于执行策略、管理风险 (risk) 以及确保与各交易场所 (venue) 的无缝交互至关重要。在以下章节中，我们将深入探讨每个命令及其用例。
-
-:::info
-[执行](../concepts/execution.md) (Execution) 指南解释了系统中的流程，结合以下内容阅读会很有帮助。
-:::
+以下交易命令可用于订单管理。
+另请参阅[执行](../concepts/execution.md) (Execution) 指南，了解通过系统的完整流程。
 
 #### 提交订单
 
@@ -410,7 +396,7 @@ NautilusTrader 提供了一套全面的交易命令，支持为算法交易量�
 - **可恢复**：模拟订单可持久化，系统崩溃后重启能恢复状态
 :::
 
-以下示例提交一个用于模拟的 `LIMIT` 买入订单（参见[模拟订单](orders.md#emulated-orders)）：
+以下示例提交一个用于模拟的 `LIMIT` 买入订单（参见[模拟订单](orders/emulated.md)）：
 
 ```python
 from nautilus_trader.model.enums import OrderSide
@@ -482,9 +468,7 @@ def buy(self) -> None:
 以下展示如何取消单个订单：
 
 ```python
-
 self.cancel_order(order)
-
 ```
 
 以下展示如何批量取消订单：
@@ -495,15 +479,12 @@ from nautilus_trader.model.orders import Order
 
 my_order_list: list[Order] = [order1, order2, order3]
 self.cancel_orders(my_order_list)
-
 ```
 
 以下展示如何取消所有订单：
 
 ```python
-
 self.cancel_all_orders()
-
 ```
 
 #### 修改订单
@@ -534,18 +515,74 @@ from nautilus_trader.model import Quantity
 
 new_quantity: Quantity = Quantity.from_int(5)
 self.modify_order(order, new_quantity)
-
 ```
 
 :::info
 价格和触发价格也可以修改（当处于模拟状态或交易场所支持时）。
 :::
 
+#### 市场退出
+
+`market_exit()` 方法提供了一种优雅的方式，用于退出策略的所有持仓并取消所有订单。
+退出完成后策略仍保持运行，如果你需要，之后可以重新入场。
+
+```python
+self.market_exit()
+```
+
+市场退出流程：
+
+1. 取消该策略所有未成交和在途 (in-flight) 的订单。
+2. 用市价单关闭所有未平仓持仓。
+3. 周期性检查（间隔为 `market_exit_interval_ms`），直到所有订单都已结清且持仓全部关闭。
+4. 一旦持仓归零 (flat)，或达到 `market_exit_max_attempts` 后，调用 `post_market_exit()`。
+
+提供了两个钩子用于自定义逻辑：
+
+- `on_market_exit()` —— 退出流程开始时调用。
+- `post_market_exit()` —— 退出流程完成时调用。
+
+```python
+class MyStrategy(Strategy):
+    def on_market_exit(self) -> None:
+        self.log.info("Beginning market exit...")
+
+    def post_market_exit(self) -> None:
+        self.log.info("Market exit complete")
+```
+
+在市场退出期间，非 reduce-only 的订单会被自动拒绝 (denied)。对于订单列表 (order list)，如果列表中有任何一个订单不是 reduce-only，则整个列表都会被拒绝，以保持列表语义（例如带有相互依赖关系的 bracket 订单）。
+
+要检查退出是否正在进行（例如，以跳过提交订单的逻辑），使用 `is_exiting()`：
+
+```python
+def on_quote_tick(self, tick: QuoteTick) -> None:
+    if self.is_exiting():
+        return  # 退出期间跳过订单逻辑
+    # ... 正常的订单逻辑
+```
+
+要在策略停止时自动执行市场退出，设置 `manage_stop=True`：
+
+```python
+config = StrategyConfig(manage_stop=True)
+```
+
+启用此选项后，调用 `stop()` 会先执行市场退出，待持仓归零后再停止策略。
+
+`StrategyConfig` 中的配置选项：
+
+- `manage_stop`（默认值：False）—— 如果为 True，`stop()` 会在停止前执行市场退出。
+- `market_exit_interval_ms`（默认值：100）—— 退出完成检查之间的间隔。
+- `market_exit_max_attempts`（默认值：100）—— 完成退出前的最大检查次数。
+- `market_exit_time_in_force`（默认值：None/GTC）—— 关闭市价单的有效期类型 (time in force)。
+- `market_exit_reduce_only`（默认值：True）—— 关闭市价单是否应为 reduce only。
+
 ## 策略配置
 
-独立配置类的主要目的是为交易策略的实例化提供完全的灵活性，包括在何处以及如何实例化。这包括能够通过网络序列化策略及其配置，使分布式回测和远程启动实盘交易成为可能。
+独立的配置类对策略在何处以及如何实例化提供了完全的灵活性。配置可以通过网络序列化，从而支持分布式回测和远程实盘交易。
 
-这种配置灵活性实际上是可选的，你可以选择不使用任何策略配置，只使用你传入策略构造函数的参数。如果你想运行分布式回测或远程启动实盘交易服务器，那么你需要定义一个配置。
+这是可选的。你可以跳过配置，直接将参数传给策略构造函数。如果你想要分布式回测或远程实盘交易，则需要定义一个配置。
 
 以下是一个配置示例：
 
@@ -580,7 +617,7 @@ class MyStrategy(Strategy):
 
     def on_start(self) -> None:
         self.time_started = self.clock.utc_now()    # 记录策略启动时间
-        self.subscribe_bars(self.config.bar_type)   # 通过 `self.config` 访问配置数据
+        self.subscribe_bars(self.config.bar_type)   # 查看如何通过 `self.config` 暴露配置数据
 
     def on_bar(self, bar: Bar):
         self.count_of_processed_bars += 1           # 更新已处理的 K线 计数
@@ -600,8 +637,8 @@ config = MyStrategyConfig(
 strategy = MyStrategy(config=config)
 ```
 
-在实现策略时，建议直接通过 `self.config` 访问配置值。
-这提供了清晰的分离：
+通过 `self.config` 访问配置值。
+这在两者之间提供了清晰的分离：
 
 - 配置数据（通过 `self.config` 访问）：
   - 包含定义策略工作方式的初始设置。
@@ -628,14 +665,30 @@ strategy = MyStrategy(config=config)
 
 ### 多策略
 
-如果你打算运行同一策略的多个实例，使用不同的配置（例如交易不同的金融工具），那么你需要为每个策略定义一个唯一的 `order_id_tag`（如上所示）。
+如果你打算运行同一策略的多个实例，使用不同的配置（例如交易不同的金融工具），那么每个实例都需要一个唯一的策略 ID 和 order ID tag。
+
+如果未提供 `strategy_id`，平台会根据策略类名和 order ID tag 构建策略 ID。该 tag 可通过 `order_id_tag` 提供；否则注册时会分配下一个数字 tag，从 `000` 开始。例如，上述配置生成的策略 ID 为 `MyStrategy-001`。
+
+如果同时提供了 `strategy_id` 和 `order_id_tag`，Rust 会将该 tag 追加到运行时策略 ID 后面，除非该 ID 已经以这个 tag 结尾。例如，`strategy_id=MyStrategy-PRIMARY` 配合 `order_id_tag=ABC` 会变成 `MyStrategy-PRIMARY-ABC`。
+如果省略了 `order_id_tag`，Rust 会使用 `strategy_id` 中以连字符分隔的最后一部分作为 order ID tag。
 
 :::note
 平台有内置的安全措施：如果两个策略共享重复的策略 ID，在注册时会抛出 `RuntimeError`，提示该策略 ID 已被注册。
 :::
 
-原因是系统必须能够识别各种命令和事件属于哪个策略。策略 ID 由策略类名和策略的 `order_id_tag` 以连字符分隔组成。例如上述配置将生成策略 ID `MyStrategy-001`。
+这样做的原因是，系统必须能够识别各种命令和事件属于哪个策略。order ID tag 还能保证同一交易者下不同策略生成的 client order ID 保持唯一。
 
-:::note
-请参阅 `StrategyId` [API 参考](../api_reference/model/identifiers.md)，获取更多详情。
+:::info Rust 实现
+Rust 将 `StrategyConfig` 视为不可变的构造输入。运行时的 `StrategyId` 携带 order ID tag，与 Python/Cython 的行为一致。这使得 actor 注册、client order ID 生成、order list ID 生成和 position ID 生成都通过 `strategy_id.get_tag()` 保持一致。
+
+如果省略了 `strategy_id`，`order_id_tag` 会覆盖生成的后缀，例如 `MyStrategy-ABC`。
 :::
+
+请参阅 [`StrategyId` API 参考](/docs/python-api-latest/model/identifiers.html)，获取更多详情。
+
+## 相关指南
+
+- [Actors](actors.md) —— 策略所继承的基类。
+- [Events](events.md) —— 事件类型与处理器分发。
+- [Orders](orders/) —— 从策略管理的订单类型与订单管理。
+- [Backtesting](backtesting.md) —— 用历史数据测试策略。

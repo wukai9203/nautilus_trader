@@ -26,35 +26,24 @@ NautilusTrader 可以同时处理多个策略 (strategy) 和交易场所 (venue)
 - `query_account(...)`（查询账户）
 - `query_order(...)`（查询订单）
 
-这些方法在内部创建必要的执行命令，并通过消息总线将其发送到相关组件（点对点），同时发布任何事件（例如新订单的初始化，即 `OrderInitialized` 事件）。
+这些方法在内部创建必要的执行命令，并通过消息总线将其发送到相关组件（点对点），同时发布诸如 `OrderInitialized` 之类的事件。
 
-一般的执行流程如下（每个箭头表示消息通过消息总线传递）：
+并非每个命令都遵循单一的线性路径：
 
-`Strategy` -> `OrderEmulator` -> `ExecAlgorithm` -> `RiskEngine` -> `ExecutionEngine` -> `ExecutionClient`
+- `submit_order(...)` 对于模拟订单会路由到 `OrderEmulator`，当设置了 `exec_algorithm_id` 时会路由到 `ExecAlgorithm`，否则路由到 `RiskEngine`。
+- `submit_order_list(...)` 根据是否模拟以及 `exec_algorithm_id` 遵循相同的分支行为。
+- `modify_order(...)` 对于模拟订单会路由到 `OrderEmulator`，否则路由到 `RiskEngine`。
+- 撤单和查询命令可以根据命令和订单状态直接路由到 `OrderEmulator`、`ExecAlgorithm` 或 `ExecutionEngine`。
 
-`OrderEmulator` 和 `ExecAlgorithm` 组件在流程中是可选的，取决于各个订单的参数（如下所述）。
+对于新订单提交，典型流程如下：
 
-:::note 何时跳过 OrderEmulator 和 ExecAlgorithm？
+`Strategy` -> `OrderEmulator` 或 `ExecAlgorithm` 或 `RiskEngine`
 
-执行流程的实际路径由每个订单的参数决定：
+从那里开始，下游流程通常为：
 
-| 组件 | 触发条件 | 跳过条件 |
-|------|---------|---------|
-| **OrderEmulator** | 订单的 `emulation_trigger` 设置为非 `NO_TRIGGER` 的值（如 `BID_ASK`、`LAST_PRICE`） | `emulation_trigger=NO_TRIGGER`（默认）或未指定 |
-| **ExecAlgorithm** | 订单指定了 `exec_algorithm_id`（如 TWAP 算法） | `exec_algorithm_id` 未指定 |
+`OrderEmulator` -> `ExecAlgorithm` 或 `ExecutionEngine`
 
-**最常见路径**（无模拟、无执行算法）：
-
-`Strategy` -> `RiskEngine` -> `ExecutionEngine` -> `ExecutionClient`
-
-**带本地模拟（等待触发）路径**（例如模拟止损单）：
-
-`Strategy` -> `OrderEmulator`（持有，等待触发）-> `RiskEngine` -> `ExecutionEngine` -> `ExecutionClient`
-
-**带执行算法路径**（例如 TWAP 拆单）：
-
-`Strategy` -> `ExecAlgorithm`（接收主订单，派生子订单）-> `RiskEngine` -> `ExecutionEngine` -> `ExecutionClient`
-:::
+`ExecAlgorithm` -> `RiskEngine` -> `ExecutionEngine` -> `ExecutionClient`
 
 下图展示了 Nautilus 执行组件之间的消息流（命令和事件）。
 
@@ -67,10 +56,13 @@ flowchart LR
     engine[ExecutionEngine]
     client[ExecutionClient]
 
-    strategy <--> emulator
-    strategy <--> algo
-    strategy <--> risk
-    emulator --> risk
+    strategy --> emulator
+    strategy --> algo
+    strategy --> risk
+    strategy --> engine
+    emulator -. OrderReleased .-> risk
+    emulator --> algo
+    emulator --> engine
     algo --> risk
     risk <--> engine
     engine <--> client
@@ -127,20 +119,33 @@ Nautilus 尚不支持交易场所侧的对冲模式，例如 Binance 的 `BOTH` 
 配置回测 (backtest) 时，可以为交易场所指定 `oms_type`。为提高回测准确性，建议将其与交易场所实际使用的 OMS 类型相匹配。
 :::
 
+### 自定义持仓 ID 与 NETTING
+
+自定义持仓 ID 仅在 `HEDGING` OMS 下有效。在 `NETTING` 下，按定义每个（品种，策略）组合只有单一持仓，引擎会为其分配一个形如 `{instrument_id}-{strategy_id}` 的确定性 ID。
+
+`ExecutionEngine` 在提交时强制执行此规则。如果有效的 OMS 解析为 `NETTING`，而调用 `submit_order`（或 `submit_order_list`）时携带的 `position_id` 与 `{instrument_id}-{strategy_id}` 不匹配，则该订单会被拒绝，并附带一个说明不匹配原因的 `OrderDenied` 事件。
+
+此规则仍然允许常见的平仓写法：`Strategy.close_position(position)` 会转发 `position.id`，在 `NETTING` 下它恰好就是那个确定性 ID，因此会被接受。若要用任意 ID 标记或划分持仓，请将策略配置为 `oms_type=HEDGING`。
+
+对于 `submit_order_list`，当提供了 `position_id` 时，无论 OMS 类型如何，引擎还会额外拒绝任何混合品种的订单列表。一个持仓只属于单一品种，因此该组合会被拒绝，并附带明确的 `OrderDenied` 原因。关于混合品种的更多注意事项，请参阅[订单列表](orders/advanced.md#order-lists)。
+
 ## 风险引擎 (Risk Engine)
 
-`RiskEngine` 是每个 Nautilus 系统的核心组件，包括回测、沙盒和实盘环境。每个订单命令和事件都会通过风险引擎，除非在 `RiskEngineConfig` 中特别绕过。
+`RiskEngine` 是每个 Nautilus 系统的组件，包括回测、沙盒和实盘环境。它位于提交和改单路径上，同时也接收来自 `OrderEmulator` 的订单事件，例如 `OrderReleased`。撤单和查询命令直接路由到其他执行组件，不会经过 `RiskEngine`。
 
-风险引擎包含多个内置的交易前风险 (risk) 检查，包括：
+除非在 `RiskEngineConfig` 中特别绕过，否则引擎会校验：
 
-- 价格精度与品种一致。
-- 价格为正值（期权类型品种除外）。
-- 数量精度与品种一致。
-- 低于品种的最大名义价值。
-- 在品种的最大或最小数量范围内。
-- 当订单指定了 `reduce_only` 执行指令时，仅允许减仓操作。
+- 品种的价格精度和触发价格精度。
+- 价格为正值，除非品种允许负价格（期权、期货价差、期权价差和现货商品）。
+- 数量精度以及基础数量的最小/最大范围。
+- GTD 订单尚未过期。
+- `reduce_only` 订单不会增加所引用的持仓。
+- 引擎级别的 `max_notional_per_order` 限制和品种的 `max_notional` 限制。
+- 非保证金账户的现金账户余额影响。
+- 提交和改单的速率限制。
+- 交易状态限制（`ACTIVE`、`HALTED`、`REDUCING`）。
 
-如果任何风险检查失败，系统会生成 `OrderDenied` 事件，有效地关闭该订单并阻止其继续进行。该事件包含可读的拒绝原因。
+如果提交时的风险检查失败，系统会生成一个带有可读原因的 `OrderDenied` 事件。如果改单时的风险检查失败，则生成一个 `OrderModifyRejected` 事件。
 
 ### 交易状态
 
@@ -148,13 +153,11 @@ Nautilus 尚不支持交易场所侧的对冲模式，例如 Binance 的 `BOTH` 
 
 `TradingState` 枚举有三个变体：
 
-- `ACTIVE`：正常运行。
-- `HALTED`：在状态改变之前不处理后续订单命令。
-- `REDUCING`：仅处理撤单或减少未平仓持仓的命令。
+- `ACTIVE`：提交和改单命令正常运行。
+- `HALTED`：新的提交和改单命令被拒绝。撤单仍可通过。
+- `REDUCING`：允许撤单，且仅接受不会增加敞口的提交或改单命令。
 
-:::info
-更多详情请参阅 `RiskEngineConfig` [API 参考](../api_reference/config#risk)。
-:::
+更多详情请参阅 [`RiskEngineConfig` API 参考](/docs/python-api-latest/config.html#nautilus_trader.risk.config.RiskEngineConfig)。
 
 ## 执行算法
 
@@ -162,13 +165,13 @@ Nautilus 尚不支持交易场所侧的对冲模式，例如 Binance 的 `BOTH` 
 
 ### TWAP（时间加权平均价格）
 
-TWAP 执行算法旨在通过在指定的时间范围内均匀分配来执行订单。算法接收一个代表总数量和方向的主订单，然后通过派生较小的子订单来拆分，这些子订单在整个时间范围内按固定间隔执行。
+TWAP 算法将执行均匀地分散在指定的时间范围内。算法接收一个代表总数量和方向的主订单，然后派生较小的子订单，这些子订单按固定间隔执行。
 
-这有助于减少主订单全部数量对市场的冲击，最大限度地降低任何给定时间的交易量集中度。
+这通过将交易量随时间分散来减少全部订单数量对市场的冲击。
 
 算法会立即提交第一个订单，最后提交的订单是时间范围结束时的主订单。
 
-以 TWAP 算法为例（位于 ``/examples/algorithms/twap.py``），以下示例演示了如何直接在 `BacktestEngine` 中初始化和注册 TWAP 执行算法（假设引擎已初始化）：
+以 TWAP 算法为例（位于 `nautilus_trader/examples/algorithms/twap.py`），以下示例演示了如何直接在 `BacktestEngine` 中初始化和注册 TWAP 执行算法（假设引擎已初始化）：
 
 ```python
 from nautilus_trader.examples.algorithms.twap import TWAPExecAlgorithm
@@ -214,7 +217,7 @@ strategy = EMACrossTWAP(config=config)
 
 ### 编写执行算法
 
-要实现自定义执行算法，必须定义一个继承自 `ExecAlgorithm` 的类。
+要构建自定义执行算法，需定义一个继承自 `ExecAlgorithm` 的类。
 
 执行算法是 `Actor` 的一种类型，因此它能够：
 
@@ -230,7 +233,7 @@ strategy = EMACrossTWAP(config=config)
 一旦执行算法注册且系统运行后，它将通过 `exec_algorithm_id` 订单参数从消息总线接收寻址到其 `ExecAlgorithmId` 的订单。订单还可能携带 `exec_algorithm_params`，它是一个 `dict[str, Any]`。
 
 :::warning
-由于 `exec_algorithm_params` 字典的灵活性，务必彻底验证所有键值对以确保算法正确运行（首先确认字典不为 ``None`` 且所有必需参数确实存在）。
+由于 `exec_algorithm_params` 字典的灵活性，务必彻底验证所有键值对以确保算法正确运行（首先确认字典不为 `None` 且所有必需参数确实存在）。
 :::
 
 收到的订单将通过以下 `on_order(...)` 方法到达。这些收到的订单在被执行算法处理时被称为"主"（原始）订单。
@@ -252,13 +255,17 @@ def on_order(self, order: Order) -> None:
 未来版本将根据需要实现更多订单类型。
 :::
 
-这些方法中的每一个都以主（原始）`Order` 作为第一个参数。主订单数量将减去传入的 `quantity`（成为派生订单的数量）。
+这些方法中的每一个都以主（原始）`Order` 作为第一个参数。默认情况下，主订单数量会减去派生订单的 `quantity`。可以通过传入 `reduce_primary=False` 来禁用此行为。
 
 :::warning
-主订单必须有足够的剩余数量（这会被验证）。
+当 `reduce_primary=True` 时，派生数量不得超过主订单的 `leaves_qty`（剩余未成交数量）。
 :::
 
-一旦派生了所需数量的次级订单且执行例程结束，算法的意图是最终发送主（原始）订单。
+:::note
+如果派生订单在被接受前被拒绝或否决，扣减的数量会自动恢复到主订单上。一旦被交易场所接受，该扣减即视为已确认。
+:::
+
+执行算法可以根据其设计持续派生次级订单、提交剩余的主订单，或两者兼有。内置的 TWAP 示例在最后一个间隔提交剩余的主订单。
 
 ### 派生订单
 
@@ -289,6 +296,7 @@ def orders_for_exec_algorithm(
     instrument_id: InstrumentId | None = None,
     strategy_id: StrategyId | None = None,
     side: OrderSide = OrderSide.NO_ORDER_SIDE,
+    account_id: AccountId | None = None,
 ) -> list[Order]:
 ```
 
@@ -335,11 +343,11 @@ def orders_for_exec_spawn(self, exec_spawn_id: ClientOrderId) -> list[Order]:
 
 :::
 
-许多方法公开的可选 `accepted_buffer_ns` 参数是一个基于时间的保护机制，仅返回 `ts_accepted` 至少在指定纳秒之前的订单。尚未被交易场所接受的订单其 `ts_accepted = 0`，因此在缓冲窗口过去后它们会被包含在内。要排除这些在途订单，必须将缓冲与显式状态过滤器配合使用（例如，限制为 `ACCEPTED` / `PARTIALLY_FILLED`）。
+许多方法公开的可选 `accepted_buffer_ns` 参数是一个基于时间的保护机制，仅返回 `ts_accepted` 至少在指定纳秒之前的订单。当 `accepted_buffer_ns > 0` 时，还必须提供 `ts_now`。尚未被交易场所接受的订单其 `ts_accepted = 0`，因此在缓冲窗口过去后它们会被包含在内。要排除这些在途订单，必须将缓冲与显式状态过滤器配合使用（例如，限制为 `ACCEPTED` / `PARTIALLY_FILLED`）。
 
 ### 审计
 
-在实盘交易中，可以定期将自有订单簿与缓存的订单索引进行审计对比，以确保一致性。审计机制验证已关闭的订单是否已正确移除，以及在途订单（已提交但尚未接受）是否在交易场所延迟窗口期间仍被跟踪。
+在实盘交易中，可以定期将自有订单簿与缓存的未平仓及在途订单索引进行审计对比，以确保一致性。审计机制验证已关闭的订单是否已正确移除，以及在途订单（已提交但尚未接受）是否在交易场所延迟窗口期间仍被跟踪。
 
 审计间隔可以通过实盘交易配置中的 `own_books_audit_interval_secs` 参数进行配置。
 
@@ -380,7 +388,7 @@ def orders_for_exec_spawn(self, exec_spawn_id: ClientOrderId) -> list[Order]:
 - 通过 WebSocket 到达的实时成交事件。
 - 定期对账轮询交易场所的成交历史。
 
-如果同一笔成交通过两个通道以不同标识符到达，且在去重之前两者都可能被应用到订单上。这在以下情况下尤其可能发生：
+如果同一笔成交在去重发生之前通过两个通道以不同标识符到达，则两者都可能被应用到订单上。这在以下情况下尤其可能发生：
 
 - 系统启动时，对账在 WebSocket 连接建立的同时运行。
 - 网络不稳定导致成交过程中重连。
@@ -392,7 +400,7 @@ def orders_for_exec_spawn(self, exec_spawn_id: ClientOrderId) -> list[Order]:
 - **对账频率增加**：将 `open_check_interval_secs` 设置为激进的值（例如 1-2 秒）会增加系统轮询交易场所的频率，从而增加与实时事件产生竞态条件的机会。
 - **启动延迟降低**：`reconciliation_startup_delay_secs` 设置（默认 10 秒）在持续对账开始前为 WebSocket 连接的稳定提供时间。降低此值会增加启动窗口期间重复成交的可能性。
 
-更多配置详情请参阅[持续对账](live.md#continuous-reconciliation)。
+更多配置详情请参阅[持续对账](../how_to/configure_live_trading.md#continuous-reconciliation)。
 
 ### 系统行为
 
@@ -428,6 +436,8 @@ def orders_for_exec_spawn(self, exec_spawn_id: ClientOrderId) -> list[Order]:
 
 此预过滤确保来自交易场所重放或对账竞态的"噪声重复"在触发模型完整性错误之前就被过滤掉。如果交易场所确实需要更正成交数据，应使用正确的执行报告语义，而不是使用相同的 `trade_id` 重新发送。
 
+对账生成的 `trade_id` 值是对账成交输入的确定性哈希，因此重启时重放对账会产生相同的 `trade_id`，并由此过滤器去重，而不会被视为新的成交。
+
 ### 配置
 
 对于实盘交易，在 `LiveExecEngineConfig` 中启用超额成交容忍：
@@ -447,3 +457,40 @@ config = LiveExecEngineConfig(
 :::warning
 当 `allow_overfills=False`（默认值）时，被拒绝的成交可能导致系统与交易场所之间的持仓差异。请使用[对账](live.md#execution-reconciliation)功能来检测和解决此类差异。
 :::
+
+## 对账报告
+
+执行引擎在实盘交易中消费适配器发出的四种对账报告变体。每种变体有不同的作用，并且在匹配订单尚未存在于本地缓存时有不同的回退处理。
+
+| 变体                    | 用例                                                       | 订单不在缓存中                          |
+|------------------------|--------------------------------------------------------------|---------------------------------------|
+| `OrderStatusReport`    | 独立的订单状态更新。                                         | 根据报告创建外部订单；如果状态为 `PartiallyFilled`/`Filled`，则根据 `avg_px`/`filled_qty` 合成一个推断成交。 |
+| `FillReport`           | 独立的执行。                                                 | 根据成交创建外部订单（`OrderType::Market`，数量为 `last_qty`）；随后应用真实成交，以保留其 `trade_id` 和 `commission`。 |
+| `OrderWithFills`       | 订单状态更新与产生它的成交捆绑在一起。                       | 创建外部订单时不带推断成交；先应用提供的成交；`report.filled_qty` 与所提供 `last_qty` 之和之间的任何残余差额，用一个推断成交补齐。 |
+| `PositionStatusReport` | 来自交易场所的持仓快照。                                     | 仅记录日志；持仓由成交派生，不在此处引导初始化。 |
+
+### 各变体的使用时机
+
+适配器根据交易场所的传输格式针对给定事件实际投递的内容来选择变体：
+
+- 对于普通的订单生命周期更新（Accepted、PartiallyFilled、Canceled、Expired），且成交详情通过另一个流单独到达的情况，使用 `OrderStatusReport`。
+- 对于仅在交易场所发起的平仓时呈现成交、而从不开立用户级订单的交易场所，使用 `FillReport`（典型例子是 Hyperliquid 清算：用户会收到一条带有 `liquidation` 元数据的 `userFills` 记录，但订单流上没有对应条目）。
+- 当单个交易场所事件同时映射到一个状态更新和一个或多个成交，且适配器在同一时间点同时具备两者时，使用 `OrderWithFills`。捆绑使引擎能够应用真实的成交元数据（`trade_id`、`commission`），仅针对残余数量合成一个推断成交。Binance Futures 通过 `dispatch_exchange_generated_fill` 将其用于交易所生成的 ADL、清算和结算订单。
+
+### 外部订单创建
+
+当报告引用的订单不在缓存中时（交易场所发起的 ADL / 清算 / 结算、由其他进程下达的订单，或本地尚未观察到的订单），引擎会创建一个*外部订单*并将所有权路由到：
+
+- 已通过 `register_external_order_claims` 认领该品种的策略，或
+- 作为默认回退的 `EXTERNAL` 策略。
+
+外部订单的 `client_order_id` 在报告中存在时取自报告，否则由 `venue_order_id` 派生。订单会被添加到缓存，交易场所订单 ID 索引会被注册，引擎会发出相应的生命周期事件（`OrderAccepted`、`OrderFilled`、`OrderCanceled`、`OrderExpired`），以便持仓通过正常的事件管道进行更新。
+
+这意味着以单个 `FillReport` 到达的 Hyperliquid 清算，以及以捆绑 `OrderWithFills` 到达的 Binance ADL，都会更新本地持仓，无需策略侧做任何处理。
+
+## 相关指南
+
+- [事件](events.md) - 订单和持仓事件类型及分发。
+- [订单](orders/) - 订单类型与管理。
+- [持仓](positions.md) - 从执行中跟踪持仓。
+- [策略](strategies.md) - 从策略提交订单。

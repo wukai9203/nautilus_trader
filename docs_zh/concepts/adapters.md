@@ -48,10 +48,11 @@ flowchart LR
 
 金融工具提供者将交易场所的 API 响应解析为 Nautilus `Instrument` 对象。
 
-`InstrumentProvider` 提供的金融工具有以下用途：
+`InstrumentProvider` 服务于两种使用场景：
 
-- 独立使用，用于发现某个集成中可用的金融工具，将其用于研究或回测 (backtest) 目的
-- 在 `sandbox` 或 `live` [环境上下文](architecture.md#environment-contexts)中使用，供 Actor/策略 (strategy) 消费
+- 独立发现可用的金融工具，用于研究或回测 (backtest)
+- 在 `sandbox` 或 `live` [环境上下文](architecture.md#environment-contexts)中为
+  Actor 和策略 (strategy) 进行运行时加载
 
 ### 研究和回测
 
@@ -62,6 +63,7 @@ import asyncio
 import os
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
+from nautilus_trader.adapters.binance.common.enums import BinanceEnvironment
 from nautilus_trader.adapters.binance import get_cached_binance_http_client
 from nautilus_trader.adapters.binance.futures.providers import BinanceFuturesInstrumentProvider
 from nautilus_trader.common.component import LiveClock
@@ -75,7 +77,7 @@ async def main():
         account_type=BinanceAccountType.USDT_FUTURES,
         api_key=os.getenv("BINANCE_FUTURES_TESTNET_API_KEY"),
         api_secret=os.getenv("BINANCE_FUTURES_TESTNET_API_SECRET"),
-        is_testnet=True,
+        environment=BinanceEnvironment.TESTNET,
     )
 
     provider = BinanceFuturesInstrumentProvider(
@@ -96,9 +98,10 @@ if __name__ == "__main__":
 
 ### 实盘交易 (Live trading)
 
-每个集成的实现方式各不相同，在实盘交易中，`InstrumentProvider` 在 `TradingNode` 内的行为通常有两种配置 (configuration) 选项：
+每个集成的实现方式各不相同。`TradingNode` 内的 `InstrumentProvider`
+通常提供两种加载行为：
 
-- 启动时自动加载所有金融工具：
+- 启动时加载所有金融工具：
 
 ```python
 from nautilus_trader.config import InstrumentProviderConfig
@@ -106,11 +109,14 @@ from nautilus_trader.config import InstrumentProviderConfig
 InstrumentProviderConfig(load_all=True)
 ```
 
-- 仅加载配置中明确指定的金融工具：
+- 仅加载配置中指定的金融工具：
 
 ```python
 InstrumentProviderConfig(load_ids=["BTCUSDT-PERP.BINANCE", "ETHUSDT-PERP.BINANCE"])
 ```
+
+订阅本身不会加载金融工具。在策略订阅实时数据之前，请将提供者配置为在启动时
+加载该金融工具，或显式请求该金融工具并等待其进入缓存。
 
 ## 数据客户端 (Data clients)
 
@@ -146,6 +152,7 @@ class MyStrategy(Strategy):
 
 ```python
 def on_start(self) -> None:
+    # 假定该金融工具已经加载到缓存中
     # 订阅实时逐笔成交更新
     self.subscribe_trade_ticks(InstrumentId.from_str("BTCUSDT-PERP.BINANCE"))
 
@@ -174,8 +181,14 @@ def on_bar(self, bar: Bar) -> None:
 - 与交易场所协调订单状态。
 - 处理账户和持仓 (position) 更新。
 
-订单流由 `ExecutionEngine` 管理，它根据订单的交易场所将命令路由到相应的执行客户端。有关从策略角度进行订单管理的详细信息，请参阅[执行](execution.md)指南。
+`ExecutionEngine` 根据订单的交易场所将命令路由到相应的执行客户端。有关从策略角度进行订单管理的详细信息，请参阅[执行](execution.md)指南。
 
 :::tip
 有关实现自定义适配器的信息，请参阅[适配器开发者指南](../developer_guide/adapters.md)。
 :::
+
+## 相关指南
+
+- [实盘交易](live.md) - 配置并运行使用适配器的实盘交易。
+- [执行](execution.md) - 通过适配器进行订单执行。
+- [数据](data.md) - 由适配器提供的市场数据。

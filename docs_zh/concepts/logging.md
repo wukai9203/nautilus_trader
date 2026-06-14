@@ -108,7 +108,7 @@ flowchart TB
 可以通过导入 `LoggingConfig` 对象来配置日志。
 默认情况下，日志级别 (log level) 为 'INFO' 及以上的 `LogLevel` 事件会被写入标准输出/标准错误。
 
-日志级别 (`LogLevel`) 的值包括（通常与 Rust 的 `tracing` 级别过滤器匹配）。
+日志级别 (`LogLevel`) 的值包括以下几种（与标准日志级别约定一致）。
 
 支持以下日志级别：
 
@@ -134,7 +134,7 @@ TRACE 级别的限制来自以下原因：
 若需调试 Rust 组件的内部行为，将 `log_level` 设置为 `"TRACE"` 即可在日志输出中捕获这些消息——它们会与 Python 产生的 DEBUG/INFO 消息混合出现。
 :::
 
-更多详情请参阅 `LoggingConfig` [API 参考](../api_reference/config.md#class-loggingconfig)。
+更多详情请参阅 `LoggingConfig` [API 参考](/docs/python-api-latest/config.html#nautilus_trader.common.config.LoggingConfig)。
 
 日志可以通过以下方式配置：
 
@@ -270,29 +270,6 @@ export NAUTILUS_LOG="stdout=Info;fileout=Debug;RiskEngine=Error;is_colored"
 对于仅 Rust 二进制文件，设置 `NAUTILUS_LOG` 可在首次使用时启用日志子系统的延迟初始化，无需显式调用 `init_logging()`。
 :::
 
-### 模块路径过滤（仅 Rust）
-
-使用 `NAUTILUS_LOG` 环境变量时，除组件名称外，还可以按 Rust 模块路径进行过滤。包含 `::` 的键被视为使用前缀匹配的模块路径过滤器，不含 `::` 的键则是使用精确匹配的组件过滤器。
-
-```bash
-# 将所有适配器过滤为 Warn 级别，但允许 OKX 使用 Debug 级别
-export NAUTILUS_LOG="stdout=Info;nautilus_okx=Warn;nautilus_okx::websocket=Debug"
-```
-
-最长匹配前缀优先。在上面的示例中，`nautilus_okx::websocket::handler` 将使用 `Debug` 级别（更长的前缀），而 `nautilus_okx::data` 将使用 `Warn` 级别。
-
-:::tip
-Rust 日志宏在未提供显式组件时会自动捕获模块路径。这使模块级过滤能与标准日志调用无缝配合。
-:::
-
-:::note
-模块路径过滤仅通过 `NAUTILUS_LOG` 环境变量可用。Python 的 `log_component_levels` 配置仅使用组件名称匹配。
-:::
-
-:::warning
-如果 `log_components_only=True`（或规范字符串中存在 `log_components_only`）且 `log_component_levels` 为空，则不会向标准输出/标准错误或文件输出任何日志消息。请至少添加一个组件过滤器，或禁用仅组件日志。
-:::
-
 ### 仅组件日志
 
 当需要关注嘈杂系统中的某个子集时，启用 `log_components_only` 可以仅记录 `log_component_levels` 中明确列出的组件的消息。无论全局 `log_level` 或文件级别如何，其他所有组件都将被抑制。
@@ -316,16 +293,38 @@ logging = LoggingConfig(
 export NAUTILUS_LOG="stdout=Info;log_components_only;RiskEngine=Debug;Portfolio=Info"
 ```
 
+### 模块路径过滤（仅 Rust）
+
+使用 `NAUTILUS_LOG` 环境变量时，除组件名称外，还可以按 Rust 模块路径进行过滤。包含 `::` 的键被视为使用前缀匹配的模块路径过滤器，不含 `::` 的键则是使用精确匹配的组件过滤器。
+
+```bash
+# 将所有适配器过滤为 Warn 级别，但允许 OKX 使用 Debug 级别
+export NAUTILUS_LOG="stdout=Info;nautilus_okx=Warn;nautilus_okx::websocket=Debug"
+```
+
+最长匹配前缀优先。在上面的示例中，`nautilus_okx::websocket::handler` 将使用 `Debug` 级别（更长的前缀），而 `nautilus_okx::data` 将使用 `Warn` 级别。
+
+:::tip
+Rust 日志宏在未提供显式组件时会自动捕获模块路径。这使模块级过滤能与标准日志调用无缝配合。
+:::
+
+:::note
+模块路径过滤仅通过 `NAUTILUS_LOG` 环境变量可用。Python 的 `log_component_levels` 配置仅使用组件名称匹配。
+:::
+
+:::warning
+如果 `log_components_only=True`（或规范字符串中存在 `log_components_only`）且 `log_component_levels` 为空，则不会向标准输出/标准错误或文件输出任何日志消息。请至少添加一个组件过滤器，或禁用仅组件日志。
+:::
+
 ### 日志颜色
 
 ANSI 颜色代码用于增强在终端中查看日志时的可读性。
-这些颜色代码可以更容易地区分日志消息的不同部分。
 在不支持 ANSI 颜色渲染的环境中（例如某些云环境或文本编辑器），
 这些颜色代码可能不太合适，因为它们会显示为原始文本。
 
 为了适应这些场景，可以将 `LoggingConfig.log_colors` 选项设置为 `false`。
-禁用 `log_colors` 将阻止向日志消息添加 ANSI 颜色代码，确保
-在不支持颜色渲染的不同环境中的兼容性。
+禁用 `log_colors` 将阻止向日志消息添加 ANSI 颜色代码，
+从而避免在不支持颜色渲染的环境中出现原始转义字符。
 
 ## 直接使用日志记录器
 
@@ -343,7 +342,7 @@ logger = Logger("MyLogger")
 ```
 
 :::info
-更多详情请参阅 `init_logging` [API 参考](../api_reference/common.md)。
+更多详情请参阅 `init_logging` [API 参考](/docs/python-api-latest/common.html)。
 :::
 
 :::warning
@@ -366,9 +365,9 @@ logger = Logger("MyLogger")
 
 此机制确保：
 
-1. 日志消息不会因线程过早终止而丢失。
+1. `LogGuard` 保持日志线程活动，并在释放时刷新日志；突然终止（崩溃、kill 信号）仍可能丢失缓冲中的日志。
 2. 只要存在任何 `LogGuard`，日志线程就保持活动状态。
-3. 当程序结束时，所有缓冲的日志都会被正确刷新到目标位置。
+3. 当程序优雅关闭时，所有缓冲的日志都会被正确刷新到目标位置。
 
 ### 为什么使用 LogGuard？
 
@@ -501,3 +500,7 @@ tracing 订阅者每个进程只能初始化一次。在 `LoggingConfig` 中使�
 
 此问题在 GitHub [issue #3027](https://github.com/nautechsystems/nautilus_trader/issues/3027) 中跟踪。
 目前正在考虑一种更确定性的关闭机制。
+
+## 相关指南
+
+- [架构](architecture.md) - 系统架构，包括日志基础设施。

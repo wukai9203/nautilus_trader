@@ -190,7 +190,7 @@ BitMEX 集成支持以下订单类型和执行功能。
 | `STOP_LIMIT`           | ✓    | 支持（设置 `price` 和 `trigger_price`）。     |
 | `MARKET_IF_TOUCHED`    | ✓    | 支持（设置 `trigger_price`）。                |
 | `LIMIT_IF_TOUCHED`     | ✓    | 支持（设置 `price` 和 `trigger_price`）。     |
-| `TRAILING_STOP_MARKET` | -    | *未实现*（BitMEX 支持）。                     |
+| `TRAILING_STOP_MARKET` | ✓    | 支持（设置 `trailing_offset`）。仅价格偏移类型。|
 
 ### 执行指令
 
@@ -240,6 +240,79 @@ order = self.order_factory.stop_market(
 
 `ExecTester` 示例配置也演示了在 `examples/live/bitmex/bitmex_exec_tester.py` 中设置 `stop_trigger_type=TriggerType.MARK_PRICE`。
 
+### 追踪止损
+
+BitMEX 支持追踪止损订单，当市场朝有利方向移动时自动调整止损价格。适配器将
+`TRAILING_STOP_MARKET` 订单映射到 BitMEX 的挂钩订单（Pegged Orders），使用
+`TrailingStopPeg` 价格类型。
+
+**限制：**
+
+- 仅支持 `PRICE` 追踪偏移类型（绝对价格偏移，而非基点或 tick）。
+- 偏移符号自动处理：卖出止损使用负偏移，买入止损使用正偏移。
+- 触发类型可与追踪止损组合使用以实现额外控制。
+
+**示例**：
+
+```python
+from nautilus_trader.model.enums import TrailingOffsetType
+
+order = self.order_factory.trailing_stop_market(
+    instrument_id=instrument_id,
+    order_side=OrderSide.SELL,
+    quantity=qty,
+    trailing_offset=Decimal("100"),  # $100 追踪偏移
+    trailing_offset_type=TrailingOffsetType.PRICE,
+    trigger_type=TriggerType.LAST_PRICE,  # 可选
+)
+```
+
+:::note
+BitMEX 随着市场移动定期更新追踪止损价格。
+当市场朝触发水平移动时，止损价格会冻结。
+有关当前更新节奏的详情，请参阅 [BitMEX API 文档](https://www.bitmex.com/app/perpetualContractsGuide)。
+:::
+
+### 挂钩订单
+
+BitMEX 支持自动跟踪参考价格的挂钩订单（Pegged Orders，BBO）。适配器通过
+`submit_order` 上的 `params` 字典支持挂钩订单，这会在交易所端将订单类型
+覆盖为 `Pegged`。
+
+| 挂钩价格类型   | 描述                                                             |
+|----------------|------------------------------------------------------------------|
+| `PrimaryPeg`   | 挂钩到最优买价（买入）或最优卖价（卖出）。                       |
+| `MarketPeg`    | 挂钩到对手方（买入挂钩最优卖价，卖出挂钩最优买价）。             |
+| `MidPricePeg`  | 挂钩到买卖价之间的中间价。                                       |
+| `LastPeg`      | 挂钩到最新成交价。                                               |
+
+**要求**：
+
+- 底层订单必须是 `LIMIT` 订单。其他订单类型将被拒绝。
+- `peg_price_type` 是必需的；`peg_offset_value` 是可选的（默认为 0）。
+- `peg_offset_value` 可以为负值（如卖方偏移）或小数。
+
+**示例**：
+
+```python
+# 挂钩到最优买价，零偏移（BBO）
+order = self.order_factory.limit(
+    instrument_id=instrument_id,
+    order_side=OrderSide.BUY,
+    quantity=qty,
+    price=price,  # LIMIT 订单必需，但会被挂钩覆盖
+)
+self.submit_order(order, params={"peg_price_type": "PrimaryPeg", "peg_offset_value": "0"})
+
+# 挂钩到中间价，偏移 -0.5
+self.submit_order(order, params={"peg_price_type": "MidPricePeg", "peg_offset_value": "-0.5"})
+```
+
+:::note
+构造 `LimitOrder` 时仍然需要 `price` 字段，但 BitMEX 对挂钩订单会忽略它，
+而是持续跟踪参考价格加偏移。
+:::
+
 ### 有效期
 
 | 有效期         | 支持 | 备注                                                |
@@ -257,13 +330,13 @@ order = self.order_factory.stop_market(
 
 ### 高级订单功能
 
-| 功能             | 支持 | 备注                                           |
-|------------------|------|------------------------------------------------|
-| 订单修改         | ✓    | 修改价格、数量和触发价格。                     |
-| 条件单组合       | -    | 使用 `contingency_type` 和 `linked_order_ids`。|
-| 冰山订单         | ✓    | 使用 `display_qty`。                           |
-| 追踪止损         | -    | *未实现*（BitMEX 支持）。                      |
-| 挂钩订单         | -    | *未实现*（BitMEX 支持）。                      |
+| 功能             | 支持 | 备注                                                                     |
+|------------------|------|--------------------------------------------------------------------------|
+| 订单修改         | ✓    | 修改价格、数量和触发价格。                                               |
+| 条件单组合       | ✓    | 使用 `contingency_type` 和 `linked_order_ids`。                          |
+| 冰山订单         | ✓    | 使用 `display_qty`。                                                     |
+| 追踪止损         | ✓    | 使用 `trailing_offset`。仅价格偏移类型。                                 |
+| 挂钩订单         | ✓    | 使用带 `peg_price_type` 的 `params`。参见[挂钩订单](#挂钩订单)。         |
 
 ### 批量操作
 
@@ -290,10 +363,33 @@ order = self.order_factory.stop_market(
 | 订单状态更新        | ✓    | 通过 WebSocket 实时推送订单状态变化。        |
 | 交易历史            | ✓    | 执行和成交报告。                             |
 
+### 强平和 ADL 处理
+
+BitMEX 通过 `execution` 频道上的 `execType` 字段呈现强制平仓的成交：
+
+| `execType`    | 含义                                                         |
+|---------------|--------------------------------------------------------------|
+| `Trade`       | 正常执行（用户或 taker 发起）。                              |
+| `Liquidation` | 持仓被强平引擎强制平仓。BitMEX 对自动减仓（ADL）和对手方强平成交都使用此代码。 |
+| `Bankruptcy`  | 账户破产；持仓针对保险基金平仓。                            |
+| `Settlement`  | 计划内的合约结算。                                           |
+| `Funding`     | 对未平仓持仓的资金费结算。                                   |
+
+适配器将 `Liquidation` 和 `Bankruptcy` 通过标准的 `FillReport` 路径路由，
+并在破产执行时记录警告。BitMEX 的公开 API **不**在 `execType` 中区分
+自动减仓和对手方强平；两者都显示为 `Liquidation`。ADL 平仓的持仓通常可以
+通过零佣金以及本地缓存中缺少对应订单来识别（引擎会为其创建一个外部订单）。
+
+上游参考：
+
+- [`/execution` 字段定义](https://support.bitmex.com/hc/en-gb/articles/6205689858077--execution-field-definitions)
+- [自动减仓概览](https://support.bitmex.com/hc/en-gb/articles/18589621443357-What-is-Auto-Deleveraging)
+- [强平概览](https://support.bitmex.com/hc/en-gb/articles/360003188434-Liquidations)
+
 ## 市场数据
 
 - 订单簿增量：仅 `L2_MBP`；`depth` 为 0（完整订单簿）或 25。
-- 订单簿快照：仅 `L2_MBP`；`depth` 为 0（默认 10）或 10。
+- 订单簿 depth10 快照：通过 `orderBook10` 频道提供固定的 10 档。
 - 通过 WebSocket 支持报价、成交和金融工具更新。
 - 在适用的情况下支持资金费率、标记价格和指数价格。
 - 通过 REST 进行历史请求：
@@ -304,11 +400,19 @@ order = self.order_factory.stop_market(
 BitMEX 每次 REST 响应上限为 1,000 行，需要通过 `start`/`startTime` 手动分页。当前适配器仅返回第一页；更广泛的分页支持计划在未来更新中提供。
 :::
 
+### 成交 ID 推导
+
+成交 Tick 和成交使用场所提供的 `trdMatchID`（UUID）作为 `TradeId`。当场所
+省略 `trdMatchID` 时（分桶成交或某些执行类型），执行路径回退到场所的
+`execID`；市场数据解析器回退到对代码、`ts_event`、价格、数量和方向的
+确定性 FNV-1a 哈希。同一场所事件在重放（Replay）中产生相同的成交 ID，
+保持下游去重完整。
+
 ## 连接管理
 
 ### HTTP Keep-Alive
 
-BitMEX 适配器利用 HTTP keep-alive 以获得最佳性能：
+BitMEX 适配器使用 HTTP keep-alive 以获得最佳性能：
 
 - **连接池**：连接自动池化和复用。
 - **Keep-alive 超时**：90 秒（与 BitMEX 服务器端超时匹配）。
@@ -324,6 +428,12 @@ BitMEX 使用 `api-expires` 头部进行请求认证以防止重放攻击：
 - 签名请求包含一个 `api-expires` Unix 时间戳，设置为当前时间往后 `recv_window_ms / 1000` 秒（默认 10 秒）。
 - 一旦该时间戳过期，BitMEX 将拒绝任何请求，因此请将延迟保持在配置的窗口内。
 
+## 资金费率
+
+适配器从 [Funding](https://www.bitmex.com/app/wsAPI#Funding)
+WebSocket 流接收资金费率数据。BitMEX 在每条消息中返回一个 `fundingInterval`
+日期时间字段，适配器读取其小时和分钟来计算 `FundingRateUpdate` 上的 `interval` 字段。
+
 ## 限流
 
 BitMEX 实施双层限流（Rate Limiting）系统：
@@ -334,7 +444,7 @@ BitMEX 实施双层限流（Rate Limiting）系统：
 - **滚动分钟限制**：认证用户每分钟 120 个请求（未认证用户每分钟 30 个请求）。
 - **订单上限**：每个交易对 200 个未完成订单和 10 个止损单；超过这些上限将触发交易所端拒绝。
 
-适配器自动执行这些配额，并公开 BitMEX 在每个响应中返回的限流头部信息。
+适配器使用配置的 `max_requests_per_second` 和 `max_requests_per_minute` 值在本地执行这些配额。
 
 ### WebSocket 限制
 
@@ -363,7 +473,7 @@ BitMEX 实施双层限流（Rate Limiting）系统：
 
 取消广播器（当 `canceller_pool_size > 1` 时）将每个取消请求并行分发到多个独立的 HTTP 客户端。每个客户端维护自己的限流器，这意味着有效请求速率会乘以池大小。
 
-**示例**：当 `canceller_pool_size=3`（默认）且 `max_requests_per_second=10` 时，单次取消操作消耗 **3 个请求**（每个客户端一个），如果快速取消，可能达到 **每秒 30 个请求**。
+**示例**：当 `canceller_pool_size=3` 且 `max_requests_per_second=10` 时，单次取消操作消耗 **3 个请求**（每个客户端一个），如果快速取消，可能达到 **每秒 30 个请求**。
 
 由于 BitMEX 在**账户级别**（而非每个连接）执行限流，广播器可能会导致你超过交易所默认的每秒 10 个请求突发和每分钟 120 个请求滚动窗口限制。
 
@@ -390,10 +500,10 @@ BitMEX 执行客户端包含一个提交广播器（Submit Broadcaster），通�
 
 - **并行分发**：提交请求同时广播到多个独立的 HTTP 客户端实例。
 - **首次成功短路**：第一个成功响应获胜，最小化到接受确认的延迟。
-- **唯一 client_order_id 后缀**：每次广播尝试使用唯一的 `client_order_id`（原始 ID，然后递增后缀 `-1`、`-2` 等），以避免重复订单 ID 被拒绝。
-- **延迟与重复的权衡**：接受潜在重复成交的风险，换取更低的最小延迟和更高的接受保证。
+- **共享 client_order_id**：所有传输使用相同的 `client_order_id`。BitMEX 以 "duplicate clOrdID" 拒绝重复提交（被跟踪为预期拒绝）。
+- **延迟与重复的权衡**：接受潜在重复成交的风险（如果多个传输在拒绝之前成功），换取更低的最小延迟和更高的接受保证。
 
-这种架构通过跨多个网络路径并行化来降低订单接受的最小延迟。请注意，所有提交的订单都可能成交，导致多次执行，策略必须适当处理。
+这种架构通过跨多个网络路径并行化来降低订单接受的最小延迟。
 
 ### 用法
 
@@ -413,10 +523,9 @@ self.submit_order(order, params={"submit_tries": 3})
 **要点**：
 
 - `submit_tries` 必须是正整数。
-- 仅当 `submit_tries > 1` 时才会进行广播。
+- 仅当 `submit_tries > 1` 时才会进行广播。默认提交通过单个 HTTP 客户端进行。
 - 如果 `submit_tries` 超过 `submitter_pool_size`，将被限制为池大小并发出警告。
-- 每次并行尝试使用唯一的 `client_order_id` 后缀（`-1`、`-2` 等），以避免重复订单 ID 被拒绝。
-- 所有提交的订单都可能成交——策略必须处理潜在的重复执行。
+- 所有传输使用相同的 `client_order_id`；BitMEX 将重复提交作为预期拒绝处理。
 
 ### 健康监控
 
@@ -440,7 +549,7 @@ self.submit_order(order, params={"submit_tries": 3})
 | `healthy_clients`        | `usize`| 池中当前健康的 HTTP 客户端数量（通过最近健康检查的客户端）。                                                          |
 | `total_clients`          | `usize`| 池中配置的 HTTP 客户端总数（`submitter_pool_size`）。                                                                 |
 
-这些指标可以通过 `SubmitBroadcaster` 实例上的 `get_metrics()` 和 `get_metrics_async()` 方法以编程方式访问。
+这些指标可以通过 `SubmitBroadcaster` 实例上的 `get_metrics()` 方法以编程方式访问。
 
 ### 配置
 
@@ -448,8 +557,8 @@ self.submit_order(order, params={"submit_tries": 3})
 
 | 选项                   | 默认值  | 描述                                                                                |
 |------------------------|---------|-------------------------------------------------------------------------------------|
-| `submitter_pool_size`  | `3`     | 广播器的 HTTP 客户端池大小。更高的值增加容错性但消耗更多资源。                      |
-| `submitter_proxy_urls` | `None`  | 可选的代理 URL 列表，用于提交广播器的路径多样性。设置后，池中每个 HTTP 客户端使用不同的代理。|
+| `submitter_pool_size`  | `None`  | HTTP 客户端池大小。`None` 解析为 1（单个客户端，无冗余）。                          |
+| `submitter_proxy_urls` | `None`  | 可选的代理 URL 列表，用于提交广播器的路径多样性。*尚未通过 Python 集成接入。*       |
 
 **配置示例**：
 
@@ -459,7 +568,7 @@ from nautilus_trader.adapters.bitmex.config import BitmexExecClientConfig
 exec_config = BitmexExecClientConfig(
     api_key="YOUR_API_KEY",
     api_secret="YOUR_API_SECRET",
-    submitter_pool_size=3,  # 默认池大小
+    submitter_pool_size=3,  # 推荐的冗余池大小
 )
 ```
 
@@ -468,7 +577,7 @@ exec_config = BitmexExecClientConfig(
 默认 `submitter_pool_size=None` 会禁用广播器。推荐设置 `submitter_pool_size=3` 将每个提交请求广播到 3 个并行 HTTP 客户端以实现容错，这会消耗每次提交操作 3 倍的限流配额，但在网络或交易所问题面前提供更高的保证。
 :::
 
-广播器在执行客户端连接时自动启动，断开时自动停止。所有提交操作自动通过广播器路由，无需对策略代码进行任何更改。
+广播器在执行客户端连接时自动启动，断开时自动停止。仅当 `submit_tries > 1` 时，提交操作才通过广播器路由；默认提交直接使用单个 HTTP 客户端。
 
 ## 取消广播器
 
@@ -508,7 +617,7 @@ BitMEX 执行客户端包含一个取消广播器（Cancel Broadcaster），通�
 | `healthy_clients`        | `usize`| 池中当前健康的 HTTP 客户端数量（通过最近健康检查的客户端）。                                                          |
 | `total_clients`          | `usize`| 池中配置的 HTTP 客户端总数（`canceller_pool_size`）。                                                                 |
 
-这些指标可以通过 `CancelBroadcaster` 实例上的 `get_metrics()` 和 `get_metrics_async()` 方法以编程方式访问。
+这些指标可以通过 `CancelBroadcaster` 实例上的 `get_metrics()` 方法以编程方式访问。
 
 ### 配置
 
@@ -516,8 +625,8 @@ BitMEX 执行客户端包含一个取消广播器（Cancel Broadcaster），通�
 
 | 选项                   | 默认值  | 描述                                                                                |
 |------------------------|---------|-------------------------------------------------------------------------------------|
-| `canceller_pool_size`  | `3`     | 广播器的 HTTP 客户端池大小。更高的值增加容错性但消耗更多资源。                      |
-| `canceller_proxy_urls` | `None`  | 可选的代理 URL 列表，用于取消广播器的路径多样性。设置后，池中每个 HTTP 客户端使用不同的代理。|
+| `canceller_pool_size`  | `None`  | HTTP 客户端池大小。`None` 解析为 1（单个客户端，无冗余）。                          |
+| `canceller_proxy_urls` | `None`  | 可选的代理 URL 列表，用于取消广播器的路径多样性。*尚未通过 Python 集成接入。*       |
 
 **配置示例**：
 
@@ -527,7 +636,7 @@ from nautilus_trader.adapters.bitmex.config import BitmexExecClientConfig
 exec_config = BitmexExecClientConfig(
     api_key="YOUR_API_KEY",
     api_secret="YOUR_API_SECRET",
-    canceller_pool_size=3,  # 默认池大小
+    canceller_pool_size=3,  # 推荐的冗余池大小
 )
 ```
 
@@ -538,6 +647,88 @@ exec_config = BitmexExecClientConfig(
 
 广播器在执行客户端连接时自动启动，断开时自动停止。所有取消操作（`cancel_order`、`cancel_all_orders`、`batch_cancel_orders`）自动通过广播器路由，无需对策略代码进行任何更改。
 
+## 死人开关
+
+适配器支持 BitMEX 的[死人开关](https://www.bitmex.com/app/restAPI#OrdercancelAllAfter)
+（`cancelAllAfter`），它提供自动订单取消作为防范连接故障的安全网。
+
+### 工作原理
+
+启用后，会在 BitMEX 上设置一个服务器端计时器。如果计时器到期而未被刷新，
+BitMEX 将取消该账户上的**所有**未完成订单。适配器通过发送周期性的心跳请求
+保持计时器存活。如果适配器失去连接（网络故障、进程崩溃等），心跳停止，
+BitMEX 将在配置的超时后取消订单。
+
+流程：
+
+1. 在**连接**时，适配器使用配置的超时（毫秒）调用
+   `POST /api/v1/order/cancelAllAfter` 来武装服务器端计时器。
+2. 后台任务以 `timeout / 4`（最少 1 秒）的**刷新间隔**发送相同的请求，
+   以在计时器到期前不断重置它。
+3. 在**断开**时，适配器等待后台心跳任务完全关闭，然后以 `timeout=0`
+   调用 `cancelAllAfter` 来**解除**服务器端计时器的武装。
+
+例如，在 60 秒超时的情况下，适配器每 15 秒发送一次心跳。
+如果连续四次心跳失败（60 秒失去连接），BitMEX 将取消所有未完成订单。
+
+### 断开顺序
+
+在断开期间解除死人开关的武装需要仔细的顺序控制。解除武装的请求
+（`timeout=0`）应该是最后一个到达 BitMEX 的 `cancelAllAfter` 调用。如果在解除
+武装之后处理了一个进行中的心跳，它将重新武装服务器端计时器，订单可能会在超时
+到期后被意外取消，即使适配器已经优雅地断开连接。
+
+适配器在两种实现中都缓解了这个问题：
+
+- **Rust**：心跳任务立即停止（abort + await），这样断开连接就不会因等待
+  sleep 或 HTTP 超时而停滞。然后在任务退出后发送解除武装的请求。
+- **Python**：心跳任务被取消并 await，确保协程在发送解除武装请求之前
+  完全展开。
+
+在强制停止的场景中（如通过 `stop()` 关闭进程），心跳任务被中止而不解除武装。
+这是有意为之的，因为当进程意外退出时，服务器端计时器提供了所期望的安全行为。
+
+:::note
+每次心跳消耗一个 REST 限流令牌。60 秒的超时大约从 120/分钟的预算中
+使用每分钟 4 个请求。
+:::
+
+### 配置
+
+通过在执行客户端配置上设置 `deadmans_switch_timeout_secs` 来启用死人开关：
+
+```python
+from nautilus_trader.adapters.bitmex.config import BitmexExecClientConfig
+
+exec_config = BitmexExecClientConfig(
+    api_key="YOUR_API_KEY",
+    api_secret="YOUR_API_SECRET",
+    deadmans_switch_timeout_secs=60,  # 失去连接 60 秒后取消所有订单
+)
+```
+
+启用后，适配器在连接时记录：
+
+```
+Starting dead man's switch: timeout=60s, refresh_interval=15s
+```
+
+并在断开时记录：
+
+```
+Disarming dead man's switch
+```
+
+:::tip
+**60 秒**的超时是推荐的起点。较短的超时提供更快的保护，但对短暂的网络抖动
+更敏感。较长的超时对短暂中断更宽容，但在真正发生故障时会使订单暴露更长时间。
+:::
+
+:::warning
+死人开关适用于账户上的**所有**未完成订单，而不仅仅是适配器下的订单。
+如果其他系统在同一账户上下单，启用死人开关也会影响那些订单。
+:::
+
 ## 配置
 
 ### API 凭证
@@ -546,8 +737,8 @@ BitMEX API 凭证可以直接在配置中提供，也可以通过环境变量提
 
 - `BITMEX_API_KEY`：用于生产环境的 BitMEX API 密钥（API Key）。
 - `BITMEX_API_SECRET`：用于生产环境的 BitMEX API 密钥密文（API Secret）。
-- `BITMEX_TESTNET_API_KEY`：用于测试网的 BitMEX API 密钥（当 `testnet=True` 时）。
-- `BITMEX_TESTNET_API_SECRET`：用于测试网的 BitMEX API 密钥密文（当 `testnet=True` 时）。
+- `BITMEX_TESTNET_API_KEY`：用于测试网的 BitMEX API 密钥（API Key）。
+- `BITMEX_TESTNET_API_SECRET`：用于测试网的 BitMEX API 密钥密文（API Secret）。
 
 生成 API 密钥的步骤：
 
@@ -562,55 +753,56 @@ BitMEX API 凭证可以直接在配置中提供，也可以通过环境变量提
 - REST API：`https://testnet.bitmex.com/api/v1`
 - WebSocket：`wss://ws.testnet.bitmex.com/realtime`
 
-当配置了 `testnet=True` 时，适配器会自动将请求路由到正确的端点。
+当配置了 `environment=BitmexEnvironment.TESTNET` 时，适配器会自动将请求路由到正确的端点。
 :::
 
 ### 数据客户端配置选项
 
 BitMEX 数据客户端提供以下配置选项：
 
-| 选项                              | 默认值   | 描述 |
-|-----------------------------------|----------|------|
-| `api_key`                         | `None`   | 可选的 API 密钥；如果为 `None`，从 `BITMEX_API_KEY` 加载。 |
-| `api_secret`                      | `None`   | 可选的 API 密钥密文；如果为 `None`，从 `BITMEX_API_SECRET` 加载。 |
-| `base_url_http`                   | `None`   | REST 基础 URL 覆盖（默认为生产环境）。 |
-| `base_url_ws`                     | `None`   | WebSocket 基础 URL 覆盖（默认为生产环境）。 |
-| `testnet`                         | `False`  | 当为 `True` 时，将请求路由到 BitMEX 测试网。 |
-| `http_timeout_secs`               | `60`     | 应用于 HTTP 调用的请求超时。 |
-| `max_retries`                     | `None`   | HTTP 调用的最大重试次数（`None` 时禁用）。 |
-| `retry_delay_initial_ms`          | `1,000`  | 重试之间的初始退避延迟（毫秒）。 |
-| `retry_delay_max_ms`              | `5,000`  | 重试之间的最大退避延迟（毫秒）。 |
-| `recv_window_ms`                  | `10,000` | 签名请求的过期窗口（毫秒）。参见[请求认证](#请求认证和过期)。 |
-| `update_instruments_interval_mins`| `60`     | 金融工具目录刷新间隔（分钟）。 |
-| `max_requests_per_second`         | `10`     | 适配器对 REST 调用执行的突发限流。 |
-| `max_requests_per_minute`         | `120`    | 适配器对 REST 调用执行的滚动分钟限流。 |
-| `http_proxy_url`                  | `None`   | 可选的 HTTP 代理 URL。 |
-| `ws_proxy_url`                    | `None`   | 可选的 WebSocket 代理 URL。 |
+| 选项                              | 默认值    | 描述 |
+|-----------------------------------|-----------|------|
+| `api_key`                         | `None`    | 可选的 API 密钥；如果为 `None`，从 `environment` 所选的环境加载。 |
+| `api_secret`                      | `None`    | 可选的 API 密钥密文；如果为 `None`，从 `environment` 所选的环境加载。 |
+| `environment`                     | `None`    | 环境枚举（`MAINNET` 或 `TESTNET`）。 |
+| `base_url_http`                   | `None`    | REST 基础 URL 覆盖（默认为生产环境）。 |
+| `base_url_ws`                     | `None`    | WebSocket 基础 URL 覆盖（默认为生产环境）。 |
+| `http_timeout_secs`               | `60`      | 应用于 HTTP 调用的请求超时。 |
+| `max_retries`                     | `3`       | HTTP 调用的最大重试次数。 |
+| `retry_delay_initial_ms`          | `1,000`   | 重试之间的初始退避延迟（毫秒）。 |
+| `retry_delay_max_ms`              | `10,000`  | 重试之间的最大退避延迟（毫秒）。 |
+| `recv_window_ms`                  | `10,000`  | 签名请求的过期窗口（毫秒）。参见[请求认证](#请求认证和过期)。 |
+| `update_instruments_interval_mins`| `60`      | 金融工具目录刷新间隔（分钟）。 |
+| `max_requests_per_second`         | `10`      | 适配器对 REST 调用执行的突发限流。 |
+| `max_requests_per_minute`         | `120`     | 适配器对 REST 调用执行的滚动分钟限流。 |
+| `proxy_url`                       | `None`    | 可选的 HTTP 和 WebSocket 传输代理 URL。 |
+| `transport_backend`               | `Sockudo` | WebSocket 传输后端。 |
 
 ### 执行客户端配置选项
 
 BitMEX 执行客户端提供以下配置选项：
 
-| 选项                     | 默认值   | 描述 |
-|--------------------------|----------|------|
-| `api_key`                | `None`   | 可选的 API 密钥；如果为 `None`，从 `BITMEX_API_KEY` 加载。 |
-| `api_secret`             | `None`   | 可选的 API 密钥密文；如果为 `None`，从 `BITMEX_API_SECRET` 加载。 |
-| `base_url_http`          | `None`   | REST 基础 URL 覆盖（默认为生产环境）。 |
-| `base_url_ws`            | `None`   | WebSocket 基础 URL 覆盖（默认为生产环境）。 |
-| `testnet`                | `False`  | 当为 `True` 时，将订单路由到 BitMEX 测试网。 |
-| `http_timeout_secs`      | `60`     | 应用于 HTTP 调用的请求超时。 |
-| `max_retries`            | `None`   | HTTP 调用的最大重试次数（`None` 时禁用）。 |
-| `retry_delay_initial_ms` | `1,000`  | 重试之间的初始退避延迟（毫秒）。 |
-| `retry_delay_max_ms`     | `5,000`  | 重试之间的最大退避延迟（毫秒）。 |
-| `recv_window_ms`         | `10,000` | 签名请求的过期窗口（毫秒）。参见[请求认证](#请求认证和过期)。 |
-| `max_requests_per_second`| `10`     | 适配器对 REST 调用执行的突发限流。 |
-| `max_requests_per_minute`| `120`    | 适配器对 REST 调用执行的滚动分钟限流。 |
-| `canceller_pool_size`    | `3`      | 取消广播器池中的冗余 HTTP 客户端数量。参见[取消广播器](#取消广播器)。 |
-| `submitter_pool_size`    | `3`      | 提交广播器池中的冗余 HTTP 客户端数量。参见[提交广播器](#提交广播器)。 |
-| `http_proxy_url`         | `None`   | 可选的 HTTP 代理 URL。 |
-| `ws_proxy_url`           | `None`   | 可选的 WebSocket 代理 URL。 |
-| `submitter_proxy_urls`   | `None`   | 可选的代理 URL 列表，用于提交广播器路径多样性。 |
-| `canceller_proxy_urls`   | `None`   | 可选的代理 URL 列表，用于取消广播器路径多样性。 |
+| 选项                           | 默认值    | 描述 |
+|--------------------------------|-----------|------|
+| `api_key`                      | `None`    | 可选的 API 密钥；如果为 `None`，从 `environment` 所选的环境加载。 |
+| `api_secret`                   | `None`    | 可选的 API 密钥密文；如果为 `None`，从 `environment` 所选的环境加载。 |
+| `environment`                  | `None`    | 环境枚举（`MAINNET` 或 `TESTNET`）。 |
+| `base_url_http`                | `None`    | REST 基础 URL 覆盖（默认为生产环境）。 |
+| `base_url_ws`                  | `None`    | WebSocket 基础 URL 覆盖（默认为生产环境）。 |
+| `http_timeout_secs`            | `60`      | 应用于 HTTP 调用的请求超时。 |
+| `max_retries`                  | `3`       | HTTP 调用的最大重试次数。 |
+| `retry_delay_initial_ms`       | `1,000`   | 重试之间的初始退避延迟（毫秒）。 |
+| `retry_delay_max_ms`           | `10,000`  | 重试之间的最大退避延迟（毫秒）。 |
+| `recv_window_ms`               | `10,000`  | 签名请求的过期窗口（毫秒）。参见[请求认证](#请求认证和过期)。 |
+| `max_requests_per_second`      | `10`      | 适配器对 REST 调用执行的突发限流。 |
+| `max_requests_per_minute`      | `120`     | 适配器对 REST 调用执行的滚动分钟限流。 |
+| `deadmans_switch_timeout_secs` | `None`    | 死人开关的超时秒数。`None` 表示禁用。参见[死人开关](#死人开关)。 |
+| `canceller_pool_size`          | `None`    | 取消广播器池中的 HTTP 客户端数量。`None` 解析为 1。参见[取消广播器](#取消广播器)。 |
+| `submitter_pool_size`          | `None`    | 提交广播器池中的 HTTP 客户端数量。`None` 解析为 1。参见[提交广播器](#提交广播器)。 |
+| `proxy_url`                    | `None`    | 可选的 HTTP 和 WebSocket 传输代理 URL。 |
+| `submitter_proxy_urls`         | `None`    | 可选的代理 URL 列表，用于提交广播器路径多样性。*尚未通过 Python 集成接入。* |
+| `canceller_proxy_urls`         | `None`    | 可选的代理 URL 列表，用于取消广播器路径多样性。*尚未通过 Python 集成接入。* |
+| `transport_backend`            | `Sockudo` | WebSocket 传输后端。 |
 
 ### 配置示例
 
@@ -619,23 +811,24 @@ BitMEX 实时交易的典型配置包括测试网和主网选项：
 ```python
 from nautilus_trader.adapters.bitmex.config import BitmexDataClientConfig
 from nautilus_trader.adapters.bitmex.config import BitmexExecClientConfig
+from nautilus_trader.core.nautilus_pyo3 import BitmexEnvironment
 
 # 使用环境变量（推荐）
 testnet_data_config = BitmexDataClientConfig(
-    testnet=True,  # API 凭证从 BITMEX_API_KEY 和 BITMEX_API_SECRET 加载
+    environment=BitmexEnvironment.TESTNET,
 )
 
 # 使用显式凭证
 mainnet_data_config = BitmexDataClientConfig(
     api_key="YOUR_API_KEY",  # 或使用 os.getenv("BITMEX_API_KEY")
     api_secret="YOUR_API_SECRET",  # 或使用 os.getenv("BITMEX_API_SECRET")
-    testnet=False,
+    environment=BitmexEnvironment.MAINNET,
 )
 
 mainnet_exec_config = BitmexExecClientConfig(
     api_key="YOUR_API_KEY",
     api_secret="YOUR_API_SECRET",
-    testnet=False,
+    environment=BitmexEnvironment.MAINNET,
 )
 ```
 
@@ -679,6 +872,8 @@ BitMEX 执行适配器现在将 Nautilus 条件订单列表映射到交易所的
 - **Taker 手续费**：消耗流动性的正向手续费。
 - **资金费率**：每 8 小时适用于永续合约。
 - **预测市场手续费**：Maker 0.00%，Taker 0.25%（不允许使用杠杆）。
+
+## 贡献
 
 :::info
 如需更多功能或为 BitMEX 适配器做贡献，请参阅我们的

@@ -46,11 +46,11 @@ Bybit 支持以下产品类型：
 | 正向期货合约(linear futures) | ✓ | 交割结算的正向期货。 |
 | 反向永续合约(inverse perpetual) | ✓ | 币本位保证金永续互换。 |
 | 反向期货合约(inverse futures) | ✓ | 币本位交割期货。 |
-| 期权合约(option) | ✓ | USDC 结算的期权。 |
+| 期权合约(option) | ✓ | USDT 结算的欧式期权。 |
 
 ## 符号体系
 
-为了区分 Bybit 上不同的产品类型，Nautilus 使用特定的产品类别后缀：
+为了区分 Bybit 上不同的产品类型，Nautilus 使用特定的产品类别后缀来标识符号：
 
 - `-SPOT`：现货加密货币
 - `-LINEAR`：永续合约和期货合约
@@ -62,6 +62,160 @@ Bybit 支持以下产品类型：
 - 以太坊/泰达币现货货币对使用 `-SPOT` 标识，如 `ETHUSDT-SPOT`。
 - BTCUSDT 永续期货合约使用 `-LINEAR` 标识，如 `BTCUSDT-LINEAR`。
 - BTCUSD 反向永续期货合约使用 `-INVERSE` 标识，如 `BTCUSD-INVERSE`。
+- 一个 BTC USDT 结算的看跌期权：`BTC-27MAR26-70000-P-USDT-OPTION`。
+- 一个 ETH USDC 结算的看涨期权：`ETH-28FEB25-2800-C-OPTION`。
+
+Bybit 的期权符号在 USDT 结算合约中包含结算币种（例如
+`BTC-27MAR26-70000-P-USDT`），但在 USDC 结算合约中省略它（例如
+`ETH-28FEB25-2800-C`）。适配器会将 `-OPTION` 附加到 API 返回的任何符号
+之后。
+
+## 金融工具加载
+
+Bybit 数据和执行客户端使用通用的 `instrument_provider` 配置。
+在策略订阅市场数据或提交订单之前，配置它以加载金融工具。订阅不会
+请求缺失的金融工具定义。
+
+```python
+from nautilus_trader.adapters.bybit import BybitProductType
+from nautilus_trader.adapters.bybit.config import BybitDataClientConfig
+from nautilus_trader.config import InstrumentProviderConfig
+
+BybitDataClientConfig(
+    instrument_provider=InstrumentProviderConfig(load_all=True),
+    product_types=(BybitProductType.SPOT,),
+)
+```
+
+当你只需要一组已知的金融工具时，使用 `load_ids`：
+
+```python
+from nautilus_trader.adapters.bybit import BybitProductType
+from nautilus_trader.adapters.bybit.config import BybitDataClientConfig
+from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.model.identifiers import InstrumentId
+
+BybitDataClientConfig(
+    instrument_provider=InstrumentProviderConfig(
+        load_ids=frozenset([InstrumentId.from_str("BTCUSDT-SPOT.BYBIT")]),
+    ),
+    product_types=(BybitProductType.SPOT,),
+)
+```
+
+所配置的 `product_types` 必须在每个金融工具 ID 中包含产品后缀。
+
+## 环境
+
+Bybit 提供三种交易环境。通过客户端配置上的 `environment` 枚举
+配置合适的环境。
+
+| 环境 | 配置 | 描述 |
+|------|------|------|
+| **Mainnet** | `BybitEnvironment.MAINNET` | 使用真实资金的生产交易。 |
+| **Demo** | `BybitEnvironment.DEMO` | 在主网基础设施上使用模拟资金进行练习交易。 |
+| **Testnet** | `BybitEnvironment.TESTNET` | 用于开发和集成测试的独立测试网络。 |
+
+### Mainnet（生产）
+
+使用真实资金进行实时交易的默认环境。
+
+```python
+from nautilus_trader.adapters.bybit import BybitEnvironment
+
+config = BybitExecClientConfig(
+    api_key="YOUR_API_KEY",
+    api_secret="YOUR_API_SECRET",
+    environment=BybitEnvironment.MAINNET,
+)
+```
+
+环境变量：`BYBIT_API_KEY`、`BYBIT_API_SECRET`
+
+### Demo 交易
+
+Demo 交易使用 Bybit 的主网基础设施配合模拟资金。
+请在 [Bybit Demo 交易页面](https://www.bybit.com/en/demo-trading)创建
+Demo API 密钥。
+
+```python
+from nautilus_trader.adapters.bybit import BybitEnvironment
+
+config = BybitExecClientConfig(
+    api_key="YOUR_DEMO_API_KEY",
+    api_secret="YOUR_DEMO_API_SECRET",
+    environment=BybitEnvironment.DEMO,
+)
+```
+
+环境变量：`BYBIT_DEMO_API_KEY`、`BYBIT_DEMO_API_SECRET`
+
+:::warning
+**Demo 环境的限制：**
+
+- Demo 交易**不支持** WebSocket Trade API。NautilusTrader 在 Demo 模式下会自动使用 HTTP REST API 进行订单操作。
+- 通过 WebSocket 提供的某些高级订单功能（触发订单、带 is_quote_quantity 的 post-only）在 Demo 模式下不可用。
+- Demo 私有流使用 `wss://stream-demo.bybit.com`，但公共市场数据使用 Bybit 的主网公共流 `wss://stream.bybit.com`。
+
+:::
+
+### Testnet
+
+用于开发和集成测试的独立测试网络。
+
+```python
+from nautilus_trader.adapters.bybit import BybitEnvironment
+
+config = BybitExecClientConfig(
+    api_key="YOUR_TESTNET_API_KEY",
+    api_secret="YOUR_TESTNET_API_SECRET",
+    environment=BybitEnvironment.TESTNET,
+)
+```
+
+环境变量：`BYBIT_TESTNET_API_KEY`、`BYBIT_TESTNET_API_SECRET`
+
+:::note
+Testnet 支持所有交易功能，包括 WebSocket Trade API。
+它使用与主网完全独立的基础设施，因此其市场数据和流动性
+与生产环境差异显著。
+:::
+
+当 `environment=BybitEnvironment.TESTNET` 时，适配器会自动解析 Bybit
+文档中的测试网端点：
+
+- REST API：`https://api-testnet.bybit.com`
+- 公共 WebSocket：`wss://stream-testnet.bybit.com/v5/public/{spot|linear|inverse|option}`
+- 私有 WebSocket：`wss://stream-testnet.bybit.com/v5/private`
+- 交易 WebSocket：`wss://stream-testnet.bybit.com/v5/trade`
+
+### Testnet 设置
+
+设置 Bybit 测试网账户和凭证的步骤：
+
+1. 在桌面浏览器中打开 [testnet.bybit.com](https://testnet.bybit.com)。
+2. 创建一个独立的测试网账户，或登录你现有的测试网账户。
+3. 通过 **Assets -> Assets Overview -> Request Test Coins** 申请测试币，
+   使账户拥有用于测试的余额。
+4. 在
+   [testnet.bybit.com/app/user/api-management](https://testnet.bybit.com/app/user/api-management)
+   打开 **API Management**。
+5. 点击 **Create New Key**。
+6. 为你的使用场景选择所需的权限。
+7. 完成 2FA 提示并复制 API key 和 secret。
+8. 在你的 shell 中导出凭证：
+
+   ```bash
+   export BYBIT_TESTNET_API_KEY="YOUR_TESTNET_API_KEY"
+   export BYBIT_TESTNET_API_SECRET="YOUR_TESTNET_API_SECRET"
+   ```
+
+Bybit 当前的测试网指南还指出：
+
+- API key 在网站上创建，而非在移动应用中。
+- 新用户在注册后的前 48 小时内可能无法创建 API key。
+- 测试网与主网是独立的。请勿向测试网账户存入真实资金。
+- Bybit 目前的文档要求通过桌面浏览器进行测试网账户设置。
 
 ## 订单能力
 
@@ -70,74 +224,139 @@ Bybit 提供了灵活的触发类型组合，使得 Nautilus 支持更广泛的�
 
 ### 订单类型
 
-| 订单类型 | 现货 | 正向 | 反向 | 备注 |
-|---------|------|------|------|------|
-| `MARKET` | ✓ | ✓ | ✓ | 支持报价数量。 |
-| `LIMIT` | ✓ | ✓ | ✓ | |
-| `STOP_MARKET` | ✓ | ✓ | ✓ | |
-| `STOP_LIMIT` | ✓ | ✓ | ✓ | |
-| `MARKET_IF_TOUCHED` | ✓ | ✓ | ✓ | |
-| `LIMIT_IF_TOUCHED` | ✓ | ✓ | ✓ | |
-| `TRAILING_STOP_MARKET` | - | ✓ | ✓ | *现货不支持*。 |
+| 订单类型 | 现货 | 正向 | 反向 | 期权 | 备注 |
+|---------|------|------|------|------|------|
+| `MARKET` | ✓ | ✓ | ✓ | ✓ | 支持报价数量。 |
+| `LIMIT` | ✓ | ✓ | ✓ | ✓ | |
+| `STOP_MARKET` | ✓ | ✓ | ✓ | - | *期权不支持*。 |
+| `STOP_LIMIT` | ✓ | ✓ | ✓ | - | *期权不支持*。 |
+| `MARKET_IF_TOUCHED` | ✓ | ✓ | ✓ | - | *期权不支持*。 |
+| `LIMIT_IF_TOUCHED` | ✓ | ✓ | ✓ | - | *期权不支持*。 |
+| `TRAILING_STOP_MARKET` | - | ✓ | ✓ | - | *现货/期权不支持*。 |
 
 ### 执行指令
 
-| 指令 | 现货 | 正向 | 反向 | 备注 |
-|------|------|------|------|------|
-| `post_only` | ✓ | ✓ | ✓ | 仅支持 `LIMIT` 订单。 |
-| `reduce_only` | - | ✓ | ✓ | *现货不支持*。 |
+| 指令 | 现货 | 正向 | 反向 | 期权 | 备注 |
+|------|------|------|------|------|------|
+| `post_only` | ✓ | ✓ | ✓ | ✓ | 仅支持 `LIMIT` 订单。 |
+| `reduce_only` | - | ✓ | ✓ | ✓ | *现货不支持*。 |
 
 ### 有效时间
 
-| 有效时间 | 现货 | 正向 | 反向 | 备注 |
-|---------|------|------|------|------|
-| `GTC` | ✓ | ✓ | ✓ | 撤单前有效(Good Till Canceled)。 |
-| `GTD` | - | - | - | *不支持*。 |
-| `FOK` | ✓ | ✓ | ✓ | 全部成交或撤销(Fill or Kill)。 |
-| `IOC` | ✓ | ✓ | ✓ | 立即成交或撤销(Immediate or Cancel)。 |
+| 有效时间 | 现货 | 正向 | 反向 | 期权 | 备注 |
+|---------|------|------|------|------|------|
+| `GTC` | ✓ | ✓ | ✓ | ✓ | 撤单前有效(Good Till Canceled)。 |
+| `GTD` | - | - | - | - | *不支持*。 |
+| `FOK` | ✓ | ✓ | ✓ | ✓ | 全部成交或撤销(Fill or Kill)。 |
+| `IOC` | ✓ | ✓ | ✓ | ✓ | 立即成交或撤销(Immediate or Cancel)。 |
 
 ### 高级订单功能
 
-| 功能 | 现货 | 正向 | 反向 | 备注 |
-|------|------|------|------|------|
-| 订单修改 | ✓ | ✓ | ✓ | 价格和数量修改。 |
-| 括号/OCO 订单 | ✓ | ✓ | ✓ | 仅限 UI；API 用户需手动实现。 |
-| 冰山订单 | ✓ | ✓ | ✓ | 每账户最多 10 个，每符号 1 个。 |
+| 功能 | 现货 | 正向 | 反向 | 期权 | 备注 |
+|------|------|------|------|------|------|
+| 订单修改 | ✓ | ✓ | ✓ | ✓ | 价格和数量修改。 |
+| 括号/OCO 订单 | ✓ | ✓ | ✓ | - | 仅限 UI；API 用户需手动实现。 |
+| 冰山订单 | ✓ | ✓ | ✓ | - | 每账户最多 10 个，每符号 1 个。 |
 
 ### 批量操作
 
-| 操作 | 现货 | 正向 | 反向 | 备注 |
-|------|------|------|------|------|
-| 批量提交 | ✓ | ✓ | ✓ | 单次请求提交多个订单。 |
-| 批量修改 | ✓ | ✓ | ✓ | 单次请求修改多个订单。 |
-| 批量取消 | ✓ | ✓ | ✓ | 单次请求取消多个订单。 |
+| 操作 | 现货 | 正向 | 反向 | 期权 | 备注 |
+|------|------|------|------|------|------|
+| 批量提交 | ✓ | ✓ | ✓ | ✓ | 单次请求提交多个订单。 |
+| 批量修改 | ✓ | ✓ | ✓ | ✓ | 单次请求修改多个订单。 |
+| 批量取消 | ✓ | ✓ | ✓ | ✓ | 单次请求取消多个订单。 |
 
 ### 持仓管理
 
-| 功能 | 现货 | 正向 | 反向 | 备注 |
-|------|------|------|------|------|
-| 查询持仓 | - | ✓ | ✓ | 实时持仓更新。 |
-| 持仓模式 | - | ✓ | ✓ | 单向 vs 对冲模式。 |
-| 杠杆(leverage)控制 | - | ✓ | ✓ | 按符号动态调整杠杆。 |
-| 保证金模式 | - | ✓ | ✓ | 全仓 vs 逐仓保证金。 |
+| 功能 | 现货 | 正向 | 反向 | 期权 | 备注 |
+|------|------|------|------|------|------|
+| 查询持仓 | - | ✓ | ✓ | ✓ | 实时持仓更新。 |
+| 持仓模式 | - | ✓ | ✓ | - | 期权仅支持单向。 |
+| 杠杆(leverage)控制 | - | ✓ | ✓ | - | 不适用于期权。 |
+| 保证金模式 | - | ✓ | ✓ | ✓ | 全仓、逐仓或组合保证金。 |
+
+#### 对冲模式（BothSides）
+
+Bybit 仅在 USDT 正向永续合约上接受 `BOTH_SIDES`。对于其他产品类型，
+请配置 `MERGED_SINGLE` 或将它们从 `position_mode` 中省略。按符号配置：
+
+```python
+from nautilus_trader.adapters.bybit import BybitPositionMode
+
+config = BybitExecClientConfig(
+    ...,
+    position_mode={"ETHUSDT-LINEAR": BybitPositionMode.BOTH_SIDES},
+)
+```
+
+连接时，适配器会为每个条目调用 `/v5/position/switch-mode`，然后
+为每个订单推导 `positionIdx`：开仓 BUY -> `1`（多头），开仓
+SELL -> `2`（空头），reduce-only SELL -> `1`，reduce-only BUY -> `2`。
+Bybit 在 V5 [切换持仓模式](https://bybit-exchange.github.io/docs/v5/position/position-mode)
+和 [下单](https://bybit-exchange.github.io/docs/v5/order/create-order#request-parameters)
+API 中对此有文档说明：`mode=3` 启用 Both Sides，且对冲模式订单需要 `positionIdx`。
+
+带有 `positionIdx=0`（单向 / Merged Single 模式）的订单和报告不携带
+交易所持仓 ID。对于对冲模式索引 `1` 和 `2`，适配器会将报告映射到
+以 `-LONG` 和 `-SHORT` 结尾的交易所持仓 ID，并在 Bybit 执行消息不包含
+`positionIdx` 时将同一 ID 携带到成交上。
+
+要覆盖此行为，可通过 `params` 传递 `position_idx`：
+
+```python
+params={"position_idx": 1}  # 0 单向, 1 多头, 2 空头
+```
+
+### 风险事件
+
+| 功能 | 现货 | 正向 | 反向 | 期权 | 备注 |
+|------|------|------|------|------|------|
+| 强平处理 | - | ✓ | ✓ | ✓ | 接管成交被标记为交易所生成。 |
+| ADL 处理 | - | ✓ | ✓ | ✓ | 自动减仓成交被标记并记录日志。 |
+| ADL 排名警告 | - | ✓ | ✓ | ✓ | 当 `adlRankIndicator >= 4` 时记录持仓报告日志。 |
+
+Bybit 会发出由交易所发起的成交，其 `execType` 设置为：
+
+- `AdlTrade`：自动减仓执行。在保险基金无法覆盖损失后，会选择一个
+  对手方的盈利持仓来平掉抵押不足的对手方。
+- `BustTrade`：强平接管。保证金耗尽后，强平引擎接管了该持仓。
+- `Delivery`：USDC 期货交割。
+- `Settle`：反向期货结算。
+
+适配器会将每一项标记为交易所生成，并记录一条包含执行 ID、符号、方向、
+数量和价格的警告。成交会通过正常的 `FillReport` 路径流转；由于这些订单
+携带空的 `orderLinkId`，执行引擎会将它们视为外部订单，并通过
+`external_order_claims`（或默认的 `EXTERNAL` 策略）进行分配。
+
+Bybit 还会在持仓更新时通过 `adlRankIndicator` 字段发布 ADL 排名。
+取值范围为 0（无持仓）到 5（即将被减仓）。每当一个未平仓持仓携带
+4 或更高的排名时，适配器会记录一条警告，以便你在交易所强制平仓前
+做出反应。
+
+上游参考：
+
+- [V5 `execType` 取值](https://bybit-exchange.github.io/docs/v5/enum#exectype)
+- [V5 `createType` 取值](https://bybit-exchange.github.io/docs/v5/enum#createtype)
+- [强平机制](https://www.bybit.com/en/help-center/article/Liquidation-Process-Derivatives-Trading)
+- [自动减仓机制](https://www.bybit.com/en/help-center/article/Auto-Deleveraging-ADL-Derivatives-Trading)
 
 ### 订单查询
 
-| 功能 | 现货 | 正向 | 反向 | 备注 |
-|------|------|------|------|------|
-| 查询未结订单 | ✓ | ✓ | ✓ | 列出所有活跃订单。 |
-| 查询订单历史 | ✓ | ✓ | ✓ | 历史订单数据。 |
-| 订单状态更新 | ✓ | ✓ | ✓ | 实时订单状态变更。 |
-| 成交历史 | ✓ | ✓ | ✓ | 执行和成交报告。 |
+| 功能 | 现货 | 正向 | 反向 | 期权 | 备注 |
+|------|------|------|------|------|------|
+| 查询未结订单 | ✓ | ✓ | ✓ | ✓ | 列出所有活跃订单。 |
+| 查询订单历史 | ✓ | ✓ | ✓ | ✓ | 历史订单数据。 |
+| 订单状态更新 | ✓ | ✓ | ✓ | ✓ | 实时订单状态变更。 |
+| 成交历史 | ✓ | ✓ | ✓ | ✓ | 执行和成交报告。 |
 
 ### 条件订单
 
-| 功能 | 现货 | 正向 | 反向 | 备注 |
-|------|------|------|------|------|
-| 订单列表 | - | - | - | *不支持*。 |
-| OCO 订单 | ✓ | ✓ | ✓ | 仅限 UI；API 用户需手动实现。 |
-| 括号订单 | ✓ | ✓ | ✓ | 仅限 UI；API 用户需手动实现。 |
-| 条件订单 | ✓ | ✓ | ✓ | 止损和触价限价订单。 |
+| 功能 | 现货 | 正向 | 反向 | 期权 | 备注 |
+|------|------|------|------|------|------|
+| 订单列表 | ✓ | ✓ | ✓ | ✓ | 通过 WebSocket 以批量方式提交。 |
+| OCO 订单 | ✓ | ✓ | ✓ | - | 仅限 UI；API 用户需手动实现。 |
+| 括号订单 | ✓ | ✓ | ✓ | - | 仅限 UI；API 用户需手动实现。 |
+| 条件订单 | ✓ | ✓ | ✓ | - | 止损和触价限价订单。 |
 
 ### 订单参数
 
@@ -145,7 +364,61 @@ Bybit 提供了灵活的触发类型组合，使得 Nautilus 支持更广泛的�
 
 | 参数 | 类型 | 描述 |
 |------|------|------|
-| `is_leverage` | `bool` | 仅适用于现货产品。如果为 `True`，则为该订单启用保证金交易（借款）。默认值：`False`。参见 [Bybit 的 isLeverage 文档](https://bybit-exchange.github.io/docs/v5/order/create-order#request-parameters)。 |
+| `is_leverage` | `bool` | 仅适用于现货。启用保证金交易（借款）。默认值：`False`。 |
+| `take_profit` | `str` 或 `float` | TP 触发价格。为订单附加原生 TP。 |
+| `stop_loss` | `str` 或 `float` | SL 触发价格。为订单附加原生 SL。 |
+| `tp_trigger_by` | `str` | TP 触发类型：`"LastPrice"`、`"IndexPrice"` 或 `"MarkPrice"`。 |
+| `sl_trigger_by` | `str` | SL 触发类型：`"LastPrice"`、`"IndexPrice"` 或 `"MarkPrice"`。 |
+| `tp_order_type` | `str` | TP 执行类型：`"Market"` 或 `"Limit"`。默认值：`"Market"`。 |
+| `sl_order_type` | `str` | SL 执行类型：`"Market"` 或 `"Limit"`。默认值：`"Market"`。 |
+| `tp_limit_price` | `str` 或 `float` | 当 `tp_order_type` 为 `"Limit"` 时 TP 的限价。 |
+| `sl_limit_price` | `str` 或 `float` | 当 `sl_order_type` 为 `"Limit"` 时 SL 的限价。 |
+| `tp_trigger_price` | `str` 或 `float` | 自定义 TP 触发价格（覆盖 `take_profit`）。 |
+| `sl_trigger_price` | `str` 或 `float` | 自定义 SL 触发价格（覆盖 `stop_loss`）。 |
+| `close_on_trigger` | `bool` | 当 TP/SL 触发时关闭持仓。默认值：`False`。 |
+| `position_idx` | `int` | 对冲模式持仓索引。参见[对冲模式](#hedge-mode-bothsides)。 |
+| `bbo_side_type` | `str` | 正向/反向 BBO 方向：`"Queue"` 或 `"Counterparty"`。 |
+| `bbo_level` | `str` 或 `int` | 正向/反向 BBO 盘口档位：`"1"` 到 `"5"`。 |
+
+:::note
+原生 TP/SL 参数在 Demo 模式下不受支持。`is_leverage` 参数仅适用于
+现货产品。参见 [Bybit 的 isLeverage 文档](https://bybit-exchange.github.io/docs/v5/order/create-order#request-parameters)。
+:::
+
+当设置了 `bbo_side_type` 和 `bbo_level` 时，Nautilus 会发送 Bybit 的
+`bboSideType` 和 `bboLevel` 字段，并在 API 请求中省略订单价格。BBO 订单
+支持正向和反向的限价、止损限价以及触价限价订单。
+
+#### 示例：带原生 TP/SL 的订单
+
+```python
+order = strategy.order_factory.limit(
+    instrument_id=InstrumentId.from_str("BTCUSDT-LINEAR.BYBIT"),
+    order_side=OrderSide.BUY,
+    quantity=Quantity.from_str("0.01"),
+    price=Price.from_str("60000.0"),
+    params={
+        "take_profit": "65000.0",
+        "stop_loss": "58000.0",
+        "tp_trigger_by": "LastPrice",
+        "sl_trigger_by": "LastPrice",
+    },
+)
+strategy.submit_order(order)
+```
+
+#### 示例：BBO 订单
+
+```python
+order = strategy.order_factory.limit(
+    instrument_id=InstrumentId.from_str("BTCUSDT-LINEAR.BYBIT"),
+    order_side=OrderSide.BUY,
+    quantity=Quantity.from_str("0.01"),
+    price=Price.from_str("60000.0"),
+    params={"bbo_side_type": "Queue", "bbo_level": 1},
+)
+strategy.submit_order(order)
+```
 
 #### 示例：现货保证金交易
 
@@ -290,7 +563,7 @@ Bybit 每日在 **04:00-05:30 UTC** 期间屏蔽 `no-convert-repay` 操作，用
 在停服窗口期间，任何买入订单成交都会触发类似以下的警告：
 
 ```
-由于 Bybit 停服窗口（每日 04:00-05:30 UTC），跳过 BTC 的借款偿还。需要手动偿还。
+Skipping borrow repayment for BTC due to Bybit blackout window (04:00-05:30 UTC daily). Will need manual repayment.
 ```
 
 **重要提示：** 如果你的买入订单在停服窗口期间成交，你需要在 05:30 UTC 之后手动偿还借款以停止利息计算，或者等待下一个停服窗口外的买入订单成交。
@@ -306,15 +579,65 @@ Bybit 每日在 **04:00-05:30 UTC** 期间屏蔽 `no-convert-repay` 操作，用
 - 自动还款仅在**现货买入订单**时触发，不适用于衍生品。
 - 还款使用 `no-convert-repay` 端点，默认偿还全部未偿借款。
 - 该功能优雅地处理 API 错误，记录失败但不会崩溃。
-- Bybit 计划在交易所层面推出自动还款模式（月底），届时可能使此功能不再需要。
 - 除非在你的 Bybit 账户上启用了自动借款，否则在开立空头持仓前仍需手动借款。
 
 ### 现货交易限制
 
 以下限制适用于现货产品，因为交易所端不跟踪持仓：
 
-- 不支持 `reduce_only` 订单。
-- 不支持追踪止损订单。
+- *不支持* `reduce_only` 订单。
+- *不支持*追踪止损订单。
+
+### 期权交易
+
+Bybit 上架了 BTC 和 ETH 的欧式期权，以 USDT 或 USDC 结算。
+适配器使用 `CryptoOption` 金融工具类型和 `-OPTION` 符号
+后缀。完整的符号格式请参见[符号体系部分](#symbology)。
+
+#### 期权数据
+
+适配器通过 WebSocket ticker 通道支持实时期权市场数据：
+
+| 数据类型 | 描述 |
+|---------|------|
+| 报价（买价/卖价） | 每个期权合约的盘口价格和数量。 |
+| 希腊值 | Delta、gamma、vega、theta，以及买价/卖价/标记 IV。 |
+| 标记价格 | 每个期权合约的交易所标记价格。 |
+| 指数价格 | 标的指数价格。 |
+| 标的（远期）价格 | 按到期日的远期价格，用于确定 ATM。 |
+| 未平仓合约量 | 每个合约的未平仓合约量。 |
+| 订单簿增量 | 来自期权订单簿流的 L2 MBP 更新。 |
+
+订阅按金融工具的希腊值，或将它们聚合为带 ATM 相对行权价过滤的
+期权链快照。订阅模式参见
+[期权概念指南](../concepts/options.md)，分步演练参见
+[期权数据教程](../tutorials/options_data_bybit.md)。NautilusTrader
+从 Bybit 按合约的期权市场数据在本地构建期权链视图。
+
+期权没有 Bar（K 线）数据。Bybit 不为此产品类型提供 K 线流。
+
+#### 期权订单参数
+
+除标准订单参数外，期权订单还接受：
+
+| 参数 | 类型 | 描述 |
+|------|------|------|
+| `order_iv` | `str` 或 `float` | 按隐含波动率而非价格下单或修改订单。 |
+| `mmp` | `bool` | 为订单启用做市商保护（Market Maker Protection）。 |
+
+这些参数通过 `SubmitOrder` 上的 `params` 传递，并在主网上通过
+WebSocket 交易通道流转。它们在 Demo 模式下不受支持。
+
+#### 期权交易限制
+
+- 基于 IV 的期权订单和仅限 WS 交易的功能在 Demo 模式下不受支持。
+- 杠杆不可配置。期权买方支付权利金；卖方提交保证金。
+- 持仓模式仅为单向。不支持对冲模式。
+- 不支持条件订单类型（`STOP_MARKET`、`STOP_LIMIT`、`MARKET_IF_TOUCHED`、
+  `LIMIT_IF_TOUCHED`）。
+- 不支持交易止损（持仓上的 TP/SL）。
+- 资金费率不适用于期权。
+- 期权需要统一交易账户（UTA）。
 
 ### 追踪止损
 
@@ -327,9 +650,21 @@ Bybit 上的追踪止损在交易所端没有客户订单 ID（但有 `venue_ord
 - 你无法查询尚未开放的追踪止损订单（此时 `venue_order_id` 未知）。
 - 你可以在 GUI 中手动调整触发价格，这将更新 Nautilus 订单。
 
+## 资金费率
+
+适配器从
+[正向 Ticker](https://bybit-exchange.github.io/docs/v5/websocket/public/ticker#linear-inverse-perpetual-response)
+WebSocket 流接收资金费率数据。Bybit 在 ticker 更新中提供 `fundingIntervalHour` 字段，
+适配器用它来填充 `FundingRateUpdate` 上的 `interval` 字段。
+
+适配器会按符号缓存最后已知的 `fundingIntervalHour`，以便部分 ticker
+更新（可能省略该字段）仍携带正确的间隔。
+
+对于历史资金费率请求，适配器会根据连续的资金费率时间戳计算间隔。
+
 ## 速率限制
 
-每个 HTTP 调用都会消耗全局令牌桶以及相应的配额。当使用量超过桶的限制时，请求会自动排队，因此通常不需要手动节流。
+每个 HTTP 调用都会消耗全局令牌桶以及任何带键的配额。当使用量超过某个桶时，请求会自动排队，因此通常不需要手动节流。
 
 | 键 / 端点 | 限制（请求/秒） | 备注 |
 |-----------|----------------|------|
@@ -419,7 +754,7 @@ Bybit 上的追踪止损在交易所端没有客户订单 ID（但有 `venue_ord
 |---------|---------|-----------|
 | LINEAR | USDT（通常） | USDT |
 | INVERSE | 基础代币（例如 BTCUSD 的 BTC） | 基础代币 |
-| OPTION | USDC（旧版）或 USDT（2025 年 2 月后） | USDC/USDT |
+| OPTION | USDT | USDT |
 
 ### 手续费计算
 
@@ -427,12 +762,12 @@ Bybit 上的追踪止损在交易所端没有客户订单 ID（但有 `venue_ord
 
 #### 现货产品
 
-- **买入订单**：`手续费 = 基础数量 × 费率`
-- **卖出订单**：`手续费 = 名义价值 × 费率`（其中 `名义价值 = 数量 × 价格`）
+- **买入订单**：`fee = base_quantity × fee_rate`
+- **卖出订单**：`fee = notional_value × fee_rate`（其中 `notional_value = quantity × price`）
 
 #### 衍生品
 
-- 所有衍生品：`手续费 = 名义价值 × 费率`
+- 所有衍生品：`fee = notional_value × fee_rate`
 
 ### 官方文档
 
@@ -449,40 +784,40 @@ Bybit 上的追踪止损在交易所端没有客户订单 ID（但有 `venue_ord
 
 | 选项 | 默认值 | 描述 |
 |------|--------|------|
-| `api_key` | `None` | API 密钥(API key)；省略时从 `BYBIT_API_KEY`/`BYBIT_TESTNET_API_KEY` 加载。 |
-| `api_secret` | `None` | API 密钥对；省略时从 `BYBIT_API_SECRET`/`BYBIT_TESTNET_API_SECRET` 加载。 |
+| `api_key` | `None` | API key；省略时从匹配的环境变量加载。 |
+| `api_secret` | `None` | API secret；省略时从匹配的环境变量加载。 |
 | `product_types` | `None` | 要启用的 `BybitProductType` 值序列；为 `None` 时加载所有产品。 |
+| `instrument_provider` | default | 金融工具加载配置。订阅前使用 `load_all=True` 或 `load_ids`。 |
+| `environment` | `None` | Bybit 环境枚举。使用 `BybitEnvironment.MAINNET`、`BybitEnvironment.DEMO` 或 `BybitEnvironment.TESTNET`。 |
 | `base_url_http` | `None` | REST 基础 URL 覆盖。 |
-| `http_proxy_url` | `None` | 可选的 HTTP 代理 URL。 |
-| `ws_proxy_url` | `None` | 可选的 WebSocket 代理 URL（尚未实现）。 |
-| `demo` | `False` | 为 `True` 时连接到 Bybit 模拟环境。 |
-| `testnet` | `False` | 为 `True` 时连接到 Bybit 测试网(testnet)。 |
+| `proxy_url` | `None` | HTTP 和 WebSocket 传输的可选代理 URL。 |
 | `update_instruments_interval_mins` | `60` | 金融工具目录刷新间隔（分钟）。 |
 | `recv_window_ms` | `5,000` | 签名 REST 请求的接收窗口（毫秒）。 |
-| `bars_timestamp_on_close` | `True` | K 线时间戳取收盘时间（`True`）或开盘时间（`False`）。 |
+| `bars_timestamp_on_close` | `True` | K 线时间戳取区间收盘时间（`True`）或开盘时间（`False`）。 |
 | `max_retries` | `None` | REST/WebSocket 恢复的最大重试次数。 |
 | `retry_delay_initial_ms` | `None` | 重试之间的初始延迟（毫秒）。 |
 | `retry_delay_max_ms` | `None` | 重试之间的最大延迟（毫秒）。 |
+| `transport_backend` | `Sockudo` | WebSocket 传输后端。 |
 
 ### 执行客户端配置选项
 
 | 选项 | 默认值 | 描述 |
 |------|--------|------|
-| `api_key` | `None` | API 密钥；省略时从 `BYBIT_API_KEY`/`BYBIT_TESTNET_API_KEY` 加载。 |
-| `api_secret` | `None` | API 密钥对；省略时从 `BYBIT_API_SECRET`/`BYBIT_TESTNET_API_SECRET` 加载。 |
+| `api_key` | `None` | API key；省略时从匹配的环境变量加载。 |
+| `api_secret` | `None` | API secret；省略时从匹配的环境变量加载。 |
 | `product_types` | `None` | 要启用的 `BybitProductType` 值序列（执行时现货不能与衍生品混合）。 |
+| `instrument_provider` | default | 金融工具加载配置。提交订单前使用 `load_all=True` 或 `load_ids`。 |
+| `environment` | `None` | Bybit 环境枚举。使用 `BybitEnvironment.MAINNET`、`BybitEnvironment.DEMO` 或 `BybitEnvironment.TESTNET`。 |
 | `base_url_http` | `None` | REST 基础 URL 覆盖。 |
 | `base_url_ws_private` | `None` | 私有 WebSocket 基础 URL 覆盖。 |
 | `base_url_ws_trade` | `None` | 交易 WebSocket 基础 URL 覆盖。 |
-| `http_proxy_url` | `None` | 可选的 HTTP 代理 URL。 |
-| `ws_proxy_url` | `None` | 可选的 WebSocket 代理 URL（尚未实现）。 |
-| `demo` | `False` | 为 `True` 时连接到 Bybit 模拟环境。 |
-| `testnet` | `False` | 为 `True` 时连接到 Bybit 测试网。 |
+| `proxy_url` | `None` | HTTP 和 WebSocket 传输的可选代理 URL。 |
 | `use_gtd` | `False` | 为 `True` 时将 GTD 订单重映射为 GTC（Bybit 不原生支持 GTD）。 |
 | `use_ws_execution_fast` | `False` | 订阅低延迟执行流。 |
 | `use_http_batch_api` | `False` | 使用 Bybit 的 HTTP 批量交易 API（已弃用）。 |
 | `use_spot_position_reports` | `False` | 为 `True` 时将现货钱包余额报告为持仓。 |
 | `auto_repay_spot_borrows` | `True` | 在买入订单完全成交后自动偿还现货保证金借款（仅现货）。 |
+| `repay_queue_interval_secs` | `1.0` | 处理现货借款还款队列之间的间隔（秒）。 |
 | `ignore_uncached_instrument_executions` | `False` | 忽略尚未缓存的金融工具的执行消息。 |
 | `max_retries` | `None` | 订单提交/取消/修改调用的最大重试次数。 |
 | `retry_delay_initial_ms` | `None` | 重试之间的初始延迟（毫秒）。 |
@@ -491,16 +826,19 @@ Bybit 上的追踪止损在交易所端没有客户订单 ID（但有 `venue_ord
 | `ws_trade_timeout_secs` | `5.0` | 等待交易 WebSocket 确认的超时时间（秒）。 |
 | `ws_auth_timeout_secs` | `5.0` | 等待认证 WebSocket 确认的超时时间（秒）。 |
 | `futures_leverages` | `None` | `BybitSymbol` 到杠杆设置的映射。 |
-| `position_mode` | `None` | `BybitSymbol` 到持仓模式（单向 vs 对冲）的映射。 |
+| `position_mode` | `None` | `BybitSymbol` 到持仓模式的映射。参见[对冲模式](#hedge-mode-bothsides)。 |
 | `margin_mode` | `None` | 账户的保证金模式设置。 |
+| `transport_backend` | `Sockudo` | WebSocket 传输后端。 |
 
 最常见的使用场景是配置一个实时 `TradingNode` 以包含 Bybit
 数据和执行客户端。为此，在你的客户端配置中添加 `BYBIT` 部分：
 
 ```python
 from nautilus_trader.adapters.bybit import BYBIT
+from nautilus_trader.adapters.bybit import BybitEnvironment
 from nautilus_trader.adapters.bybit import BybitProductType
 from nautilus_trader.live.node import TradingNode
+from nautilus_trader.live.node import TradingNodeConfig
 
 config = TradingNodeConfig(
     ...,  # 省略
@@ -509,8 +847,8 @@ config = TradingNodeConfig(
             "api_key": "YOUR_BYBIT_API_KEY",
             "api_secret": "YOUR_BYBIT_API_SECRET",
             "base_url_http": None,  # 使用自定义端点覆盖
-            "product_types": [BybitProductType.LINEAR]
-            "testnet": False,
+            "environment": BybitEnvironment.MAINNET,
+            "product_types": [BybitProductType.LINEAR],
         },
     },
     exec_clients={
@@ -518,8 +856,8 @@ config = TradingNodeConfig(
             "api_key": "YOUR_BYBIT_API_KEY",
             "api_secret": "YOUR_BYBIT_API_SECRET",
             "base_url_http": None,  # 使用自定义端点覆盖
-            "product_types": [BybitProductType.LINEAR]
-            "testnet": False,
+            "environment": BybitEnvironment.MAINNET,
+            "product_types": [BybitProductType.LINEAR],
         },
     },
 )
@@ -570,6 +908,8 @@ node.build()
 :::
 
 启动交易节点时，你会立即收到凭证是否有效以及是否具有交易权限的确认。
+
+## 贡献
 
 :::info
 如需额外功能或为 Bybit 适配器做出贡献，请参阅我们的
