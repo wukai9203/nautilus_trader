@@ -13,9 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Test utilities and data management for [NautilusTrader](http://nautilustrader.io).
+//! Test utilities and data management for [NautilusTrader](https://nautilustrader.io).
 //!
-//! The `nautilus-testkit` crate provides comprehensive testing utilities including test data management,
+//! The `nautilus-testkit` crate provides testing utilities including test data management,
 //! file handling, and common testing patterns. This crate supports robust testing workflows
 //! across the entire NautilusTrader ecosystem with automated data downloads and validation:
 //!
@@ -25,15 +25,13 @@
 //! - **Precision handling**: Support for both 64-bit and 128-bit precision test data.
 //! - **Common patterns**: Reusable test utilities and helper functions.
 //!
-//! # Platform
+//! # NautilusTrader
 //!
-//! [NautilusTrader](http://nautilustrader.io) is an open-source, high-performance, production-grade
-//! algorithmic trading platform, providing quantitative traders with the ability to backtest
-//! portfolios of automated trading strategies on historical data with an event-driven engine,
-//! and also deploy those same strategies live, with no code changes.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
 //!
-//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-//! highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
@@ -47,6 +45,7 @@
 //! - `extension-module`: Builds the crate as a Python extension module.
 
 #![warn(rustc::all)]
+#![warn(clippy::pedantic)]
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
@@ -54,6 +53,16 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::float_cmp,
+        clippy::trivially_copy_pass_by_ref,
+        reason = "test fixtures assert exact values and construct binary protocol bytes"
+    )
+)]
 
 pub mod common;
 pub mod files;

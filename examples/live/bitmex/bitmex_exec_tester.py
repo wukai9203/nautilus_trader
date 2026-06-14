@@ -25,6 +25,7 @@ from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
+from nautilus_trader.core.nautilus_pyo3 import BitmexEnvironment
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId
@@ -62,6 +63,7 @@ config_node = TradingNodeConfig(
     exec_engine=LiveExecEngineConfig(
         reconciliation=True,
         reconciliation_instrument_ids=[instrument_id],  # Only reconcile this instrument
+        filter_unclaimed_external_orders=True,
         open_check_interval_secs=5.0,
         open_check_open_only=False,
         # position_check_interval_secs=60.0,
@@ -73,22 +75,14 @@ config_node = TradingNodeConfig(
     ),
     data_clients={
         BITMEX: BitmexDataClientConfig(
-            api_key=None,  # 'BITMEX_API_KEY' env var
-            api_secret=None,  # 'BITMEX_API_SECRET' env var
-            base_url_http=None,  # Override with custom endpoint
-            base_url_ws=None,  # Override with custom endpoint
+            environment=BitmexEnvironment.TESTNET if testnet else BitmexEnvironment.MAINNET,
             instrument_provider=InstrumentProviderConfig(load_all=True),
-            testnet=testnet,  # If client uses the testnet API
         ),
     },
     exec_clients={
         BITMEX: BitmexExecClientConfig(
-            api_key=None,  # 'BITMEX_API_KEY' env var
-            api_secret=None,  # 'BITMEX_API_SECRET' env var
-            base_url_http=None,  # Override with custom endpoint
-            base_url_ws=None,  # Override with custom endpoint
+            environment=BitmexEnvironment.TESTNET if testnet else BitmexEnvironment.MAINNET,
             instrument_provider=InstrumentProviderConfig(load_all=True),
-            testnet=testnet,  # If client uses the testnet API
             submitter_pool_size=1,
             canceller_pool_size=3,
         ),

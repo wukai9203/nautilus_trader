@@ -13,29 +13,29 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use indexmap::IndexMap;
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::identifiers::{ClientId, InstrumentId};
+use serde::{Deserialize, Serialize};
 
 /// Represents a request for a pool snapshot from a specific AMM pool.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestPoolSnapshot {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
     pub request_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl RequestPoolSnapshot {
     /// Creates a new [`RequestPoolSnapshot`] instance.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         request_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         Self {
             instrument_id,

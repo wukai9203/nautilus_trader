@@ -15,22 +15,25 @@
 
 //! Python bindings for dYdX gRPC client.
 
-#![allow(clippy::missing_errors_doc)]
-
 use std::sync::Arc;
 
-use nautilus_core::python::IntoPyObjectNautilusExt;
+use nautilus_core::{
+    hex,
+    python::{IntoPyObjectNautilusExt, to_pyruntime_err},
+};
 use pyo3::prelude::*;
 
 use crate::grpc::DydxGrpcClient;
 
-#[pyclass(name = "DydxGrpcClient")]
+#[pyclass(name = "DydxGrpcClient", from_py_object)]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.dydx")]
 #[derive(Debug, Clone)]
 pub struct PyDydxGrpcClient {
     pub(crate) inner: Arc<DydxGrpcClient>,
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyDydxGrpcClient {
     /// Create a new gRPC client.
     ///
@@ -43,7 +46,7 @@ impl PyDydxGrpcClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let client = DydxGrpcClient::new(grpc_url)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))?;
+                .map_err(to_pyruntime_err)?;
 
             Ok(Self {
                 inner: Arc::new(client),
@@ -66,7 +69,7 @@ impl PyDydxGrpcClient {
             let urls: Vec<&str> = grpc_urls.iter().map(String::as_str).collect();
             let client = DydxGrpcClient::new_with_fallback(&urls)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))?;
+                .map_err(to_pyruntime_err)?;
 
             Ok(Self {
                 inner: Arc::new(client),
@@ -87,7 +90,7 @@ impl PyDydxGrpcClient {
             let height = client
                 .latest_block_height()
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))?;
+                .map_err(to_pyruntime_err)?;
             Ok(height.0 as u64)
         })
     }
@@ -109,7 +112,7 @@ impl PyDydxGrpcClient {
             let account = client
                 .get_account(&address)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))?;
+                .map_err(to_pyruntime_err)?;
             Ok((account.account_number, account.sequence))
         })
     }
@@ -131,7 +134,7 @@ impl PyDydxGrpcClient {
             let balances = client
                 .get_account_balances(&address)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))?;
+                .map_err(to_pyruntime_err)?;
             let result: Vec<(String, String)> =
                 balances.into_iter().map(|c| (c.denom, c.amount)).collect();
             Ok(result)
@@ -156,7 +159,7 @@ impl PyDydxGrpcClient {
             let subaccount = client
                 .get_subaccount(&address, subaccount_number)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))?;
+                .map_err(to_pyruntime_err)?;
 
             // Return as dict-like structure
             // quantums is bytes representing a big-endian signed integer
@@ -187,20 +190,19 @@ impl PyDydxGrpcClient {
         let client = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut client = (*client).clone();
-            let info = client
-                .get_node_info()
-                .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))?;
+            let info = client.get_node_info().await.map_err(to_pyruntime_err)?;
 
             // Return node info as a dict
             Python::attach(|py| {
                 use pyo3::types::PyDict;
                 let dict = PyDict::new(py);
+
                 if let Some(default_node_info) = info.default_node_info {
                     dict.set_item("network", default_node_info.network)?;
                     dict.set_item("moniker", default_node_info.moniker)?;
                     dict.set_item("version", default_node_info.version)?;
                 }
+
                 if let Some(app_info) = info.application_version {
                     dict.set_item("app_name", app_info.name)?;
                     dict.set_item("app_version", app_info.version)?;
@@ -227,7 +229,7 @@ impl PyDydxGrpcClient {
             let gas_used = client
                 .simulate_tx(tx_bytes)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))?;
+                .map_err(to_pyruntime_err)?;
             Ok(gas_used)
         })
     }
@@ -242,10 +244,7 @@ impl PyDydxGrpcClient {
         let client = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut client = (*client).clone();
-            let tx = client
-                .get_tx(&hash)
-                .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))?;
+            let tx = client.get_tx(&hash).await.map_err(to_pyruntime_err)?;
 
             // Return tx as JSON string
             let result = format!("Tx(body_bytes_len={})", tx.body.messages.len());

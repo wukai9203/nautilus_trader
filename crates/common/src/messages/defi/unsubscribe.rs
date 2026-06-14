@@ -13,31 +13,31 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use indexmap::IndexMap;
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_model::{
     defi::chain::Blockchain,
     identifiers::{ClientId, InstrumentId},
 };
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnsubscribeBlocks {
     pub chain: Blockchain,
     pub client_id: Option<ClientId>,
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl UnsubscribeBlocks {
     /// Creates a new [`UnsubscribeBlocks`] instance.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         chain: Blockchain,
         client_id: Option<ClientId>,
         command_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         Self {
             chain,
@@ -50,24 +50,24 @@ impl UnsubscribeBlocks {
 }
 
 /// Represents a command to unsubscribe from definition updates for a specific AMM pool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnsubscribePool {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl UnsubscribePool {
     /// Creates a new [`UnsubscribePool`] instance.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         command_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         Self {
             instrument_id,
@@ -79,24 +79,24 @@ impl UnsubscribePool {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnsubscribePoolSwaps {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl UnsubscribePoolSwaps {
     /// Creates a new [`UnsubscribePoolSwaps`] instance.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         command_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         Self {
             instrument_id,
@@ -109,24 +109,24 @@ impl UnsubscribePoolSwaps {
 }
 
 /// Represents a command to unsubscribe from liquidity updates for a specific AMM pool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnsubscribePoolLiquidityUpdates {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl UnsubscribePoolLiquidityUpdates {
     /// Creates a new [`UnsubscribePoolLiquidityUpdates`] instance.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         command_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         Self {
             instrument_id,
@@ -139,24 +139,24 @@ impl UnsubscribePoolLiquidityUpdates {
 }
 
 /// Represents a command to unsubscribe from fee-collect events for a specific AMM pool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnsubscribePoolFeeCollects {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl UnsubscribePoolFeeCollects {
     /// Creates a new [`UnsubscribePoolFeeCollects`] instance.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         command_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         Self {
             instrument_id,
@@ -169,24 +169,24 @@ impl UnsubscribePoolFeeCollects {
 }
 
 /// Represents a command to unsubscribe from flash-loan events for a specific AMM pool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnsubscribePoolFlashEvents {
     pub instrument_id: InstrumentId,
     pub client_id: Option<ClientId>,
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
 }
 
 impl UnsubscribePoolFlashEvents {
     /// Creates a new [`UnsubscribePoolFlashEvents`] instance.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         instrument_id: InstrumentId,
         client_id: Option<ClientId>,
         command_id: UUID4,
         ts_init: UnixNanos,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
     ) -> Self {
         Self {
             instrument_id,

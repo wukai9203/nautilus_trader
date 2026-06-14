@@ -35,7 +35,11 @@ use crate::{
 #[serde(tag = "type")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct TradeTick {
     /// The trade instrument ID.
@@ -226,7 +230,6 @@ mod tests {
         assert_eq!(trade.aggressor_side, AggressorSide::Seller);
     }
 
-    #[cfg(feature = "high-precision")] // TODO: Add 64-bit precision version of test
     #[rstest]
     #[should_panic(expected = "invalid `Quantity` for 'size' not positive, was 0")]
     fn test_trade_tick_new_with_zero_size_panics() {

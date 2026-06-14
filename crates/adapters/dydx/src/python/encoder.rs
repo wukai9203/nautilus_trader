@@ -15,10 +15,9 @@
 
 //! Python bindings for dYdX ClientOrderId encoder.
 
-#![allow(clippy::missing_errors_doc)]
-
 use std::sync::Arc;
 
+use nautilus_core::python::to_pyruntime_err;
 use nautilus_model::identifiers::ClientOrderId;
 use pyo3::prelude::*;
 
@@ -29,6 +28,7 @@ use crate::execution::encoder::ClientOrderIdEncoder;
 /// Provides bidirectional encoding of Nautilus ClientOrderId strings to
 /// dYdX's (client_id, client_metadata) u32 pair.
 #[pyclass(name = "DydxClientOrderIdEncoder")]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.dydx")]
 #[derive(Debug)]
 pub struct PyDydxClientOrderIdEncoder {
     inner: Arc<ClientOrderIdEncoder>,
@@ -42,6 +42,7 @@ impl PyDydxClientOrderIdEncoder {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyDydxClientOrderIdEncoder {
     /// Create a new ClientOrderIdEncoder.
     #[new]
@@ -65,10 +66,7 @@ impl PyDydxClientOrderIdEncoder {
     #[pyo3(name = "encode")]
     fn py_encode(&self, client_order_id: &str) -> PyResult<(u32, u32)> {
         let id = ClientOrderId::from(client_order_id);
-        let encoded = self
-            .inner
-            .encode(id)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e}")))?;
+        let encoded = self.inner.encode(id).map_err(to_pyruntime_err)?;
         Ok((encoded.client_id, encoded.client_metadata))
     }
 

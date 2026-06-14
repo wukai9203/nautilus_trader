@@ -28,7 +28,11 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct PoolFeeCollect {
     /// The blockchain network where the fee collection occurred.
@@ -57,16 +61,16 @@ pub struct PoolFeeCollect {
     pub tick_lower: i32,
     /// The upper price tick boundary of the liquidity position.
     pub tick_upper: i32,
-    /// The timestamp of the fee collection in Unix nanoseconds.
-    pub timestamp: Option<UnixNanos>,
+    /// UNIX timestamp (nanoseconds) when the fee collection event occurred.
+    pub ts_event: UnixNanos,
     /// UNIX timestamp (nanoseconds) when the instance was created.
-    pub ts_init: Option<UnixNanos>,
+    pub ts_init: UnixNanos,
 }
 
 impl PoolFeeCollect {
     /// Creates a new [`PoolFeeCollect`] instance with the specified properties.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub const fn new(
         chain: SharedChain,
         dex: SharedDex,
@@ -81,7 +85,8 @@ impl PoolFeeCollect {
         amount1: u128,
         tick_lower: i32,
         tick_upper: i32,
-        timestamp: Option<UnixNanos>,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
     ) -> Self {
         Self {
             chain,
@@ -97,8 +102,8 @@ impl PoolFeeCollect {
             amount1,
             tick_lower,
             tick_upper,
-            timestamp,
-            ts_init: timestamp,
+            ts_event,
+            ts_init,
         }
     }
 }

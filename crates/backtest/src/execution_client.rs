@@ -71,16 +71,17 @@ impl Debug for BacktestExecutionClient {
         f.debug_struct(stringify!(BacktestExecutionClient))
             .field("client_id", &self.core.client_id)
             .field("routing", &self.routing)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl BacktestExecutionClient {
-    #[allow(clippy::too_many_arguments)]
+    /// Creates a new [`BacktestExecutionClient`] instance.
+    #[must_use]
     pub fn new(
         trader_id: TraderId,
         account_id: AccountId,
-        exchange: Rc<RefCell<SimulatedExchange>>,
+        exchange: &Rc<RefCell<SimulatedExchange>>,
         cache: Rc<RefCell<Cache>>,
         clock: Rc<RefCell<dyn Clock>>,
         routing: Option<bool>,
@@ -106,10 +107,6 @@ impl BacktestExecutionClient {
 
         let factory = OrderEventFactory::new(trader_id, account_id, account_type, base_currency);
 
-        if !frozen_account {
-            // TODO Register calculated account
-        }
-
         Self {
             core,
             factory,
@@ -122,11 +119,11 @@ impl BacktestExecutionClient {
         }
     }
 
-    fn get_order(&self, client_order_id: &ClientOrderId) -> anyhow::Result<OrderAny> {
+    fn get_order(&self, client_order_id: ClientOrderId) -> anyhow::Result<OrderAny> {
         self.cache
             .borrow()
-            .order(client_order_id)
-            .cloned()
+            .order(&client_order_id)
+            .map(|o| o.clone())
             .ok_or_else(|| anyhow::anyhow!("Order not found in cache for {client_order_id}"))
     }
 
@@ -163,7 +160,7 @@ impl ExecutionClient for BacktestExecutionClient {
     }
 
     fn get_account(&self) -> Option<AccountAny> {
-        self.cache.borrow().account(&self.core.account_id).cloned()
+        self.cache.borrow().account_owned(&self.core.account_id)
     }
 
     fn generate_account_state(
@@ -194,34 +191,33 @@ impl ExecutionClient for BacktestExecutionClient {
         Ok(())
     }
 
-    fn submit_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+    fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
         // Buffer the OrderSubmitted event for deferred processing to avoid
         // RefCell re-entrancy (exec_engine holds a borrow during execute)
-        let order = self.get_order(&cmd.client_order_id)?;
+        let order = self.get_order(cmd.client_order_id)?;
         let ts_init = self.clock.borrow().timestamp_ns();
         let event = self.factory.generate_order_submitted(&order, ts_init);
         self.queued_events.borrow_mut().push(event);
 
         if let Some(exchange) = self.exchange.upgrade() {
-            exchange
-                .borrow_mut()
-                .send(TradingCommand::SubmitOrder(cmd.clone()));
+            exchange.borrow_mut().send(TradingCommand::SubmitOrder(cmd));
         } else {
             log::error!("submit_order: SimulatedExchange has been dropped");
         }
         Ok(())
     }
 
-    fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
+    fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
         let ts_init = self.clock.borrow().timestamp_ns();
 
         let orders: Vec<OrderAny> = self
             .cache
             .borrow()
-            .orders_for_ids(&cmd.order_list.client_order_ids, cmd);
+            .orders_for_ids(&cmd.order_list.client_order_ids, &cmd);
 
         // Buffer events for deferred processing
         let mut queued = self.queued_events.borrow_mut();
+
         for order in &orders {
             let event = self.factory.generate_order_submitted(order, ts_init);
             queued.push(event);
@@ -231,73 +227,67 @@ impl ExecutionClient for BacktestExecutionClient {
         if let Some(exchange) = self.exchange.upgrade() {
             exchange
                 .borrow_mut()
-                .send(TradingCommand::SubmitOrderList(cmd.clone()));
+                .send(TradingCommand::SubmitOrderList(cmd));
         } else {
             log::error!("submit_order_list: SimulatedExchange has been dropped");
         }
         Ok(())
     }
 
-    fn modify_order(&self, cmd: &ModifyOrder) -> anyhow::Result<()> {
+    fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
         if let Some(exchange) = self.exchange.upgrade() {
-            exchange
-                .borrow_mut()
-                .send(TradingCommand::ModifyOrder(cmd.clone()));
+            exchange.borrow_mut().send(TradingCommand::ModifyOrder(cmd));
         } else {
             log::error!("modify_order: SimulatedExchange has been dropped");
         }
         Ok(())
     }
 
-    fn cancel_order(&self, cmd: &CancelOrder) -> anyhow::Result<()> {
+    fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
         if let Some(exchange) = self.exchange.upgrade() {
-            exchange
-                .borrow_mut()
-                .send(TradingCommand::CancelOrder(cmd.clone()));
+            exchange.borrow_mut().send(TradingCommand::CancelOrder(cmd));
         } else {
             log::error!("cancel_order: SimulatedExchange has been dropped");
         }
         Ok(())
     }
 
-    fn cancel_all_orders(&self, cmd: &CancelAllOrders) -> anyhow::Result<()> {
+    fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
         if let Some(exchange) = self.exchange.upgrade() {
             exchange
                 .borrow_mut()
-                .send(TradingCommand::CancelAllOrders(cmd.clone()));
+                .send(TradingCommand::CancelAllOrders(cmd));
         } else {
             log::error!("cancel_all_orders: SimulatedExchange has been dropped");
         }
         Ok(())
     }
 
-    fn batch_cancel_orders(&self, cmd: &BatchCancelOrders) -> anyhow::Result<()> {
+    fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
         if let Some(exchange) = self.exchange.upgrade() {
             exchange
                 .borrow_mut()
-                .send(TradingCommand::BatchCancelOrders(cmd.clone()));
+                .send(TradingCommand::BatchCancelOrders(cmd));
         } else {
             log::error!("batch_cancel_orders: SimulatedExchange has been dropped");
         }
         Ok(())
     }
 
-    fn query_account(&self, cmd: &QueryAccount) -> anyhow::Result<()> {
+    fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
         if let Some(exchange) = self.exchange.upgrade() {
             exchange
                 .borrow_mut()
-                .send(TradingCommand::QueryAccount(cmd.clone()));
+                .send(TradingCommand::QueryAccount(cmd));
         } else {
             log::error!("query_account: SimulatedExchange has been dropped");
         }
         Ok(())
     }
 
-    fn query_order(&self, cmd: &QueryOrder) -> anyhow::Result<()> {
+    fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
         if let Some(exchange) = self.exchange.upgrade() {
-            exchange
-                .borrow_mut()
-                .send(TradingCommand::QueryOrder(cmd.clone()));
+            exchange.borrow_mut().send(TradingCommand::QueryOrder(cmd));
         } else {
             log::error!("query_order: SimulatedExchange has been dropped");
         }

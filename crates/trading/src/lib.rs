@@ -13,21 +13,19 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Trading strategy machinery and orchestration [NautilusTrader](http://nautilustrader.io).
+//! Trading strategy machinery and orchestration [NautilusTrader](https://nautilustrader.io).
 //!
 //! The `nautilus-trading` crate provides core trading capabilities including:
 //!
 //! - **Forex sessions**: Market session time calculations and timezone handling.
 //!
-//! # Platform
+//! # NautilusTrader
 //!
-//! [NautilusTrader](http://nautilustrader.io) is an open-source, high-performance, production-grade
-//! algorithmic trading platform, providing quantitative traders with the ability to backtest
-//! portfolios of automated trading strategies on historical data with an event-driven engine,
-//! and also deploy those same strategies live, with no code changes.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
+//! engine for multi-asset, multi-venue trading systems.
 //!
-//! NautilusTrader's design, architecture, and implementation philosophy prioritizes software correctness and safety at the
-//! highest level, with the aim of supporting mission-critical, trading system backtesting and live deployment workloads.
+//! The system spans research, deterministic simulation, and live execution within a single
+//! event-driven architecture, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
@@ -36,10 +34,14 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
+//! - `examples`: Enables example strategies (e.g. `EmaCross`) for backtesting and demos.
+//! - `defi`: Enables DeFi (Decentralized Finance) support.
+//! - `high-precision`: Enables [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) to use 128-bit value types.
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
 //! - `extension-module`: Builds the crate as a Python extension module.
 
 #![warn(rustc::all)]
+#![warn(clippy::pedantic)]
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
@@ -47,16 +49,70 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::similar_names,
+    reason = "trading domain terms such as side/size and call/put identifiers are intentionally parallel"
+)]
+#![allow(
+    clippy::manual_let_else,
+    reason = "match and if-let early returns are consistent with surrounding trading flow code"
+)]
+#![allow(
+    clippy::redundant_closure_for_method_calls,
+    reason = "matches the Rust 1.94 ICE workaround in the workspace lint table"
+)]
+#![allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "trading algorithms and examples cast between raw quantities, time intervals, and float signals"
+)]
+#![allow(
+    clippy::missing_fields_in_debug,
+    reason = "manual Debug impls intentionally omit verbose runtime state"
+)]
+#![allow(
+    clippy::struct_excessive_bools,
+    reason = "strategy config and state structs mirror existing trading and Python surfaces"
+)]
+#![allow(
+    clippy::too_many_lines,
+    reason = "strategy and algorithm dispatch flows exceed the default threshold by design"
+)]
+#![allow(
+    clippy::match_wildcard_for_single_variants,
+    reason = "wildcard arms guard against future enum variants in trading dispatch"
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::default_trait_access,
+        clippy::float_cmp,
+        reason = "trading tests assert exact float state transitions and build typed fixtures"
+    )
+)]
+
+mod macros;
+
+#[doc(hidden)]
+pub mod _macro_reexports {
+    pub use nautilus_common::actor::DataActorCore;
+}
 
 pub mod algorithm;
 pub mod sessions;
 pub mod strategy;
 
+#[cfg(feature = "examples")]
+pub mod examples;
+
 pub use algorithm::{
-    ExecutionAlgorithm, ExecutionAlgorithmConfig, ExecutionAlgorithmCore, TwapAlgorithm,
-    TwapAlgorithmConfig,
+    ExecutionAlgorithm, ExecutionAlgorithmConfig, ExecutionAlgorithmCore,
+    ImportableExecAlgorithmConfig, TwapAlgorithm, TwapAlgorithmConfig,
 };
-pub use strategy::{Strategy, StrategyConfig, StrategyCore};
+pub use strategy::{ImportableStrategyConfig, Strategy, StrategyConfig, StrategyCore};
 
 #[cfg(feature = "python")]
 pub mod python;

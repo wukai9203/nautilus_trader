@@ -36,7 +36,10 @@ pub mod stubs;
 use ahash::AHashSet;
 use enum_dispatch::enum_dispatch;
 use indexmap::IndexMap;
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{
+    UUID4, UnixNanos,
+    correctness::{CorrectnessError, check_predicate_false},
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
@@ -72,6 +75,7 @@ use crate::{
         StrategyId, Symbol, TradeId, TraderId, Venue, VenueOrderId,
     },
     orderbook::OwnBookOrder,
+    reports::OrderStatusReport,
     types::{Currency, Money, Price, Quantity},
 };
 
@@ -88,7 +92,17 @@ pub const LIMIT_ORDER_TYPES: &[OrderType] = &[
     OrderType::Limit,
     OrderType::StopLimit,
     OrderType::LimitIfTouched,
-    OrderType::MarketIfTouched,
+    OrderType::TrailingStopLimit,
+];
+
+/// Order types that support the TRIGGERED order status.
+///
+/// Market-style stops (`StopMarket`, `MarketIfTouched`, `TrailingStopMarket`) execute
+/// immediately on trigger and have no intermediate TRIGGERED state.
+pub const TRIGGERABLE_ORDER_TYPES: &[OrderType] = &[
+    OrderType::StopLimit,
+    OrderType::TrailingStopLimit,
+    OrderType::LimitIfTouched,
 ];
 
 /// Order statuses for locally active orders (pre-submission to venue).
@@ -143,10 +157,10 @@ pub enum OrderError {
     #[error("Duplicate fill: trade_id {0} already applied to order")]
     DuplicateFill(TradeId),
     #[error("{0}")]
-    Invariant(#[from] anyhow::Error),
+    Invariant(#[from] CorrectnessError),
 }
 
-/// Converts an IndexMap with `Ustr` keys and values to `String` keys and values.
+/// Converts an `IndexMap` with `Ustr` keys and values to `String` keys and values.
 #[must_use]
 pub fn ustr_indexmap_to_str(h: IndexMap<Ustr, Ustr>) -> IndexMap<String, String> {
     h.into_iter()
@@ -154,7 +168,7 @@ pub fn ustr_indexmap_to_str(h: IndexMap<Ustr, Ustr>) -> IndexMap<String, String>
         .collect()
 }
 
-/// Converts an IndexMap with `String` keys and values to `Ustr` keys and values.
+/// Converts an `IndexMap` with `String` keys and values to `Ustr` keys and values.
 #[must_use]
 pub fn str_indexmap_to_ustr(h: IndexMap<String, String>) -> IndexMap<Ustr, Ustr> {
     h.into_iter()
@@ -167,12 +181,8 @@ pub(crate) fn check_display_qty(
     display_qty: Option<Quantity>,
     quantity: Quantity,
 ) -> Result<(), OrderError> {
-    if let Some(q) = display_qty
-        && q > quantity
-    {
-        return Err(OrderError::Invariant(anyhow::anyhow!(
-            "`display_qty` may not exceed `quantity`"
-        )));
+    if let Some(q) = display_qty {
+        check_predicate_false(q > quantity, "`display_qty` may not exceed `quantity`")?;
     }
     Ok(())
 }
@@ -182,11 +192,10 @@ pub(crate) fn check_time_in_force(
     time_in_force: TimeInForce,
     expire_time: Option<UnixNanos>,
 ) -> Result<(), OrderError> {
-    if time_in_force == TimeInForce::Gtd && expire_time.unwrap_or_default() == 0 {
-        return Err(OrderError::Invariant(anyhow::anyhow!(
-            "`expire_time` is required for `GTD` order"
-        )));
-    }
+    check_predicate_false(
+        time_in_force == TimeInForce::Gtd && expire_time.unwrap_or_default() == 0,
+        "`expire_time` is required for `GTD` order",
+    )?;
     Ok(())
 }
 
@@ -240,6 +249,7 @@ impl OrderStatus {
             (Self::PendingUpdate, OrderEventAny::PendingUpdate(_)) => Self::PendingUpdate,  // Allow multiple requests
             (Self::PendingUpdate, OrderEventAny::PendingCancel(_)) => Self::PendingCancel,
             (Self::PendingUpdate, OrderEventAny::ModifyRejected(_)) => Self::PendingUpdate,  // Handled by modify_rejected to restore previous_status
+            (Self::PendingUpdate, OrderEventAny::Updated(_)) => Self::PendingUpdate,  // Handled by updated to restore previous_status
             (Self::PendingUpdate, OrderEventAny::Filled(_)) => Self::Filled,
             (Self::PendingCancel, OrderEventAny::Rejected(_)) => Self::Rejected,
             (Self::PendingCancel, OrderEventAny::PendingCancel(_)) => Self::PendingCancel,  // Allow multiple requests
@@ -318,7 +328,12 @@ pub trait Order: 'static + Send {
     /// Calculates potential overfill quantity without mutating order state.
     fn calculate_overfill(&self, fill_qty: Quantity) -> Quantity {
         let potential_filled = self.filled_qty() + fill_qty;
-        potential_filled.saturating_sub(self.quantity())
+        let quantity = self.quantity();
+        if potential_filled > quantity {
+            potential_filled - quantity
+        } else {
+            Quantity::zero(fill_qty.precision)
+        }
     }
 
     fn avg_px(&self) -> Option<f64>;
@@ -346,7 +361,6 @@ pub trait Order: 'static + Send {
     fn events(&self) -> Vec<&OrderEventAny>;
 
     fn last_event(&self) -> &OrderEventAny {
-        // SAFETY: Order specification guarantees at least one event (OrderInitialized)
         self.events()
             .last()
             .expect("Order invariant violated: no events")
@@ -362,7 +376,7 @@ pub trait Order: 'static + Send {
 
     fn has_price(&self) -> bool;
 
-    /// Returns `true` if a fill with matching trade_id, side, qty, and price already exists.
+    /// Returns `true` if a fill with matching `trade_id`, side, qty, and price already exists.
     fn is_duplicate_fill(&self, fill: &OrderFilled) -> bool {
         self.events().iter().any(|event| {
             if let OrderEventAny::Filled(existing) = event {
@@ -503,6 +517,119 @@ pub trait Order: 'static + Send {
         )
     }
 
+    /// Builds an [`OrderStatusReport`] snapshot from the order's current state.
+    ///
+    /// Returns `None` if the order has no `venue_order_id` or `account_id`:
+    /// a status report describes a venue-acknowledged order, and both fields
+    /// are set by the time a venue acknowledges the order.
+    fn to_order_status_report(&self, report_id: Option<UUID4>) -> Option<OrderStatusReport> {
+        let account_id = self.account_id()?;
+        let venue_order_id = self.venue_order_id()?;
+
+        let mut report = OrderStatusReport::new(
+            account_id,
+            self.instrument_id(),
+            Some(self.client_order_id()),
+            venue_order_id,
+            self.order_side(),
+            self.order_type(),
+            self.time_in_force(),
+            self.status(),
+            self.quantity(),
+            self.filled_qty(),
+            self.ts_accepted().unwrap_or_else(|| self.ts_last()),
+            self.ts_last(),
+            self.ts_init(),
+            report_id,
+        )
+        .with_post_only(self.is_post_only())
+        .with_reduce_only(self.is_reduce_only());
+
+        if let Some(price) = self.price() {
+            report = report.with_price(price);
+        }
+
+        if let Some(trigger_price) = self.trigger_price() {
+            report = report.with_trigger_price(trigger_price);
+        }
+
+        if let Some(trigger_type) = self.trigger_type() {
+            report = report.with_trigger_type(trigger_type);
+        }
+
+        if let Some(limit_offset) = self.limit_offset() {
+            report = report.with_limit_offset(limit_offset);
+        }
+
+        if let Some(trailing_offset) = self.trailing_offset() {
+            report = report.with_trailing_offset(trailing_offset);
+        }
+
+        if let Some(trailing_offset_type) = self.trailing_offset_type() {
+            report = report.with_trailing_offset_type(trailing_offset_type);
+        }
+
+        if let Some(display_qty) = self.display_qty() {
+            report = report.with_display_qty(display_qty);
+        }
+
+        if let Some(expire_time) = self.expire_time() {
+            report = report.with_expire_time(expire_time);
+        }
+
+        if let Some(contingency_type) = self.contingency_type() {
+            report = report.with_contingency_type(contingency_type);
+        }
+
+        if let Some(order_list_id) = self.order_list_id() {
+            report = report.with_order_list_id(order_list_id);
+        }
+
+        if let Some(linked_order_ids) = self.linked_order_ids() {
+            report = report.with_linked_order_ids(linked_order_ids.iter().copied());
+        }
+
+        if let Some(parent_order_id) = self.parent_order_id() {
+            report = report.with_parent_order_id(parent_order_id);
+        }
+
+        if let Some(position_id) = self.position_id() {
+            report = report.with_venue_position_id(position_id);
+        }
+
+        // The trait exposes no trigger or rejection metadata accessors,
+        // recover the last occurrences from the event history.
+        let mut ts_triggered = None;
+        let mut rejected_reason = None;
+
+        for event in self.events() {
+            match event {
+                OrderEventAny::Triggered(triggered) => ts_triggered = Some(triggered.ts_event),
+                OrderEventAny::Rejected(rejected) => rejected_reason = Some(rejected.reason),
+                _ => {}
+            }
+        }
+
+        if let Some(ts_triggered) = ts_triggered {
+            report = report.with_ts_triggered(ts_triggered);
+        }
+
+        // `cancel_reason` is the report's only reason channel,
+        // reconciliation reads it for rejected orders.
+        if let Some(reason) = rejected_reason {
+            report = report.with_cancel_reason(reason.to_string());
+        }
+
+        // Skip a non-finite avg_px rather than fail the whole snapshot
+        if let Some(avg_px) = self.avg_px()
+            && let Ok(updated) = report.clone().with_avg_px(avg_px)
+        {
+            report = updated;
+        }
+
+        Some(report)
+    }
+
     fn is_triggered(&self) -> Option<bool>; // TODO: Temporary on trait
     fn set_position_id(&mut self, position_id: Option<PositionId>);
     fn set_quantity(&mut self, quantity: Quantity);
@@ -553,6 +680,7 @@ where
             ts_event: order.ts_init(),
             ts_init: order.ts_init(),
             reconciliation: false,
+            causation_id: None,
         }
     }
 }
@@ -604,6 +732,7 @@ pub struct OrderCore {
 
 impl OrderCore {
     /// Creates a new [`OrderCore`] instance.
+    #[must_use]
     pub fn new(init: OrderInitialized) -> Self {
         let events: Vec<OrderEventAny> = vec![OrderEventAny::Initialized(init.clone())];
         Self {
@@ -661,18 +790,25 @@ impl OrderCore {
     /// `event.client_order_id()` or `event.strategy_id()` does not match the order.
     pub fn apply(&mut self, event: OrderEventAny) -> Result<(), OrderError> {
         if self.client_order_id != event.client_order_id() {
-            return Err(OrderError::Invariant(anyhow::anyhow!(
-                "Event client_order_id {} does not match order client_order_id {}",
-                event.client_order_id(),
-                self.client_order_id
-            )));
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!(
+                    "Event client_order_id {} does not match order client_order_id {}",
+                    event.client_order_id(),
+                    self.client_order_id
+                ),
+            }
+            .into());
         }
+
         if self.strategy_id != event.strategy_id() {
-            return Err(OrderError::Invariant(anyhow::anyhow!(
-                "Event strategy_id {} does not match order strategy_id {}",
-                event.strategy_id(),
-                self.strategy_id
-            )));
+            return Err(CorrectnessError::PredicateViolation {
+                message: format!(
+                    "Event strategy_id {} does not match order strategy_id {}",
+                    event.strategy_id(),
+                    self.strategy_id
+                ),
+            }
+            .into());
         }
 
         // Save current status as previous_status for ALL transitions except:
@@ -696,6 +832,12 @@ impl OrderCore {
             && self.trade_ids.contains(&fill.trade_id)
         {
             return Err(OrderError::DuplicateFill(fill.trade_id));
+        }
+
+        if matches!(event, OrderEventAny::Triggered(_))
+            && !TRIGGERABLE_ORDER_TYPES.contains(&self.order_type)
+        {
+            return Err(OrderError::InvalidOrderEvent);
         }
 
         let new_status = self.status.transition(&event)?;
@@ -771,7 +913,7 @@ impl OrderCore {
         Ok(())
     }
 
-    fn triggered(&mut self, _event: &OrderTriggered) {}
+    fn triggered(&self, _event: &OrderTriggered) {}
 
     fn canceled(&mut self, event: &OrderCanceled) {
         self.ts_closed = Some(event.ts_event);
@@ -782,6 +924,12 @@ impl OrderCore {
     }
 
     fn updated(&mut self, event: &OrderUpdated) {
+        if self.status == OrderStatus::PendingUpdate
+            && let Some(previous) = self.previous_status
+        {
+            self.status = previous;
+        }
+
         if let Some(venue_order_id) = &event.venue_order_id
             && (self.venue_order_id.is_none()
                 || venue_order_id != self.venue_order_id.as_ref().unwrap())
@@ -789,6 +937,8 @@ impl OrderCore {
             self.venue_order_id = Some(*venue_order_id);
             self.venue_order_ids.push(*venue_order_id);
         }
+
+        self.is_quote_quantity = event.is_quote_quantity;
     }
 
     fn filled(&mut self, event: &OrderFilled) {
@@ -822,12 +972,44 @@ impl OrderCore {
         self.filled_qty = new_filled_qty;
         self.leaves_qty = self.leaves_qty.saturating_sub(event.last_qty);
         self.ts_last = event.ts_event;
+
+        if let Some(commission) = event.commission {
+            let commission_currency = commission.currency;
+            if let Some(existing_commission) = self.commissions.get_mut(&commission_currency) {
+                *existing_commission = *existing_commission + commission;
+            } else {
+                self.commissions.insert(commission_currency, commission);
+            }
+        }
+
         if self.ts_accepted.is_none() {
             // Set ts_accepted to time of first fill if not previously set
             self.ts_accepted = Some(event.ts_event);
         }
 
         self.set_avg_px(event.last_qty, event.last_px);
+
+        debug_assert!(
+            matches!(
+                self.status,
+                OrderStatus::PartiallyFilled | OrderStatus::Filled
+            ),
+            "Invariant: status must be PartiallyFilled or Filled after fill handler (status={:?})",
+            self.status
+        );
+        debug_assert!(
+            self.venue_order_id.is_some()
+                && self.last_trade_id.is_some()
+                && !self.trade_ids.is_empty(),
+            "Invariant: venue_order_id, last_trade_id and trade_ids must be set after fill"
+        );
+        debug_assert!(
+            self.filled_qty.raw.saturating_add(self.leaves_qty.raw) >= self.quantity.raw,
+            "Invariant: filled_qty + leaves_qty >= quantity (filled={}, leaves={}, quantity={})",
+            self.filled_qty,
+            self.leaves_qty,
+            self.quantity
+        );
     }
 
     fn set_avg_px(&mut self, last_qty: Quantity, last_px: Price) {
@@ -840,6 +1022,11 @@ impl OrderCore {
         let prev_filled_qty = (self.filled_qty - last_qty).as_f64();
         let last_qty_f64 = last_qty.as_f64();
         let total_qty = prev_filled_qty + last_qty_f64;
+
+        debug_assert!(
+            total_qty > 0.0,
+            "Invariant: avg_px calc requires positive total_qty (prev={prev_filled_qty}, last={last_qty_f64})"
+        );
 
         let avg_px = self
             .avg_px
@@ -889,7 +1076,7 @@ impl OrderCore {
         match self.side {
             OrderSide::Buy => self.quantity.as_decimal(),
             OrderSide::Sell => -self.quantity.as_decimal(),
-            _ => panic!("Invalid order side"),
+            OrderSide::NoOrderSide => panic!("Invalid order side"),
         }
     }
 
@@ -936,14 +1123,16 @@ mod tests {
 
     use super::*;
     use crate::{
-        enums::{OrderSide, OrderStatus, PositionSide},
-        events::order::{
-            accepted::OrderAcceptedBuilder, canceled::OrderCanceledBuilder,
-            denied::OrderDeniedBuilder, filled::OrderFilledBuilder,
-            initialized::OrderInitializedBuilder, submitted::OrderSubmittedBuilder,
-            triggered::OrderTriggeredBuilder, updated::OrderUpdatedBuilder,
+        enums::{LiquiditySide, OrderSide, OrderStatus, PositionSide, TriggerType},
+        events::order::spec::{
+            OrderAcceptedSpec, OrderCanceledSpec, OrderDeniedSpec, OrderFilledSpec,
+            OrderInitializedSpec, OrderPendingUpdateSpec, OrderRejectedSpec, OrderSubmittedSpec,
+            OrderTriggeredSpec, OrderUpdatedSpec,
         },
-        orders::MarketOrder,
+        identifiers::InstrumentId,
+        instruments::{CurrencyPair, Instrument, InstrumentAny, stubs::audusd_sim},
+        orders::{MarketOrder, builder::OrderTestBuilder, stubs::TestOrderStubs},
+        types::{Price, Quantity},
     };
 
     // TODO: WIP
@@ -978,12 +1167,12 @@ mod tests {
     #[case(OrderSide::Buy, dec!(10_000))]
     #[case(OrderSide::Sell, dec!(-10_000))]
     fn test_signed_decimal_qty(#[case] order_side: OrderSide, #[case] expected: Decimal) {
-        let order: MarketOrder = OrderInitializedBuilder::default()
+        let order: MarketOrder = OrderInitializedSpec::builder()
             .order_side(order_side)
             .quantity(Quantity::from(10_000))
             .build()
-            .unwrap()
-            .into();
+            .try_into()
+            .unwrap();
 
         let result = order.signed_decimal_qty();
         assert_eq!(result, expected);
@@ -1006,12 +1195,12 @@ mod tests {
         #[case] position_qty: Quantity,
         #[case] expected: bool,
     ) {
-        let order: MarketOrder = OrderInitializedBuilder::default()
+        let order: MarketOrder = OrderInitializedSpec::builder()
             .order_side(order_side)
             .quantity(order_qty)
             .build()
-            .unwrap()
-            .into();
+            .try_into()
+            .unwrap();
 
         assert_eq!(
             order.would_reduce_only(position_side, position_qty),
@@ -1021,8 +1210,8 @@ mod tests {
 
     #[rstest]
     fn test_order_state_transition_denied() {
-        let mut order: MarketOrder = OrderInitializedBuilder::default().build().unwrap().into();
-        let denied = OrderDeniedBuilder::default().build().unwrap();
+        let mut order: MarketOrder = OrderInitializedSpec::builder().build().try_into().unwrap();
+        let denied = OrderDeniedSpec::builder().build();
         let event = OrderEventAny::Denied(denied);
 
         order.apply(event.clone()).unwrap();
@@ -1036,12 +1225,12 @@ mod tests {
 
     #[rstest]
     fn test_order_life_cycle_to_filled() {
-        let init = OrderInitializedBuilder::default().build().unwrap();
-        let submitted = OrderSubmittedBuilder::default().build().unwrap();
-        let accepted = OrderAcceptedBuilder::default().build().unwrap();
-        let filled = OrderFilledBuilder::default().build().unwrap();
+        let init = OrderInitializedSpec::builder().build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let filled = OrderFilledSpec::builder().build();
 
-        let mut order: MarketOrder = init.clone().into();
+        let mut order: MarketOrder = init.clone().try_into().unwrap();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
         order.apply(OrderEventAny::Accepted(accepted)).unwrap();
         order.apply(OrderEventAny::Filled(filled)).unwrap();
@@ -1058,10 +1247,76 @@ mod tests {
     }
 
     #[rstest]
+    fn test_order_life_cycle_fills_with_negative_prices() {
+        // Options and spreads can legitimately trade at negative prices. The
+        // weighted average-price update must not panic when `last_px` or the
+        // prior `avg_px` is below zero.
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from(100_000))
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let fill1 = OrderFilledSpec::builder()
+            .last_qty(Quantity::from(50_000))
+            .last_px(Price::from("-5.00000"))
+            .trade_id(TradeId::from("TRADE-1"))
+            .build();
+        let fill2 = OrderFilledSpec::builder()
+            .last_qty(Quantity::from(50_000))
+            .last_px(Price::from("-7.00000"))
+            .trade_id(TradeId::from("TRADE-2"))
+            .build();
+
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Filled(fill1)).unwrap();
+        order.apply(OrderEventAny::Filled(fill2)).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert_eq!(order.filled_qty(), Quantity::from(100_000));
+        assert_eq!(order.leaves_qty(), Quantity::from(0));
+        // Weighted avg: (50_000 * -5.0 + 50_000 * -7.0) / 100_000 = -6.0
+        assert_eq!(order.avg_px(), Some(-6.0));
+    }
+
+    #[rstest]
+    fn test_order_life_cycle_accumulates_fill_commissions() {
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from(100_000))
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let fill1 = OrderFilledSpec::builder()
+            .last_qty(Quantity::from(50_000))
+            .trade_id(TradeId::from("TRADE-1"))
+            .commission(Money::from("1.25 USD"))
+            .build();
+        let fill2 = OrderFilledSpec::builder()
+            .last_qty(Quantity::from(50_000))
+            .trade_id(TradeId::from("TRADE-2"))
+            .commission(Money::from("1.35 USD"))
+            .build();
+
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Filled(fill1)).unwrap();
+        order.apply(OrderEventAny::Filled(fill2)).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert_eq!(
+            order.commission(&Currency::USD()),
+            Some(Money::from("2.60 USD"))
+        );
+        assert_eq!(order.commissions_vec(), vec![Money::from("2.60 USD")]);
+    }
+
+    #[rstest]
     fn test_order_state_transition_to_canceled() {
-        let mut order: MarketOrder = OrderInitializedBuilder::default().build().unwrap().into();
-        let submitted = OrderSubmittedBuilder::default().build().unwrap();
-        let canceled = OrderCanceledBuilder::default().build().unwrap();
+        let mut order: MarketOrder = OrderInitializedSpec::builder().build().try_into().unwrap();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let canceled = OrderCanceledSpec::builder().build();
 
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
         order.apply(OrderEventAny::Canceled(canceled)).unwrap();
@@ -1073,15 +1328,14 @@ mod tests {
 
     #[rstest]
     fn test_order_life_cycle_to_partially_filled() {
-        let init = OrderInitializedBuilder::default().build().unwrap();
-        let submitted = OrderSubmittedBuilder::default().build().unwrap();
-        let accepted = OrderAcceptedBuilder::default().build().unwrap();
-        let filled = OrderFilledBuilder::default()
+        let init = OrderInitializedSpec::builder().build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let filled = OrderFilledSpec::builder()
             .last_qty(Quantity::from(50_000))
-            .build()
-            .unwrap();
+            .build();
 
-        let mut order: MarketOrder = init.clone().into();
+        let mut order: MarketOrder = init.clone().try_into().unwrap();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
         order.apply(OrderEventAny::Accepted(accepted)).unwrap();
         order.apply(OrderEventAny::Filled(filled)).unwrap();
@@ -1096,7 +1350,7 @@ mod tests {
 
     #[rstest]
     fn test_order_commission_calculation() {
-        let mut order: MarketOrder = OrderInitializedBuilder::default().build().unwrap().into();
+        let mut order: MarketOrder = OrderInitializedSpec::builder().build().try_into().unwrap();
         order
             .commissions
             .insert(Currency::USD(), Money::new(10.0, Currency::USD()));
@@ -1113,13 +1367,13 @@ mod tests {
 
     #[rstest]
     fn test_order_is_primary() {
-        let order: MarketOrder = OrderInitializedBuilder::default()
-            .exec_algorithm_id(Some(ExecAlgorithmId::from("ALGO-001")))
-            .exec_spawn_id(Some(ClientOrderId::from("O-001")))
+        let order: MarketOrder = OrderInitializedSpec::builder()
+            .exec_algorithm_id(ExecAlgorithmId::from("ALGO-001"))
+            .exec_spawn_id(ClientOrderId::from("O-001"))
             .client_order_id(ClientOrderId::from("O-001"))
             .build()
-            .unwrap()
-            .into();
+            .try_into()
+            .unwrap();
 
         assert!(order.is_primary());
         assert!(!order.is_spawned());
@@ -1127,13 +1381,13 @@ mod tests {
 
     #[rstest]
     fn test_order_is_spawned() {
-        let order: MarketOrder = OrderInitializedBuilder::default()
-            .exec_algorithm_id(Some(ExecAlgorithmId::from("ALGO-001")))
-            .exec_spawn_id(Some(ClientOrderId::from("O-002")))
+        let order: MarketOrder = OrderInitializedSpec::builder()
+            .exec_algorithm_id(ExecAlgorithmId::from("ALGO-001"))
+            .exec_spawn_id(ClientOrderId::from("O-002"))
             .client_order_id(ClientOrderId::from("O-001"))
             .build()
-            .unwrap()
-            .into();
+            .try_into()
+            .unwrap();
 
         assert!(!order.is_primary());
         assert!(order.is_spawned());
@@ -1141,11 +1395,11 @@ mod tests {
 
     #[rstest]
     fn test_order_is_contingency() {
-        let order: MarketOrder = OrderInitializedBuilder::default()
-            .contingency_type(Some(ContingencyType::Oto))
+        let order: MarketOrder = OrderInitializedSpec::builder()
+            .contingency_type(ContingencyType::Oto)
             .build()
-            .unwrap()
-            .into();
+            .try_into()
+            .unwrap();
 
         assert!(order.is_contingency());
         assert!(order.is_parent_order());
@@ -1154,11 +1408,11 @@ mod tests {
 
     #[rstest]
     fn test_order_is_child_order() {
-        let order: MarketOrder = OrderInitializedBuilder::default()
-            .parent_order_id(Some(ClientOrderId::from("PARENT-001")))
+        let order: MarketOrder = OrderInitializedSpec::builder()
+            .parent_order_id(ClientOrderId::from("PARENT-001"))
             .build()
-            .unwrap()
-            .into();
+            .try_into()
+            .unwrap();
 
         assert!(order.is_child_order());
         assert!(!order.is_parent_order());
@@ -1169,20 +1423,17 @@ mod tests {
         use crate::orders::limit::LimitOrder;
 
         // Create order with distinct timestamps to verify parameter ordering
-        let init = OrderInitializedBuilder::default()
-            .price(Some(Price::from("100.00")))
-            .build()
-            .unwrap();
-        let submitted = OrderSubmittedBuilder::default()
+        let init = OrderInitializedSpec::builder()
+            .price(Price::from("100.00"))
+            .build();
+        let submitted = OrderSubmittedSpec::builder()
             .ts_event(UnixNanos::from(1_000_000))
-            .build()
-            .unwrap();
-        let accepted = OrderAcceptedBuilder::default()
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
             .ts_event(UnixNanos::from(2_000_000))
-            .build()
-            .unwrap();
+            .build();
 
-        let mut order: LimitOrder = init.into();
+        let mut order: LimitOrder = init.try_into().unwrap();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
         order.apply(OrderEventAny::Accepted(accepted)).unwrap();
 
@@ -1197,13 +1448,12 @@ mod tests {
     #[rstest]
     fn test_order_accepted_without_submitted_sets_account_id() {
         // Test external order flow: Initialized -> Accepted (no Submitted)
-        let init = OrderInitializedBuilder::default().build().unwrap();
-        let accepted = OrderAcceptedBuilder::default()
+        let init = OrderInitializedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder()
             .account_id(AccountId::from("EXTERNAL-001"))
-            .build()
-            .unwrap();
+            .build();
 
-        let mut order: MarketOrder = init.into();
+        let mut order: MarketOrder = init.try_into().unwrap();
 
         // Verify account_id is initially None
         assert_eq!(order.account_id(), None);
@@ -1219,17 +1469,15 @@ mod tests {
     #[rstest]
     fn test_order_accepted_after_submitted_preserves_account_id() {
         // Test normal order flow: Initialized -> Submitted -> Accepted
-        let init = OrderInitializedBuilder::default().build().unwrap();
-        let submitted = OrderSubmittedBuilder::default()
+        let init = OrderInitializedSpec::builder().build();
+        let submitted = OrderSubmittedSpec::builder()
             .account_id(AccountId::from("SUBMITTED-001"))
-            .build()
-            .unwrap();
-        let accepted = OrderAcceptedBuilder::default()
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
             .account_id(AccountId::from("ACCEPTED-001"))
-            .build()
-            .unwrap();
+            .build();
 
-        let mut order: MarketOrder = init.into();
+        let mut order: MarketOrder = init.try_into().unwrap();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
 
         // After submitted, account_id should be set
@@ -1246,18 +1494,16 @@ mod tests {
     #[rstest]
     fn test_overfill_tracks_overfill_qty() {
         // Test that overfill is tracked on the order
-        let init = OrderInitializedBuilder::default()
+        let init = OrderInitializedSpec::builder()
             .quantity(Quantity::from(100_000))
-            .build()
-            .unwrap();
-        let submitted = OrderSubmittedBuilder::default().build().unwrap();
-        let accepted = OrderAcceptedBuilder::default().build().unwrap();
-        let overfill = OrderFilledBuilder::default()
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let overfill = OrderFilledSpec::builder()
             .last_qty(Quantity::from(110_000)) // Overfill: 110k > 100k
-            .build()
-            .unwrap();
+            .build();
 
-        let mut order: MarketOrder = init.into();
+        let mut order: MarketOrder = init.try_into().unwrap();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
         order.apply(OrderEventAny::Accepted(accepted)).unwrap();
         order.apply(OrderEventAny::Filled(overfill)).unwrap();
@@ -1272,24 +1518,21 @@ mod tests {
     #[rstest]
     fn test_partial_fill_then_overfill() {
         // Test multiple fills resulting in overfill
-        let init = OrderInitializedBuilder::default()
+        let init = OrderInitializedSpec::builder()
             .quantity(Quantity::from(100_000))
-            .build()
-            .unwrap();
-        let submitted = OrderSubmittedBuilder::default().build().unwrap();
-        let accepted = OrderAcceptedBuilder::default().build().unwrap();
-        let fill1 = OrderFilledBuilder::default()
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let fill1 = OrderFilledSpec::builder()
             .last_qty(Quantity::from(80_000))
             .trade_id(TradeId::from("TRADE-1"))
-            .build()
-            .unwrap();
-        let fill2 = OrderFilledBuilder::default()
+            .build();
+        let fill2 = OrderFilledSpec::builder()
             .last_qty(Quantity::from(30_000)) // Total 110k > 100k
             .trade_id(TradeId::from("TRADE-2"))
-            .build()
-            .unwrap();
+            .build();
 
-        let mut order: MarketOrder = init.into();
+        let mut order: MarketOrder = init.try_into().unwrap();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
         order.apply(OrderEventAny::Accepted(accepted)).unwrap();
         order.apply(OrderEventAny::Filled(fill1)).unwrap();
@@ -1311,18 +1554,16 @@ mod tests {
     #[rstest]
     fn test_exact_fill_no_overfill() {
         // Test that exact fill doesn't trigger overfill tracking
-        let init = OrderInitializedBuilder::default()
+        let init = OrderInitializedSpec::builder()
             .quantity(Quantity::from(100_000))
-            .build()
-            .unwrap();
-        let submitted = OrderSubmittedBuilder::default().build().unwrap();
-        let accepted = OrderAcceptedBuilder::default().build().unwrap();
-        let filled = OrderFilledBuilder::default()
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let filled = OrderFilledSpec::builder()
             .last_qty(Quantity::from(100_000)) // Exact fill
-            .build()
-            .unwrap();
+            .build();
 
-        let mut order: MarketOrder = init.into();
+        let mut order: MarketOrder = init.try_into().unwrap();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
         order.apply(OrderEventAny::Accepted(accepted)).unwrap();
         order.apply(OrderEventAny::Filled(filled)).unwrap();
@@ -1338,24 +1579,21 @@ mod tests {
         // Simulates real exchange scenario with fractional fills:
         // Order for 2450.5 units, partially filled 1202.5, then fill of 1285.5 arrives
         // Total filled: 2488.0, overfill: 37.5
-        let init = OrderInitializedBuilder::default()
+        let init = OrderInitializedSpec::builder()
             .quantity(Quantity::from("2450.5"))
-            .build()
-            .unwrap();
-        let submitted = OrderSubmittedBuilder::default().build().unwrap();
-        let accepted = OrderAcceptedBuilder::default().build().unwrap();
-        let fill1 = OrderFilledBuilder::default()
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let fill1 = OrderFilledSpec::builder()
             .last_qty(Quantity::from("1202.5"))
             .trade_id(TradeId::from("TRADE-1"))
-            .build()
-            .unwrap();
-        let fill2 = OrderFilledBuilder::default()
+            .build();
+        let fill2 = OrderFilledSpec::builder()
             .last_qty(Quantity::from("1285.5")) // 1202.5 + 1285.5 = 2488 > 2450.5
             .trade_id(TradeId::from("TRADE-2"))
-            .build()
-            .unwrap();
+            .build();
 
-        let mut order: MarketOrder = init.into();
+        let mut order: MarketOrder = init.try_into().unwrap();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
         order.apply(OrderEventAny::Accepted(accepted)).unwrap();
         order.apply(OrderEventAny::Filled(fill1)).unwrap();
@@ -1377,11 +1615,11 @@ mod tests {
 
     #[rstest]
     fn test_calculate_overfill_returns_zero_when_no_overfill() {
-        let order: MarketOrder = OrderInitializedBuilder::default()
+        let order: MarketOrder = OrderInitializedSpec::builder()
             .quantity(Quantity::from(100_000))
             .build()
-            .unwrap()
-            .into();
+            .try_into()
+            .unwrap();
 
         // Fill qty less than order qty - no overfill
         let overfill = order.calculate_overfill(Quantity::from(50_000));
@@ -1394,11 +1632,11 @@ mod tests {
 
     #[rstest]
     fn test_calculate_overfill_returns_overfill_amount() {
-        let order: MarketOrder = OrderInitializedBuilder::default()
+        let order: MarketOrder = OrderInitializedSpec::builder()
             .quantity(Quantity::from(100_000))
             .build()
-            .unwrap()
-            .into();
+            .try_into()
+            .unwrap();
 
         // Fill qty exceeds order qty
         let overfill = order.calculate_overfill(Quantity::from(110_000));
@@ -1407,18 +1645,16 @@ mod tests {
 
     #[rstest]
     fn test_calculate_overfill_accounts_for_existing_fills() {
-        let init = OrderInitializedBuilder::default()
+        let init = OrderInitializedSpec::builder()
             .quantity(Quantity::from(100_000))
-            .build()
-            .unwrap();
-        let submitted = OrderSubmittedBuilder::default().build().unwrap();
-        let accepted = OrderAcceptedBuilder::default().build().unwrap();
-        let partial_fill = OrderFilledBuilder::default()
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let partial_fill = OrderFilledSpec::builder()
             .last_qty(Quantity::from(60_000))
-            .build()
-            .unwrap();
+            .build();
 
-        let mut order: MarketOrder = init.into();
+        let mut order: MarketOrder = init.try_into().unwrap();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
         order.apply(OrderEventAny::Accepted(accepted)).unwrap();
         order.apply(OrderEventAny::Filled(partial_fill)).unwrap();
@@ -1435,11 +1671,11 @@ mod tests {
 
     #[rstest]
     fn test_calculate_overfill_with_fractional_quantities() {
-        let order: MarketOrder = OrderInitializedBuilder::default()
+        let order: MarketOrder = OrderInitializedSpec::builder()
             .quantity(Quantity::from("2450.5"))
             .build()
-            .unwrap()
-            .into();
+            .try_into()
+            .unwrap();
 
         // Simulates the exact scenario from user's log
         // Order for 2450.5, if fill of 2488.0 arrives
@@ -1448,25 +1684,43 @@ mod tests {
     }
 
     #[rstest]
+    fn test_calculate_overfill_zero_after_fractional_partial_fill() {
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from("1.000"))
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let partial_fill = OrderFilledSpec::builder()
+            .last_qty(Quantity::from("0.072"))
+            .build();
+
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Filled(partial_fill)).unwrap();
+
+        // After filling 0.072 of 1.000, another 0.072 fill should not overfill
+        let overfill = order.calculate_overfill(Quantity::from("0.072"));
+        assert_eq!(overfill, Quantity::from("0.000"));
+    }
+
+    #[rstest]
     fn test_duplicate_fill_rejected() {
-        let init = OrderInitializedBuilder::default()
+        let init = OrderInitializedSpec::builder()
             .quantity(Quantity::from(100_000))
-            .build()
-            .unwrap();
-        let submitted = OrderSubmittedBuilder::default().build().unwrap();
-        let accepted = OrderAcceptedBuilder::default().build().unwrap();
-        let fill1 = OrderFilledBuilder::default()
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let fill1 = OrderFilledSpec::builder()
             .last_qty(Quantity::from(50_000))
             .trade_id(TradeId::from("TRADE-001"))
-            .build()
-            .unwrap();
-        let fill2_duplicate = OrderFilledBuilder::default()
+            .build();
+        let fill2_duplicate = OrderFilledSpec::builder()
             .last_qty(Quantity::from(50_000))
             .trade_id(TradeId::from("TRADE-001")) // Same trade_id as fill1
-            .build()
-            .unwrap();
+            .build();
 
-        let mut order: MarketOrder = init.into();
+        let mut order: MarketOrder = init.try_into().unwrap();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
         order.apply(OrderEventAny::Accepted(accepted)).unwrap();
         order.apply(OrderEventAny::Filled(fill1)).unwrap();
@@ -1491,25 +1745,53 @@ mod tests {
     }
 
     #[rstest]
+    fn test_check_display_qty_returns_typed_invariant_with_stable_display() {
+        let error = check_display_qty(Some(Quantity::from(2)), Quantity::from(1)).unwrap_err();
+
+        match error {
+            OrderError::Invariant(CorrectnessError::PredicateViolation { ref message }) => {
+                assert_eq!(message, "`display_qty` may not exceed `quantity`");
+            }
+            other => panic!("Expected typed invariant error, was: {other:?}"),
+        }
+
+        assert_eq!(error.to_string(), "`display_qty` may not exceed `quantity`");
+    }
+
+    #[rstest]
+    fn test_check_time_in_force_returns_typed_invariant_with_stable_display() {
+        let error = check_time_in_force(TimeInForce::Gtd, None).unwrap_err();
+
+        match error {
+            OrderError::Invariant(CorrectnessError::PredicateViolation { ref message }) => {
+                assert_eq!(message, "`expire_time` is required for `GTD` order");
+            }
+            other => panic!("Expected typed invariant error, was: {other:?}"),
+        }
+
+        assert_eq!(
+            error.to_string(),
+            "`expire_time` is required for `GTD` order"
+        );
+    }
+
+    #[rstest]
     fn test_different_trade_ids_allowed() {
-        let init = OrderInitializedBuilder::default()
+        let init = OrderInitializedSpec::builder()
             .quantity(Quantity::from(100_000))
-            .build()
-            .unwrap();
-        let submitted = OrderSubmittedBuilder::default().build().unwrap();
-        let accepted = OrderAcceptedBuilder::default().build().unwrap();
-        let fill1 = OrderFilledBuilder::default()
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let fill1 = OrderFilledSpec::builder()
             .last_qty(Quantity::from(50_000))
             .trade_id(TradeId::from("TRADE-001"))
-            .build()
-            .unwrap();
-        let fill2 = OrderFilledBuilder::default()
+            .build();
+        let fill2 = OrderFilledSpec::builder()
             .last_qty(Quantity::from(50_000))
             .trade_id(TradeId::from("TRADE-002")) // Different trade_id
-            .build()
-            .unwrap();
+            .build();
 
-        let mut order: MarketOrder = init.into();
+        let mut order: MarketOrder = init.try_into().unwrap();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
         order.apply(OrderEventAny::Accepted(accepted)).unwrap();
         order.apply(OrderEventAny::Filled(fill1)).unwrap();
@@ -1522,25 +1804,51 @@ mod tests {
     }
 
     #[rstest]
+    fn test_pending_update_order_restores_status_on_updated() {
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from(100_000))
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let pending_update = OrderPendingUpdateSpec::builder().build();
+        let updated = OrderUpdatedSpec::builder()
+            .quantity(Quantity::from(50_000))
+            .build();
+
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Accepted);
+
+        order
+            .apply(OrderEventAny::PendingUpdate(pending_update))
+            .unwrap();
+        assert_eq!(order.status(), OrderStatus::PendingUpdate);
+
+        order.apply(OrderEventAny::Updated(updated)).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Accepted);
+        assert_eq!(order.quantity(), Quantity::from(50_000));
+    }
+
+    #[rstest]
     fn test_partially_filled_order_can_be_updated() {
         // Test that a partially filled order can receive an Updated event
         // and remain in PartiallyFilled status
-        let init = OrderInitializedBuilder::default()
+        let init = OrderInitializedSpec::builder()
             .quantity(Quantity::from(100_000))
-            .build()
-            .unwrap();
-        let submitted = OrderSubmittedBuilder::default().build().unwrap();
-        let accepted = OrderAcceptedBuilder::default().build().unwrap();
-        let partial_fill = OrderFilledBuilder::default()
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let partial_fill = OrderFilledSpec::builder()
             .last_qty(Quantity::from(40_000))
-            .build()
-            .unwrap();
-        let updated = OrderUpdatedBuilder::default()
+            .build();
+        let updated = OrderUpdatedSpec::builder()
             .quantity(Quantity::from(80_000)) // Reduce to 80k (still > 40k filled)
-            .build()
-            .unwrap();
+            .build();
 
-        let mut order: MarketOrder = init.into();
+        let mut order: MarketOrder = init.try_into().unwrap();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
         order.apply(OrderEventAny::Accepted(accepted)).unwrap();
         order.apply(OrderEventAny::Filled(partial_fill)).unwrap();
@@ -1559,19 +1867,21 @@ mod tests {
     fn test_triggered_order_can_be_updated() {
         // Test that a triggered order can receive an Updated event
         // and remain in Triggered status
-        let init = OrderInitializedBuilder::default()
-            .quantity(Quantity::from(100_000))
-            .build()
-            .unwrap();
-        let submitted = OrderSubmittedBuilder::default().build().unwrap();
-        let accepted = OrderAcceptedBuilder::default().build().unwrap();
-        let triggered = OrderTriggeredBuilder::default().build().unwrap();
-        let updated = OrderUpdatedBuilder::default()
+        let instrument_id = InstrumentId::from("ETHUSDT-LINEAR.BYBIT");
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let triggered = OrderTriggeredSpec::builder().build();
+        let updated = OrderUpdatedSpec::builder()
             .quantity(Quantity::from(80_000))
-            .build()
-            .unwrap();
+            .build();
 
-        let mut order: MarketOrder = init.into();
+        let mut order = OrderTestBuilder::new(OrderType::StopLimit)
+            .instrument_id(instrument_id)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("0.99500"))
+            .trigger_price(Price::from("1.00000"))
+            .trigger_type(TriggerType::LastPrice)
+            .build();
         order.apply(OrderEventAny::Submitted(submitted)).unwrap();
         order.apply(OrderEventAny::Accepted(accepted)).unwrap();
         order.apply(OrderEventAny::Triggered(triggered)).unwrap();
@@ -1582,5 +1892,375 @@ mod tests {
 
         assert_eq!(order.status(), OrderStatus::Triggered);
         assert_eq!(order.quantity(), Quantity::from(80_000));
+    }
+
+    #[rstest]
+    fn test_order_updated_with_is_quote_quantity_clears_flag() {
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::new(10.0, 6))
+            .quote_quantity(true)
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let updated = OrderUpdatedSpec::builder()
+            .quantity(Quantity::new(47.393_365, 6))
+            .is_quote_quantity(false)
+            .build();
+
+        let mut order: MarketOrder = init.try_into().unwrap();
+        assert!(order.is_quote_quantity());
+
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Updated(updated)).unwrap();
+
+        assert!(!order.is_quote_quantity());
+        assert_eq!(order.quantity(), Quantity::new(47.393_365, 6));
+        assert_eq!(order.leaves_qty(), Quantity::new(47.393_365, 6));
+    }
+
+    #[rstest]
+    fn test_order_updated_default_is_quote_quantity_clears_flag() {
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::new(10.0, 6))
+            .quote_quantity(true)
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        // Builder defaults is_quote_quantity to false
+        let updated = OrderUpdatedSpec::builder()
+            .quantity(Quantity::new(8.0, 6))
+            .build();
+
+        let mut order: MarketOrder = init.try_into().unwrap();
+        assert!(order.is_quote_quantity());
+
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Updated(updated)).unwrap();
+
+        assert!(!order.is_quote_quantity());
+        assert_eq!(order.quantity(), Quantity::new(8.0, 6));
+    }
+
+    #[rstest]
+    fn test_canceled_then_partial_fill_then_canceled() {
+        let mut order: MarketOrder = OrderInitializedSpec::builder().build().try_into().unwrap();
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let canceled1 = OrderCanceledSpec::builder().build();
+        let fill = OrderFilledSpec::builder()
+            .last_qty(Quantity::from(50_000))
+            .trade_id(TradeId::from("FILL-1"))
+            .build();
+        let canceled2 = OrderCanceledSpec::builder().build();
+
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Canceled(canceled1)).unwrap();
+        assert_eq!(order.status(), OrderStatus::Canceled);
+        assert!(order.is_closed());
+
+        // Fill arrives after cancel (real-world race condition)
+        order.apply(OrderEventAny::Filled(fill)).unwrap();
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(order.filled_qty(), Quantity::from(50_000));
+        assert!(order.is_open());
+
+        // Re-emitted cancel restores terminal state
+        order.apply(OrderEventAny::Canceled(canceled2)).unwrap();
+        assert_eq!(order.status(), OrderStatus::Canceled);
+        assert!(order.is_closed());
+    }
+
+    #[rstest]
+    fn test_apply_triggered_to_stop_market_order_returns_error() {
+        let instrument_id = InstrumentId::from("ETHUSDT-LINEAR.BYBIT");
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let triggered = OrderTriggeredSpec::builder().build();
+
+        let mut order = OrderTestBuilder::new(OrderType::StopMarket)
+            .instrument_id(instrument_id)
+            .quantity(Quantity::from(1))
+            .trigger_price(Price::from("1.00000"))
+            .trigger_type(TriggerType::LastPrice)
+            .build();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+
+        let result = order.apply(OrderEventAny::Triggered(triggered));
+        assert!(result.is_err());
+        assert_eq!(order.status(), OrderStatus::Accepted);
+    }
+
+    #[rstest]
+    fn test_apply_triggered_to_stop_limit_order_succeeds() {
+        let instrument_id = InstrumentId::from("ETHUSDT-LINEAR.BYBIT");
+        let submitted = OrderSubmittedSpec::builder().build();
+        let accepted = OrderAcceptedSpec::builder().build();
+        let triggered = OrderTriggeredSpec::builder().build();
+
+        let mut order = OrderTestBuilder::new(OrderType::StopLimit)
+            .instrument_id(instrument_id)
+            .quantity(Quantity::from(1))
+            .price(Price::from("0.99500"))
+            .trigger_price(Price::from("1.00000"))
+            .trigger_type(TriggerType::LastPrice)
+            .build();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Triggered(triggered)).unwrap();
+
+        assert_eq!(order.status(), OrderStatus::Triggered);
+    }
+
+    #[rstest]
+    fn test_to_order_status_report_for_accepted_limit_order() {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("1.00000"))
+            .build();
+        let accepted = TestOrderStubs::make_accepted_order(&order);
+
+        let report = accepted.to_order_status_report(None).unwrap();
+
+        assert_eq!(report.account_id, AccountId::from("SIM-001"));
+        assert_eq!(report.instrument_id, InstrumentId::from("AUDUSD.SIM"));
+        assert_eq!(report.client_order_id, Some(accepted.client_order_id()));
+        assert_eq!(report.venue_order_id, VenueOrderId::from("V-001"));
+        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_type, OrderType::Limit);
+        assert_eq!(report.time_in_force, accepted.time_in_force());
+        assert_eq!(report.order_status, OrderStatus::Accepted);
+        assert_eq!(report.quantity, Quantity::from(100_000));
+        assert_eq!(report.filled_qty, Quantity::from(0));
+        assert_eq!(report.price, Some(Price::from("1.00000")));
+        assert_eq!(report.avg_px, None);
+        assert_eq!(report.ts_accepted, accepted.ts_accepted().unwrap());
+        assert_eq!(report.ts_last, accepted.ts_last());
+        assert_eq!(report.ts_init, accepted.ts_init());
+    }
+
+    #[rstest]
+    fn test_to_order_status_report_for_filled_market_order(audusd_sim: CurrencyPair) {
+        let audusd_sim = InstrumentAny::CurrencyPair(audusd_sim);
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(audusd_sim.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .build();
+        let filled = TestOrderStubs::make_filled_order(&order, &audusd_sim, LiquiditySide::Maker);
+        let report_id = UUID4::new();
+
+        let report = filled.to_order_status_report(Some(report_id)).unwrap();
+
+        assert_eq!(report.report_id, report_id);
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.quantity, Quantity::from(100_000));
+        assert_eq!(report.filled_qty, Quantity::from(100_000));
+        assert_eq!(report.price, None);
+        assert_eq!(report.avg_px, Some(dec!(1)));
+        assert_eq!(report.venue_position_id, Some(PositionId::from("1")));
+        assert_eq!(report.ts_accepted, filled.ts_accepted().unwrap());
+        assert_eq!(report.ts_last, filled.ts_last());
+    }
+
+    #[rstest]
+    fn test_to_order_status_report_maps_optional_fields() {
+        let order = OrderTestBuilder::new(OrderType::StopLimit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("0.99500"))
+            .trigger_price(Price::from("1.00000"))
+            .trigger_type(TriggerType::LastPrice)
+            .time_in_force(TimeInForce::Gtd)
+            .expire_time(UnixNanos::from(5_000_000_000))
+            .display_qty(Quantity::from(10_000))
+            .post_only(true)
+            .reduce_only(true)
+            .contingency_type(ContingencyType::Oto)
+            .order_list_id(OrderListId::from("OL-001"))
+            .linked_order_ids(vec![ClientOrderId::from("O-CHILD")])
+            .parent_order_id(ClientOrderId::from("O-PARENT"))
+            .build();
+        let accepted = TestOrderStubs::make_accepted_order(&order);
+
+        let report = accepted.to_order_status_report(None).unwrap();
+
+        assert_eq!(report.price, Some(Price::from("0.99500")));
+        assert_eq!(report.trigger_price, Some(Price::from("1.00000")));
+        assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
+        assert_eq!(report.expire_time, Some(UnixNanos::from(5_000_000_000)));
+        assert_eq!(report.display_qty, Some(Quantity::from(10_000)));
+        assert!(report.post_only);
+        assert!(report.reduce_only);
+        assert_eq!(report.contingency_type, ContingencyType::Oto);
+        assert_eq!(report.order_list_id, Some(OrderListId::from("OL-001")));
+        assert_eq!(
+            report.linked_order_ids,
+            Some(vec![ClientOrderId::from("O-CHILD")])
+        );
+        assert_eq!(
+            report.parent_order_id,
+            Some(ClientOrderId::from("O-PARENT"))
+        );
+    }
+
+    #[rstest]
+    fn test_to_order_status_report_maps_ts_triggered() {
+        let order = OrderTestBuilder::new(OrderType::StopLimit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("0.99500"))
+            .trigger_price(Price::from("1.00000"))
+            .trigger_type(TriggerType::LastPrice)
+            .build();
+        let mut order = TestOrderStubs::make_accepted_order(&order);
+        let triggered = OrderTriggeredSpec::builder()
+            .ts_event(UnixNanos::from(1_500_000_000))
+            .build();
+        order.apply(OrderEventAny::Triggered(triggered)).unwrap();
+
+        let report = order.to_order_status_report(None).unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Triggered);
+        assert_eq!(report.ts_triggered, Some(UnixNanos::from(1_500_000_000)));
+    }
+
+    #[rstest]
+    fn test_to_order_status_report_maps_rejection_reason() {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("1.00000"))
+            .build();
+        let mut order = TestOrderStubs::make_accepted_order(&order);
+        let rejected = OrderRejectedSpec::builder()
+            .reason(Ustr::from("INSUFFICIENT_MARGIN"))
+            .build();
+        order.apply(OrderEventAny::Rejected(rejected)).unwrap();
+
+        let report = order.to_order_status_report(None).unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Rejected);
+        assert_eq!(
+            report.cancel_reason,
+            Some("INSUFFICIENT_MARGIN".to_string())
+        );
+    }
+
+    #[rstest]
+    fn test_to_order_status_report_maps_distinct_timestamps() {
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("1.00000"))
+            .ts_init(UnixNanos::from(1_000))
+            .build();
+        let submitted = OrderSubmittedSpec::builder()
+            .ts_event(UnixNanos::from(2_000))
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
+            .ts_event(UnixNanos::from(3_000))
+            .build();
+        let filled = OrderFilledSpec::builder()
+            .last_qty(Quantity::from(50_000))
+            .ts_event(UnixNanos::from(4_000))
+            .build();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Filled(filled)).unwrap();
+
+        let report = order.to_order_status_report(None).unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::PartiallyFilled);
+        assert_eq!(report.filled_qty, Quantity::from(50_000));
+        assert_eq!(report.ts_accepted, UnixNanos::from(3_000));
+        assert_eq!(report.ts_last, UnixNanos::from(4_000));
+        assert_eq!(report.ts_init, UnixNanos::from(1_000));
+    }
+
+    #[rstest]
+    fn test_to_order_status_report_ts_accepted_falls_back_to_ts_last() {
+        // Venue ack can arrive through an update before any acceptance event
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("1.00000"))
+            .build();
+        let submitted = OrderSubmittedSpec::builder()
+            .ts_event(UnixNanos::from(2_000))
+            .build();
+        let updated = OrderUpdatedSpec::builder()
+            .venue_order_id(VenueOrderId::from("V-001"))
+            .ts_event(UnixNanos::from(3_000))
+            .build();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+        order.apply(OrderEventAny::Updated(updated)).unwrap();
+
+        let report = order.to_order_status_report(None).unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Submitted);
+        assert_eq!(report.venue_order_id, VenueOrderId::from("V-001"));
+        assert_eq!(report.ts_accepted, UnixNanos::from(3_000));
+        assert_eq!(report.ts_last, UnixNanos::from(3_000));
+    }
+
+    #[rstest]
+    fn test_to_order_status_report_maps_trailing_offsets() {
+        let order = OrderTestBuilder::new(OrderType::TrailingStopLimit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("0.99500"))
+            .trigger_price(Price::from("1.00000"))
+            .trigger_type(TriggerType::LastPrice)
+            .limit_offset(dec!(0.0001))
+            .trailing_offset(dec!(0.0002))
+            .trailing_offset_type(TrailingOffsetType::Price)
+            .build();
+        let accepted = TestOrderStubs::make_accepted_order(&order);
+
+        let report = accepted.to_order_status_report(None).unwrap();
+
+        assert_eq!(report.limit_offset, Some(dec!(0.0001)));
+        assert_eq!(report.trailing_offset, Some(dec!(0.0002)));
+        assert_eq!(report.trailing_offset_type, TrailingOffsetType::Price);
+    }
+
+    #[rstest]
+    fn test_to_order_status_report_returns_none_before_venue_ack() {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("1.00000"))
+            .build();
+
+        assert!(order.to_order_status_report(None).is_none());
+    }
+
+    #[rstest]
+    fn test_to_order_status_report_returns_none_for_submitted_order() {
+        // Inflight orders have an account_id but no venue_order_id yet
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("AUDUSD.SIM"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .price(Price::from("1.00000"))
+            .build();
+        let submitted = OrderSubmittedSpec::builder().build();
+        order.apply(OrderEventAny::Submitted(submitted)).unwrap();
+
+        assert!(order.account_id().is_some());
+        assert!(order.to_order_status_report(None).is_none());
     }
 }

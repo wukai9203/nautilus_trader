@@ -18,8 +18,8 @@
 use std::borrow::Cow;
 
 use nautilus_model::enums::{
-    ContingencyType, LiquiditySide, OrderSide, OrderSideSpecified, OrderStatus, OrderType,
-    PositionSide, TimeInForce,
+    ContingencyType, LiquiditySide, MarketStatusAction, OrderSide, OrderSideSpecified, OrderStatus,
+    OrderType, PositionSide, TimeInForce,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
@@ -41,7 +41,17 @@ use strum::{AsRefStr, Display, EnumIter, EnumString};
 #[serde(rename_all = "PascalCase")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bitmex", eq, eq_int)
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.bitmex",
+        eq,
+        eq_int,
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.bitmex")
 )]
 pub enum BitmexSymbolStatus {
     /// Symbol is open for trading.
@@ -109,7 +119,16 @@ impl From<BitmexSide> for OrderSide {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bitmex", eq, eq_int)
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.bitmex",
+        eq,
+        eq_int,
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.bitmex")
 )]
 pub enum BitmexPositionSide {
     /// Long position.
@@ -254,6 +273,16 @@ pub enum BitmexOrderStatus {
     Expired,
 }
 
+impl BitmexOrderStatus {
+    /// Returns whether this status represents a terminal order state.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Filled | Self::Canceled | Self::Rejected | Self::Expired
+        )
+    }
+}
+
 impl From<BitmexOrderStatus> for OrderStatus {
     fn from(value: BitmexOrderStatus) -> Self {
         match value {
@@ -337,6 +366,12 @@ impl BitmexTimeInForce {
     ///
     /// Returns an error if the time in force is not supported by BitMEX.
     pub fn try_from_time_in_force(value: TimeInForce) -> anyhow::Result<Self> {
+        if value == TimeInForce::Gtd {
+            anyhow::bail!(
+                "GTD time in force is not supported for BitMEX order submit; use GTC, Day, IOC, or FOK"
+            );
+        }
+
         Self::try_from(value)
     }
 }
@@ -596,6 +631,10 @@ pub enum BitmexInstrumentType {
     #[serde(rename = "FMXXS")]
     FuturesSpreads,
 
+    /// Active crypto futures spreads.
+    #[serde(rename = "FFMCSX")]
+    FuturesSpread,
+
     /// Prediction Markets (non-standardized financial future on index, cash settled).
     /// CFI code FFICSX - traders predict outcomes of events.
     #[serde(rename = "FFICSX")]
@@ -665,6 +704,10 @@ pub enum BitmexInstrumentType {
     /// BitMEX Yield/Dividend Index.
     #[serde(rename = "MRVDXX")]
     YieldIndex,
+
+    /// Unknown instrument type.
+    #[serde(other)]
+    Other,
 }
 
 /// Represents the different types of instrument subscriptions available on BitMEX.
@@ -787,6 +830,18 @@ pub enum BitmexInstrumentState {
     Delisted,
 }
 
+impl From<&BitmexInstrumentState> for MarketStatusAction {
+    fn from(state: &BitmexInstrumentState) -> Self {
+        match state {
+            BitmexInstrumentState::Open => Self::Trading,
+            BitmexInstrumentState::Closed => Self::Close,
+            BitmexInstrumentState::Settled => Self::Close,
+            BitmexInstrumentState::Unlisted => Self::NotAvailableForTrading,
+            BitmexInstrumentState::Delisted => Self::NotAvailableForTrading,
+        }
+    }
+}
+
 /// Represents the fair price calculation method.
 #[derive(
     Clone, Debug, Display, PartialEq, Eq, AsRefStr, EnumIter, EnumString, Serialize, Deserialize,
@@ -815,6 +870,46 @@ pub enum BitmexMarkMethod {
     LastPricePreLaunch,
     /// Composite index.
     CompositeIndex,
+}
+
+/// BitMEX API environment.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.bitmex",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.bitmex")
+)]
+pub enum BitmexEnvironment {
+    /// Live trading environment.
+    #[default]
+    Mainnet,
+    /// Testnet environment.
+    Testnet,
 }
 
 #[cfg(test)]
@@ -938,6 +1033,10 @@ mod tests {
             r#""FMXXS""#
         );
         assert_eq!(
+            serde_json::to_string(&BitmexInstrumentType::FuturesSpread).unwrap(),
+            r#""FFMCSX""#
+        );
+        assert_eq!(
             serde_json::to_string(&BitmexInstrumentType::ReferenceBasket).unwrap(),
             r#""RCSXXX""#
         );
@@ -1027,6 +1126,10 @@ mod tests {
             BitmexInstrumentType::FuturesSpreads
         );
         assert_eq!(
+            serde_json::from_str::<BitmexInstrumentType>(r#""FFMCSX""#).unwrap(),
+            BitmexInstrumentType::FuturesSpread
+        );
+        assert_eq!(
             serde_json::from_str::<BitmexInstrumentType>(r#""RCSXXX""#).unwrap(),
             BitmexInstrumentType::ReferenceBasket
         );
@@ -1061,8 +1164,10 @@ mod tests {
             BitmexInstrumentType::YieldIndex
         );
 
-        // Error case
-        assert!(serde_json::from_str::<BitmexInstrumentType>(r#""INVALID""#).is_err());
+        assert_eq!(
+            serde_json::from_str::<BitmexInstrumentType>(r#""INVALID""#).unwrap(),
+            BitmexInstrumentType::Other
+        );
     }
 
     #[rstest]
@@ -1117,8 +1222,8 @@ mod tests {
     #[rstest]
     fn test_error_cases() {
         assert!(serde_json::from_str::<BitmexProductType>(r#""invalid_type""#).is_err());
-        assert!(serde_json::from_str::<BitmexProductType>(r"123").is_err());
-        assert!(serde_json::from_str::<BitmexProductType>(r"{}").is_err());
+        assert!(serde_json::from_str::<BitmexProductType>("123").is_err());
+        assert!(serde_json::from_str::<BitmexProductType>("{}").is_err());
     }
 
     #[rstest]
@@ -1195,5 +1300,33 @@ mod tests {
         let result = BitmexTimeInForce::try_from_time_in_force(TimeInForce::Ioc);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), BitmexTimeInForce::ImmediateOrCancel);
+
+        let result = BitmexTimeInForce::try_from_time_in_force(TimeInForce::Gtd);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("GTD time in force is not supported")
+        );
+    }
+
+    #[rstest]
+    #[case(BitmexInstrumentState::Open, MarketStatusAction::Trading)]
+    #[case(BitmexInstrumentState::Closed, MarketStatusAction::Close)]
+    #[case(BitmexInstrumentState::Settled, MarketStatusAction::Close)]
+    #[case(
+        BitmexInstrumentState::Unlisted,
+        MarketStatusAction::NotAvailableForTrading
+    )]
+    #[case(
+        BitmexInstrumentState::Delisted,
+        MarketStatusAction::NotAvailableForTrading
+    )]
+    fn test_bitmex_instrument_state_to_market_status_action(
+        #[case] state: BitmexInstrumentState,
+        #[case] expected: MarketStatusAction,
+    ) {
+        assert_eq!(MarketStatusAction::from(&state), expected);
     }
 }

@@ -62,7 +62,6 @@ from nautilus_trader.model.functions cimport trailing_offset_type_to_str
 from nautilus_trader.model.identifiers cimport AccountId
 from nautilus_trader.model.identifiers cimport ComponentId
 from nautilus_trader.model.identifiers cimport InstrumentId
-from nautilus_trader.model.instruments.base cimport NEGATIVE_PRICE_INSTRUMENT_CLASSES
 from nautilus_trader.model.instruments.base cimport Instrument
 from nautilus_trader.model.objects cimport Currency
 from nautilus_trader.model.objects cimport Money
@@ -461,31 +460,45 @@ cdef class RiskEngine(Component):
             self._send_to_execution(command)
             return
 
-        # Get instrument for orders
-        cdef Instrument instrument = self._cache.instrument(command.instrument_id)
-
-        if instrument is None:
-            self._deny_command(
-                command=command,
-                reason=f"no instrument found for {command.instrument_id}",
-            )
-            return  # Denied
+        # Per-order checks use each order's own instrument; the cumulative
+        # risk check uses the representative. See docs/concepts/orders.md
+        # (Order lists -> Caveats for mixed-instrument lists).
+        cdef OrderList order_list = command.order_list
+        cdef set instrument_ids = order_list.instrument_ids()
+        cdef dict instruments = {}
+        cdef InstrumentId inst_id
+        cdef Instrument resolved
+        for inst_id in instrument_ids:
+            resolved = self._cache.instrument(inst_id)
+            if resolved is None:
+                self._deny_command(
+                    command=command,
+                    reason=f"no instrument found for {inst_id}",
+                )
+                return  # Denied
+            instruments[inst_id] = resolved
 
         ########################################################################
         # PRE-TRADE ORDER(S) CHECKS
         ########################################################################
-        for order in command.order_list.orders:
-            if not self._check_order(instrument, order):
+        cdef Order order
+        for order in order_list.orders:
+            if not self._check_order(instruments[order.instrument_id], order):
                 return  # Denied
 
-        if not self._check_orders_risk(instrument, command.order_list.orders):
-            # Deny all orders in list
-            self._deny_order_list(command.order_list, "OrderList {command.order_list.id.to_str()} DENIED")
-            return # Denied
+        cdef Instrument representative = instruments[command.instrument_id]
+        if not self._check_orders_risk(representative, order_list.orders):
+            self._deny_order_list(order_list, f"OrderList {order_list.id.to_str()} DENIED")
+            return  # Denied
 
-        self._execution_gateway(instrument, command)
+        self._execution_gateway(representative, command)
 
     cpdef void _handle_modify_order(self, ModifyOrder command):
+        if self.is_bypassed:
+            # Perform no further risk checks or throttling
+            self._send_to_execution(command)
+            return
+
         ########################################################################
         # VALIDATE COMMAND
         ########################################################################
@@ -871,20 +884,25 @@ cdef class RiskEngine(Component):
             else:
                 effective_quantity = order.quantity
 
-            # Check min/max quantity against effective quantity
-            if instrument.max_quantity and effective_quantity > instrument.max_quantity:
-                self._deny_order(
-                    order=order,
-                    reason=f"QUANTITY_EXCEEDS_MAXIMUM: effective_quantity={effective_quantity}, max_quantity={instrument.max_quantity}",
-                )
-                return False  # Denied
+            # Base-quantity bounds (`min_quantity`/`max_quantity`) do not apply to
+            # quote-denominated orders: the client-side conversion uses an estimated
+            # price and may differ from the venue fill, and some venues enforce
+            # distinct per-order-type minimums. The venue is authoritative for
+            # quote-denominated sizing; rely on `min_notional`/`max_notional` below.
+            if not order.is_quote_quantity:
+                if instrument.max_quantity and effective_quantity > instrument.max_quantity:
+                    self._deny_order(
+                        order=order,
+                        reason=f"QUANTITY_EXCEEDS_MAXIMUM: effective_quantity={effective_quantity}, max_quantity={instrument.max_quantity}",
+                    )
+                    return False  # Denied
 
-            if instrument.min_quantity and effective_quantity < instrument.min_quantity:
-                self._deny_order(
-                    order=order,
-                    reason=f"QUANTITY_BELOW_MINIMUM: effective_quantity={effective_quantity}, min_quantity={instrument.min_quantity}",
-                )
-                return False  # Denied
+                if instrument.min_quantity and effective_quantity < instrument.min_quantity:
+                    self._deny_order(
+                        order=order,
+                        reason=f"QUANTITY_BELOW_MINIMUM: effective_quantity={effective_quantity}, min_quantity={instrument.min_quantity}",
+                    )
+                    return False  # Denied
 
             notional = instrument.notional_value(effective_quantity, last_px, use_quote_for_inverse=True)
 
@@ -1024,7 +1042,7 @@ cdef class RiskEngine(Component):
             # Check failed
             return f"price {price} invalid (precision {price.precision} > {instrument.price_precision})"
 
-        if instrument.instrument_class not in NEGATIVE_PRICE_INSTRUMENT_CLASSES:
+        if not instrument.allows_negative_price():
             if price.raw_int_c() <= 0:
                 # Check failed
                 return f"price {price} invalid (not positive)"
@@ -1147,16 +1165,16 @@ cdef class RiskEngine(Component):
                     return  # Denied
             elif isinstance(command, SubmitOrderList):
                 for order in command.order_list.orders:
-                    if order.is_buy_c() and self._portfolio.is_net_long(instrument.id):
+                    if order.is_buy_c() and self._portfolio.is_net_long(order.instrument_id):
                         self._deny_order_list(
                             order_list=command.order_list,
-                            reason=f"OrderList contains BUY when TradingState.REDUCING and LONG {instrument.id}",
+                            reason=f"OrderList contains BUY when TradingState.REDUCING and LONG {order.instrument_id}",
                         )
                         return  # Denied
-                    elif order.is_sell_c() and self._portfolio.is_net_short(instrument.id):
+                    elif order.is_sell_c() and self._portfolio.is_net_short(order.instrument_id):
                         self._deny_order_list(
                             order_list=command.order_list,
-                            reason=f"OrderList contains SELL when TradingState.REDUCING and SHORT {instrument.id}",
+                            reason=f"OrderList contains SELL when TradingState.REDUCING and SHORT {order.instrument_id}",
                         )
                         return  # Denied
 

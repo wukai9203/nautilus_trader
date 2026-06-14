@@ -15,6 +15,7 @@
 
 //! Deribit HTTP API models and types.
 
+use ahash::AHashMap;
 use nautilus_core::serialization::{deserialize_decimal, deserialize_optional_decimal};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,7 @@ use ustr::Ustr;
 
 pub use crate::common::{
     enums::{DeribitCurrency, DeribitOptionType, DeribitProductType},
+    models::DeribitTradeLeg,
     rpc::{DeribitJsonRpcError, DeribitJsonRpcRequest, DeribitJsonRpcResponse},
 };
 
@@ -115,6 +117,33 @@ pub struct DeribitTickSizeStep {
     pub tick_size: Decimal,
 }
 
+/// Deribit combo definition from `public/get_combos`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeribitCombo {
+    /// Unique combo identifier, matching the combo instrument name.
+    pub id: Ustr,
+    /// Combo state, e.g. `active`.
+    pub state: String,
+    /// Combo leg makeup.
+    pub legs: Vec<DeribitComboLeg>,
+    /// Combo creation timestamp in milliseconds since UNIX epoch.
+    pub creation_timestamp: i64,
+    /// Numeric Deribit instrument ID.
+    pub instrument_id: i64,
+    /// State timestamp in milliseconds since UNIX epoch.
+    pub state_timestamp: i64,
+}
+
+/// A single leg entry of a Deribit combo definition.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeribitComboLeg {
+    /// Signed leg amount. Positive is long, negative is short.
+    #[serde(deserialize_with = "deserialize_decimal")]
+    pub amount: Decimal,
+    /// Leg instrument name.
+    pub instrument_name: Ustr,
+}
+
 /// Wrapper for the account summaries response.
 ///
 /// The API returns an object with a `summaries` field containing the array of account summaries,
@@ -204,6 +233,15 @@ pub struct DeribitAccountSummary {
     /// Portfolio margining enabled
     #[serde(default)]
     pub portfolio_margining_enabled: Option<bool>,
+    /// Margin model (e.g., "segregated_sm", "cross_sm", "cross_pm")
+    #[serde(default)]
+    pub margin_model: Option<String>,
+    /// Whether cross-collateral is enabled for this currency
+    #[serde(default)]
+    pub cross_collateral_enabled: Option<bool>,
+    /// Available withdrawal funds (per-currency withdrawable amount)
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    pub available_withdrawal_funds: Option<Decimal>,
 }
 
 /// Extended account summary with additional account details.
@@ -368,9 +406,9 @@ pub struct DeribitPublicTrade {
     pub contracts: Option<Decimal>,
     /// Direction of the trade: "buy" or "sell"
     pub direction: String,
-    /// Index Price at the moment of trade.
-    #[serde(deserialize_with = "deserialize_decimal")]
-    pub index_price: Decimal,
+    /// Index Price at the moment of trade (can be empty for some trade types).
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    pub index_price: Option<Decimal>,
     /// Unique instrument identifier.
     pub instrument_name: String,
     /// Option implied volatility for the price (Option only).
@@ -379,9 +417,9 @@ pub struct DeribitPublicTrade {
     /// Optional field (only for trades caused by liquidation).
     #[serde(default)]
     pub liquidation: Option<String>,
-    /// Mark Price at the moment of trade.
-    #[serde(deserialize_with = "deserialize_decimal")]
-    pub mark_price: Decimal,
+    /// Mark Price at the moment of trade (can be empty for some trade types).
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    pub mark_price: Option<Decimal>,
     /// Price in base currency.
     #[serde(deserialize_with = "deserialize_decimal")]
     pub price: Decimal,
@@ -406,8 +444,11 @@ pub struct DeribitPublicTrade {
     #[serde(default)]
     pub combo_id: Option<String>,
     /// Optional field containing combo trade identifier if the trade is a combo trade.
-    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
-    pub combo_trade_id: Option<Decimal>,
+    #[serde(default)]
+    pub combo_trade_id: Option<String>,
+    /// Per-leg trades when this is the parent combo trade.
+    #[serde(default)]
+    pub legs: Option<Vec<DeribitTradeLeg>>,
 }
 
 /// Response wrapper for trades endpoints.
@@ -421,6 +462,50 @@ pub struct DeribitTradesResponse {
     pub trades: Vec<DeribitPublicTrade>,
 }
 
+/// Expiration strings grouped by instrument kind.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeribitExpirationsByKind {
+    /// Future expirations, including `PERPETUAL` when present.
+    #[serde(default)]
+    pub future: Vec<String>,
+    /// Option expirations.
+    #[serde(default)]
+    pub option: Vec<String>,
+    /// Future combo expirations.
+    #[serde(default)]
+    pub future_combo: Vec<String>,
+    /// Option combo expirations.
+    #[serde(default)]
+    pub option_combo: Vec<String>,
+}
+
+/// Response from `public/get_expirations` endpoint.
+///
+/// Deribit returns a currency-keyed object for concrete or `grouped` currencies,
+/// and a direct kind-keyed object for `currency=any`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum DeribitExpirationsResponse {
+    /// Expirations keyed by lowercase currency code.
+    ByCurrency(AHashMap<String, DeribitExpirationsByKind>),
+    /// Expirations returned without currency grouping.
+    Expirations(DeribitExpirationsByKind),
+}
+
+impl DeribitExpirationsResponse {
+    /// Returns expirations for a currency code, or the direct result for `currency=any`.
+    #[must_use]
+    pub fn expirations_for_currency(&self, currency: &str) -> Option<&DeribitExpirationsByKind> {
+        match self {
+            Self::ByCurrency(expirations) => {
+                let key = currency.to_ascii_lowercase();
+                expirations.get(&key)
+            }
+            Self::Expirations(expirations) => Some(expirations),
+        }
+    }
+}
+
 /// Response from `public/get_tradingview_chart_data` endpoint.
 ///
 /// Contains OHLCV data in array format where each array element corresponds
@@ -430,7 +515,6 @@ pub struct DeribitTradingViewChartData {
     /// List of prices at close (one per candle)
     pub close: Vec<f64>,
     /// List of cost bars (volume in quote currency, one per candle)
-    #[serde(default)]
     pub cost: Vec<f64>,
     /// List of highest price levels (one per candle)
     pub high: Vec<f64>,
@@ -521,6 +605,43 @@ pub struct DeribitOrderBook {
     /// Interest rate used in implied volatility calculations (options only)
     #[serde(default, deserialize_with = "deserialize_optional_decimal")]
     pub interest_rate: Option<Decimal>,
+}
+
+/// Book summary data from `/public/get_book_summary_by_currency` endpoint.
+///
+/// Each entry represents a single instrument's book summary including the
+/// forward/underlying price used for ATM determination.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeribitBookSummary {
+    /// Unique instrument identifier (e.g. "BTC-28MAR25-90000-C")
+    pub instrument_name: String,
+    /// The forward/underlying price for implied volatility calculations
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    pub underlying_price: Option<Decimal>,
+    /// Name of the underlying future or index (e.g. "BTC-28MAR25" or "SYN.BTC-28MAR25")
+    #[serde(default)]
+    pub underlying_index: Option<String>,
+    /// Mark price for the instrument
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    pub mark_price: Option<Decimal>,
+    /// The time when the instrument was created (milliseconds since UNIX epoch)
+    pub creation_timestamp: i64,
+}
+
+/// Ticker data from `/public/ticker` endpoint.
+///
+/// Only the fields needed for forward price extraction are included;
+/// serde will ignore the many additional fields returned by the API.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeribitTicker {
+    /// Unique instrument identifier (e.g., "BTC-28FEB26-65000-C")
+    pub instrument_name: String,
+    /// Underlying price for implied volatility calculations (options only)
+    #[serde(default, deserialize_with = "deserialize_optional_decimal")]
+    pub underlying_price: Option<Decimal>,
+    /// Name of the underlying future or index (e.g., "BTC-28MAR25" or "SYN.BTC-28MAR25")
+    #[serde(default)]
+    pub underlying_index: Option<String>,
 }
 
 /// Position data from `/private/get_positions` endpoint.
@@ -681,4 +802,99 @@ pub struct DeribitUserTradesResponse {
     pub has_more: bool,
     /// Array of user trade objects.
     pub trades: Vec<crate::websocket::messages::DeribitUserTradeMsg>,
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    #[rstest]
+    fn test_deserialize_public_trade_with_empty_mark_and_index_price() {
+        let json = r#"{
+            "amount": 1.0,
+            "direction": "sell",
+            "index_price": "",
+            "instrument_name": "ETH-PERPETUAL",
+            "mark_price": "",
+            "price": 2968.3,
+            "tick_direction": 0,
+            "timestamp": 1766332040636,
+            "trade_id": "ETH-123",
+            "trade_seq": 1
+        }"#;
+
+        let trade: DeribitPublicTrade = serde_json::from_str(json).unwrap();
+        assert_eq!(trade.index_price, None);
+        assert_eq!(trade.mark_price, None);
+        assert_eq!(trade.price, dec!(2968.3));
+    }
+
+    #[rstest]
+    fn test_deserialize_public_trade_with_missing_mark_and_index_price() {
+        let json = r#"{
+            "amount": 1.0,
+            "direction": "sell",
+            "instrument_name": "ETH-PERPETUAL",
+            "price": 2968.3,
+            "tick_direction": 0,
+            "timestamp": 1766332040636,
+            "trade_id": "ETH-123",
+            "trade_seq": 1
+        }"#;
+
+        let trade: DeribitPublicTrade = serde_json::from_str(json).unwrap();
+        assert_eq!(trade.index_price, None);
+        assert_eq!(trade.mark_price, None);
+    }
+
+    #[rstest]
+    fn test_deserialize_public_trade_with_present_mark_and_index_price() {
+        let json = r#"{
+            "amount": 1.0,
+            "direction": "sell",
+            "index_price": 2967.73,
+            "instrument_name": "ETH-PERPETUAL",
+            "mark_price": 2968.01,
+            "price": 2968.3,
+            "tick_direction": 0,
+            "timestamp": 1766332040636,
+            "trade_id": "ETH-123",
+            "trade_seq": 1
+        }"#;
+
+        let trade: DeribitPublicTrade = serde_json::from_str(json).unwrap();
+        assert_eq!(trade.index_price, Some(dec!(2967.73)));
+        assert_eq!(trade.mark_price, Some(dec!(2968.01)));
+    }
+
+    #[rstest]
+    fn test_deserialize_expirations_currency_keyed_response() {
+        let json = r#"{
+            "btc": {
+                "option": ["20MAY26", "26JUN26"],
+                "future": ["20MAY26", "PERPETUAL"]
+            }
+        }"#;
+
+        let response: DeribitExpirationsResponse = serde_json::from_str(json).unwrap();
+        let expirations = response.expirations_for_currency("BTC").unwrap();
+        assert_eq!(expirations.option, vec!["20MAY26", "26JUN26"]);
+        assert_eq!(expirations.future, vec!["20MAY26", "PERPETUAL"]);
+    }
+
+    #[rstest]
+    fn test_deserialize_expirations_direct_response() {
+        let json = r#"{
+            "option": ["20MAY26", "26JUN26"],
+            "future": ["20MAY26", "PERPETUAL"]
+        }"#;
+
+        let response: DeribitExpirationsResponse = serde_json::from_str(json).unwrap();
+        let expirations = response.expirations_for_currency("any").unwrap();
+        assert_eq!(expirations.option, vec!["20MAY26", "26JUN26"]);
+        assert_eq!(expirations.future, vec!["20MAY26", "PERPETUAL"]);
+    }
 }

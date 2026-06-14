@@ -17,7 +17,9 @@ use std::fmt::Display;
 
 use derive_builder::Builder;
 use nautilus_core::{Params, UUID4, UnixNanos};
-use nautilus_model::identifiers::{ClientId, ClientOrderId, InstrumentId, TraderId, Venue};
+use nautilus_model::identifiers::{
+    ClientId, ClientOrderId, InstrumentId, TraderId, Venue, VenueOrderId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::enums::LogLevel;
@@ -36,11 +38,15 @@ pub struct GenerateOrderStatusReport {
     #[builder(default)]
     pub client_order_id: Option<ClientOrderId>,
     #[builder(default)]
-    pub venue_order_id: Option<ClientOrderId>,
+    pub venue_order_id: Option<VenueOrderId>,
     #[builder(default)]
     pub params: Option<Params>,
     #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<UUID4>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl GenerateOrderStatusReport {
@@ -50,7 +56,7 @@ impl GenerateOrderStatusReport {
         ts_init: UnixNanos,
         instrument_id: Option<InstrumentId>,
         client_order_id: Option<ClientOrderId>,
-        venue_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
         params: Option<Params>,
         correlation_id: Option<UUID4>,
     ) -> Self {
@@ -62,6 +68,7 @@ impl GenerateOrderStatusReport {
             venue_order_id,
             params,
             correlation_id,
+            causation_id: None,
         }
     }
 }
@@ -99,11 +106,15 @@ pub struct GenerateOrderStatusReports {
     #[serde(default = "default_report_log_level")]
     pub log_receipt_level: LogLevel,
     #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<UUID4>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl GenerateOrderStatusReports {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         command_id: UUID4,
@@ -125,6 +136,7 @@ impl GenerateOrderStatusReports {
             params,
             log_receipt_level: LogLevel::Info,
             correlation_id,
+            causation_id: None,
         }
     }
 }
@@ -150,7 +162,7 @@ pub struct GenerateFillReports {
     #[builder(default)]
     pub instrument_id: Option<InstrumentId>,
     #[builder(default)]
-    pub venue_order_id: Option<ClientOrderId>,
+    pub venue_order_id: Option<VenueOrderId>,
     #[builder(default)]
     pub start: Option<UnixNanos>,
     #[builder(default)]
@@ -162,17 +174,21 @@ pub struct GenerateFillReports {
     #[serde(default = "default_report_log_level")]
     pub log_receipt_level: LogLevel,
     #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<UUID4>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl GenerateFillReports {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         command_id: UUID4,
         ts_init: UnixNanos,
         instrument_id: Option<InstrumentId>,
-        venue_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
         start: Option<UnixNanos>,
         end: Option<UnixNanos>,
         params: Option<Params>,
@@ -188,6 +204,7 @@ impl GenerateFillReports {
             params,
             log_receipt_level: LogLevel::Info,
             correlation_id,
+            causation_id: None,
         }
     }
 }
@@ -223,7 +240,11 @@ pub struct GeneratePositionStatusReports {
     #[serde(default = "default_report_log_level")]
     pub log_receipt_level: LogLevel,
     #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<UUID4>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl GeneratePositionStatusReports {
@@ -246,6 +267,7 @@ impl GeneratePositionStatusReports {
             params,
             log_receipt_level: LogLevel::Info,
             correlation_id,
+            causation_id: None,
         }
     }
 }
@@ -274,7 +296,11 @@ pub struct GenerateExecutionMassStatus {
     #[builder(default)]
     pub params: Option<Params>,
     #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<UUID4>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl GenerateExecutionMassStatus {
@@ -296,6 +322,7 @@ impl GenerateExecutionMassStatus {
             ts_init,
             params,
             correlation_id,
+            causation_id: None,
         }
     }
 }

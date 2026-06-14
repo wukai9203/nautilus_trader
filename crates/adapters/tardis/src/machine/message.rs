@@ -14,10 +14,10 @@
 // -------------------------------------------------------------------------------------------------
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error};
 use ustr::Ustr;
 
-use crate::{enums::TardisExchange, parse::deserialize_uppercase};
+use crate::common::{enums::TardisExchange, parse::deserialize_uppercase};
 
 /// Represents a single level in the order book (bid or ask).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -40,8 +40,10 @@ pub struct BookChangeMsg {
     /// Indicates whether this is an initial order book snapshot.
     pub is_snapshot: bool,
     /// Updated bids, with price and amount levels.
+    #[serde(deserialize_with = "deserialize_book_levels")]
     pub bids: Vec<BookLevel>,
     /// Updated asks, with price and amount levels.
+    #[serde(deserialize_with = "deserialize_book_levels")]
     pub asks: Vec<BookLevel>,
     /// The order book update timestamp provided by the exchange (ISO 8601 format).
     pub timestamp: DateTime<Utc>,
@@ -65,8 +67,10 @@ pub struct BookSnapshotMsg {
     /// The requested snapshot interval in milliseconds.
     pub interval: u32,
     /// The top bids price-amount levels.
+    #[serde(deserialize_with = "deserialize_book_levels")]
     pub bids: Vec<BookLevel>,
     /// The top asks price-amount levels.
+    #[serde(deserialize_with = "deserialize_book_levels")]
     pub asks: Vec<BookLevel>,
     /// The snapshot timestamp based on the last book change message processed timestamp.
     pub timestamp: DateTime<Utc>,
@@ -118,6 +122,65 @@ pub struct DerivativeTickerMsg {
     /// The last mark price if provided by exchange.
     pub mark_price: Option<f64>,
     /// The message timestamp provided by exchange.
+    pub timestamp: DateTime<Utc>,
+    /// The local timestamp when the message was received.
+    pub local_timestamp: DateTime<Utc>,
+}
+
+/// Option summary info sourced from the options instrument channel, carrying exchange-provided
+/// greeks, implied volatilities, mark and underlying prices, and best bid/ask for a single option.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptionSummaryMsg {
+    /// The symbol as provided by the exchange.
+    #[serde(deserialize_with = "deserialize_uppercase")]
+    pub symbol: Ustr,
+    /// The exchange ID.
+    pub exchange: TardisExchange,
+    /// The option type, either `put` or `call`.
+    pub option_type: String,
+    /// The option strike price.
+    pub strike_price: f64,
+    /// The option expiration date provided by the exchange.
+    pub expiration_date: DateTime<Utc>,
+    /// The best bid price if provided by the exchange.
+    pub best_bid_price: Option<f64>,
+    /// The best bid amount if provided by the exchange.
+    pub best_bid_amount: Option<f64>,
+    /// The best bid implied volatility if provided by the exchange.
+    #[serde(rename = "bestBidIV")]
+    pub best_bid_iv: Option<f64>,
+    /// The best ask price if provided by the exchange.
+    pub best_ask_price: Option<f64>,
+    /// The best ask amount if provided by the exchange.
+    pub best_ask_amount: Option<f64>,
+    /// The best ask implied volatility if provided by the exchange.
+    #[serde(rename = "bestAskIV")]
+    pub best_ask_iv: Option<f64>,
+    /// The last trade price if provided by the exchange.
+    pub last_price: Option<f64>,
+    /// The open interest if provided by the exchange.
+    pub open_interest: Option<f64>,
+    /// The mark price if provided by the exchange.
+    pub mark_price: Option<f64>,
+    /// The mark implied volatility if provided by the exchange.
+    #[serde(rename = "markIV")]
+    pub mark_iv: Option<f64>,
+    /// The option delta if provided by the exchange.
+    pub delta: Option<f64>,
+    /// The option gamma if provided by the exchange.
+    pub gamma: Option<f64>,
+    /// The option vega if provided by the exchange.
+    pub vega: Option<f64>,
+    /// The option theta if provided by the exchange.
+    pub theta: Option<f64>,
+    /// The option rho if provided by the exchange.
+    pub rho: Option<f64>,
+    /// The underlying price if provided by the exchange.
+    pub underlying_price: Option<f64>,
+    /// The underlying index name.
+    pub underlying_index: String,
+    /// The message timestamp provided by the exchange.
     pub timestamp: DateTime<Utc>,
     /// The local timestamp when the message was received.
     pub local_timestamp: DateTime<Utc>,
@@ -187,7 +250,29 @@ pub enum WsMessage {
     Trade(TradeMsg),
     TradeBar(BarMsg),
     DerivativeTicker(DerivativeTickerMsg),
+    OptionSummary(OptionSummaryMsg),
     Disconnect(DisconnectMsg),
+}
+
+#[derive(Debug, Deserialize)]
+struct RawBookLevel {
+    price: Option<f64>,
+    amount: Option<f64>,
+}
+
+fn deserialize_book_levels<'de, D>(deserializer: D) -> Result<Vec<BookLevel>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<RawBookLevel>::deserialize(deserializer)?
+        .into_iter()
+        .filter_map(|level| match (level.price, level.amount) {
+            (Some(price), Some(amount)) => Some(Ok(BookLevel { price, amount })),
+            (None, None) => None,
+            (None, Some(_)) => Some(Err(D::Error::custom("book level missing price"))),
+            (Some(_), None) => Some(Err(D::Error::custom("book level missing amount"))),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -195,7 +280,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::tests::load_test_json;
+    use crate::common::testing::load_test_json;
 
     #[rstest]
     fn test_parse_book_change_message() {
@@ -217,6 +302,52 @@ mod tests {
             message.local_timestamp,
             DateTime::parse_from_rfc3339("2019-10-23T11:29:53.469Z").unwrap()
         );
+    }
+
+    #[rstest]
+    fn test_parse_book_change_message_skips_empty_book_levels() {
+        let json_data = r#"{
+            "type": "book_change",
+            "symbol": "XBTUSD",
+            "exchange": "bitmex",
+            "isSnapshot": false,
+            "bids": [{"price": 7984, "amount": 100}, {}],
+            "asks": [{}],
+            "timestamp": "2019-10-23T11:29:53.469Z",
+            "localTimestamp": "2019-10-23T11:29:53.469Z"
+        }"#;
+
+        let message: BookChangeMsg = serde_json::from_str(json_data).unwrap();
+
+        assert_eq!(message.bids.len(), 1);
+        assert!(message.asks.is_empty());
+        assert_eq!(message.bids[0].price, 7_984.0);
+        assert_eq!(message.bids[0].amount, 100.0);
+    }
+
+    #[rstest]
+    #[case(r#"[{"price": 7984}]"#, "book level missing amount")]
+    #[case(r#"[{"amount": 100}]"#, "book level missing price")]
+    fn test_parse_book_change_message_rejects_partial_book_level(
+        #[case] bids: &str,
+        #[case] error_message: &str,
+    ) {
+        let json_data = format!(
+            r#"{{
+                "type": "book_change",
+                "symbol": "XBTUSD",
+                "exchange": "bitmex",
+                "isSnapshot": false,
+                "bids": {bids},
+                "asks": [],
+                "timestamp": "2019-10-23T11:29:53.469Z",
+                "localTimestamp": "2019-10-23T11:29:53.469Z"
+            }}"#
+        );
+
+        let error = serde_json::from_str::<BookChangeMsg>(&json_data).unwrap_err();
+
+        assert!(error.to_string().contains(error_message));
     }
 
     #[rstest]
@@ -243,6 +374,51 @@ mod tests {
             message.local_timestamp,
             DateTime::parse_from_rfc3339("2019-10-25T13:39:46.961Z").unwrap()
         );
+    }
+
+    #[rstest]
+    fn test_parse_book_snapshot_message_skips_empty_book_levels() {
+        let json_data = r#"{
+            "type": "book_snapshot",
+            "symbol": "ETC",
+            "exchange": "hyperliquid",
+            "name": "book_snapshot_20_10s",
+            "depth": 20,
+            "interval": 10000,
+            "bids": [{"price": 20.002, "amount": 5.81}],
+            "asks": [{"price": 20.003, "amount": 162.45}, {}],
+            "timestamp": "2025-03-03T10:48:10.000Z",
+            "localTimestamp": "2025-03-03T10:48:10.596818Z"
+        }"#;
+
+        let message: BookSnapshotMsg = serde_json::from_str(json_data).unwrap();
+
+        assert_eq!(message.symbol, "ETC");
+        assert_eq!(message.exchange, TardisExchange::Hyperliquid);
+        assert_eq!(message.bids.len(), 1);
+        assert_eq!(message.asks.len(), 1);
+        assert_eq!(message.asks[0].price, 20.003);
+        assert_eq!(message.asks[0].amount, 162.45);
+    }
+
+    #[rstest]
+    fn test_parse_book_snapshot_message_rejects_partial_book_level() {
+        let json_data = r#"{
+            "type": "book_snapshot",
+            "symbol": "ETC",
+            "exchange": "hyperliquid",
+            "name": "book_snapshot_20_10s",
+            "depth": 20,
+            "interval": 10000,
+            "bids": [{"price": 20.002}],
+            "asks": [],
+            "timestamp": "2025-03-03T10:48:10.000Z",
+            "localTimestamp": "2025-03-03T10:48:10.596818Z"
+        }"#;
+
+        let error = serde_json::from_str::<BookSnapshotMsg>(json_data).unwrap_err();
+
+        assert!(error.to_string().contains("book level missing amount"));
     }
 
     #[rstest]
@@ -288,6 +464,36 @@ mod tests {
         assert_eq!(
             message.local_timestamp,
             DateTime::parse_from_rfc3339("2019-10-23T11:34:29.416Z").unwrap()
+        );
+    }
+
+    #[rstest]
+    fn test_parse_option_summary_message() {
+        let json_data = load_test_json("option_summary.json");
+        let message: OptionSummaryMsg = serde_json::from_str(&json_data).unwrap();
+
+        assert_eq!(message.symbol, "BTC-28JUN24-70000-C");
+        assert_eq!(message.exchange, TardisExchange::Deribit);
+        assert_eq!(message.option_type, "call");
+        assert_eq!(message.strike_price, 70_000.0);
+        assert_eq!(message.best_bid_iv, Some(0.55));
+        assert_eq!(message.best_ask_iv, Some(0.58));
+        assert_eq!(message.mark_iv, Some(0.565));
+        assert_eq!(message.delta, Some(0.25));
+        assert_eq!(message.gamma, Some(0.000_02));
+        assert_eq!(message.vega, Some(45.5));
+        assert_eq!(message.theta, Some(-15.2));
+        assert_eq!(message.rho, Some(0.05));
+        assert_eq!(message.underlying_price, Some(63_500.0));
+        assert_eq!(message.underlying_index, "BTC-USD");
+        assert_eq!(message.open_interest, Some(150.0));
+        assert_eq!(
+            message.timestamp,
+            DateTime::parse_from_rfc3339("2024-01-15T10:30:00.123Z").unwrap()
+        );
+        assert_eq!(
+            message.local_timestamp,
+            DateTime::parse_from_rfc3339("2024-01-15T10:30:00.234Z").unwrap()
         );
     }
 

@@ -29,6 +29,7 @@ from nautilus_trader.cache.cache cimport Cache
 from nautilus_trader.common.component cimport Clock
 from nautilus_trader.common.component cimport Logger
 from nautilus_trader.common.component cimport MessageBus
+from nautilus_trader.common.component cimport TimeEvent
 from nautilus_trader.core.data cimport Data
 from nautilus_trader.core.rust.backtest cimport TimeEventAccumulator_API
 from nautilus_trader.core.rust.core cimport CVec
@@ -129,6 +130,7 @@ cdef class BacktestEngine:
 
     cdef CVec _advance_time(self, uint64_t ts_now)
     cdef bint _process_next_timer(self)
+    cdef void _process_and_settle_venues(self, uint64_t ts_now)
     cdef void _flush_accumulator_events(self, uint64_t ts_now)
     cdef void _process_raw_time_event_handlers(
         self,
@@ -137,6 +139,7 @@ cdef class BacktestEngine:
         bint only_now,
         bint as_of_now=*,
     )
+    cdef dict _get_result_summary(self)
 
     cpdef void _handle_data_command(self, DataCommand command)
     cdef void _handle_subscribe(self, SubscribeData command)
@@ -309,6 +312,8 @@ cdef class SimulatedExchange:
     cpdef void adjust_account(self, Money adjustment)
     cpdef void update_instrument(self, Instrument instrument)
     cdef tuple generate_inflight_command(self, TradingCommand command)
+    cdef bint _has_pending_commands(self, uint64_t ts_now)
+    cdef void _drain_commands(self, uint64_t ts_now)
     cpdef void send(self, TradingCommand command)
     cpdef void process_order_book_delta(self, OrderBookDelta delta)
     cpdef void process_order_book_deltas(self, OrderBookDeltas deltas)
@@ -320,9 +325,13 @@ cdef class SimulatedExchange:
     cpdef void process_instrument_status(self, InstrumentStatus data)
     cpdef void process(self, uint64_t ts_now)
     cpdef void reset(self)
+    cpdef void _process_instrument_expiration_time_event(self, TimeEvent event)
 
     cdef void _process_instrument_expirations(self, uint64_t ts_now)
     cdef void _update_next_instrument_expiration(self, OrderMatchingEngine matching_engine)
+    cdef void _set_instrument_expiration_timer(self, OrderMatchingEngine matching_engine)
+    cdef void _set_instrument_expiration_timers(self)
+    cdef str _instrument_expiration_timer_name(self, InstrumentId instrument_id)
 
     cdef void _process_trading_command(self, TradingCommand command)
     cdef void _process_modify_submitted_order(self, ModifyOrder command)
@@ -346,6 +355,7 @@ cdef class SimulatedExchange:
 
 # -- EVENT GENERATORS -----------------------------------------------------------------------------
 
+    cdef bint _account_at_starting_balances(self)
     cdef void _generate_fresh_account_state(self)
 
 
@@ -411,9 +421,18 @@ cdef class OrderMatchingEngine:
     cdef bint _fill_at_market
     cdef dict[ClientOrderId, tuple[PriceRaw, QuantityRaw]] _queue_ahead
     cdef dict[ClientOrderId, QuantityRaw] _queue_excess
+    cdef dict[ClientOrderId, PriceRaw] _queue_pending
     cdef dict[PriceRaw, tuple[QuantityRaw, QuantityRaw]] _bid_consumption
     cdef dict[PriceRaw, tuple[QuantityRaw, QuantityRaw]] _ask_consumption
     cdef QuantityRaw _trade_consumption
+    cdef PriceRaw _prev_bid_price_raw
+    cdef PriceRaw _prev_ask_price_raw
+    cdef QuantityRaw _prev_bid_size_raw
+    cdef QuantityRaw _prev_ask_size_raw
+    cdef PriceRaw _last_quote_bid_raw
+    cdef PriceRaw _last_quote_ask_raw
+    cdef bint _has_quote_context
+    cdef bint _tob_initialized
 
     cdef int _position_count
     cdef int _order_count
@@ -455,6 +474,7 @@ cdef class OrderMatchingEngine:
     cdef OrderFilled _option_create_close_fill(self, Position position, Price price, str trade_id, uint64_t ts_now)
     cdef OrderFilled _option_create_underlying_fill(self, Position position, Instrument underlying_instrument, Quantity quantity, PositionSide side, Price price, str trade_id_suffix, uint64_t ts_now)
     cdef void _option_send_events(self, list events)
+    cdef void _option_register_settlement_order(self, Position position, InstrumentId instrument_id, OrderSide order_side, Quantity quantity, ClientOrderId client_order_id, VenueOrderId venue_order_id, PositionId position_id, bint reduce_only, str tag)
     cdef void _process_trade_ticks_from_bar(self, Bar bar)
     cdef TradeTick _create_base_trade_tick(self, Bar bar, Quantity size)
     cdef void _process_trade_bar_open(self, Bar bar, TradeTick tick)
@@ -475,6 +495,7 @@ cdef class OrderMatchingEngine:
     cpdef void process_cancel(self, CancelOrder command, AccountId account_id)
     cpdef void process_cancel_all(self, CancelAllOrders command, AccountId account_id)
     cpdef void process_batch_cancel(self, BatchCancelOrders command, AccountId account_id)
+    cdef bint _convert_quote_to_base_quantity(self, Order order)
     cdef void _process_market_order(self, MarketOrder order)
     cdef void _process_market_to_limit_order(self, MarketToLimitOrder order)
     cdef void _process_limit_order(self, LimitOrder order)
@@ -497,10 +518,12 @@ cdef class OrderMatchingEngine:
 # -- ORDER PROCESSING -----------------------------------------------------------------------------
 
     cpdef void iterate(self, uint64_t timestamp_ns, AggressorSide aggressor_side=*)
+    cdef void _purge_closed_cached_filled_qty(self)
     cpdef list[tuple[Price, Quantity]] determine_limit_price_and_volume(self, Order order)
     cpdef list[tuple[Price, Quantity]] determine_market_price_and_volume(self, Order order)
     cdef list[tuple[Price, Quantity]] determine_market_fills_with_simulation(self, Order order)
     cdef list[tuple[Price, Quantity]] determine_limit_fills_with_simulation(self, Order order)
+    cdef void _seed_trade_consumption(self, PriceRaw trade_price_raw, QuantityRaw trade_size_raw, uint64_t trade_ts_event, AggressorSide aggressor_side)
     cdef list[tuple[Price, Quantity]] _apply_liquidity_consumption(self, list fills, OrderSide order_side, QuantityRaw max_qty_raw=*, list[Price] book_prices=*)
     cdef Quantity determine_trade_fill_qty(self, Order order)
     cpdef void fill_market_order(self, Order order)
@@ -511,6 +534,11 @@ cdef class OrderMatchingEngine:
     cdef void _clear_queue_on_delete(self, PriceRaw deleted_price_raw, OrderSide deleted_side)
     cdef void _clear_all_queue_positions(self)
     cdef void _decrement_queue_on_trade(self, PriceRaw price_raw, QuantityRaw trade_size_raw, AggressorSide aggressor_side)
+    cdef void _seed_tob_baseline(self)
+    cdef void _decrement_l1_queue_on_quote(self, PriceRaw bid_price_raw, QuantityRaw bid_size_raw, PriceRaw ask_price_raw, QuantityRaw ask_size_raw)
+    cdef void _adjust_l1_queue_on_price_move(self, PriceRaw new_price_raw, QuantityRaw new_size_raw, OrderSide order_side)
+    cdef void _resolve_pending_l1_snapshots(self, PriceRaw bid_price_raw, QuantityRaw bid_size_raw, PriceRaw ask_price_raw, QuantityRaw ask_size_raw)
+    cdef void _resolve_pending_on_trade(self, PriceRaw trade_price_raw)
 
     cpdef void apply_fills(
         self,
@@ -550,8 +578,8 @@ cdef class OrderMatchingEngine:
     cdef PositionId _get_position_id(self, Order order, bint generate=*)
     cdef PositionId _generate_venue_position_id(self)
     cdef VenueOrderId _generate_venue_order_id(self)
-    cdef TradeId _generate_trade_id(self)
-    cdef str _generate_trade_id_str(self)
+    cdef TradeId _generate_trade_id(self, uint64_t ts_init)
+    cdef str _generate_trade_id_str(self, uint64_t ts_init)
 
 # -- EVENT HANDLING -------------------------------------------------------------------------------
 

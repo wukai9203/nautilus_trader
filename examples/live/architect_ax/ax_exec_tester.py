@@ -28,6 +28,8 @@ from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.config import LiveRiskEngineConfig
 from nautilus_trader.live.node import TradingNode
+from nautilus_trader.model.enums import OrderType
+from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.test_kit.strategies.tester_exec import ExecTester
@@ -56,8 +58,6 @@ config_node = TradingNodeConfig(
     risk_engine=LiveRiskEngineConfig(bypass=True),
     data_clients={
         AX: AxDataClientConfig(
-            api_key=None,  # 'AX_API_KEY' env var
-            api_secret=None,  # 'AX_API_SECRET' env var
             environment=AxEnvironment.SANDBOX,
             instrument_provider=InstrumentProviderConfig(
                 load_all=False,
@@ -67,8 +67,6 @@ config_node = TradingNodeConfig(
     },
     exec_clients={
         AX: AxExecClientConfig(
-            api_key=None,  # 'AX_API_KEY' env var
-            api_secret=None,  # 'AX_API_SECRET' env var
             environment=AxEnvironment.SANDBOX,
             instrument_provider=InstrumentProviderConfig(
                 load_all=False,
@@ -96,10 +94,13 @@ config_tester = ExecTesterConfig(
     # enable_stop_sells=True,
     order_qty=order_qty,
     open_position_on_start_qty=order_qty,
-    # stop_order_type=OrderType.STOP_LIMIT,
+    open_position_time_in_force=TimeInForce.IOC,
+    stop_order_type=OrderType.STOP_LIMIT,
     # tob_offset_ticks=0,
     use_post_only=True,
-    # manage_stop=True,
+    # cancel_orders_on_stop=False,
+    # close_positions_on_stop=False,
+    manage_stop=True,
     # test_reject_post_only=True,
     log_data=False,
     dry_run=False,

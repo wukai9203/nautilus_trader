@@ -24,12 +24,12 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashSet;
 use indexmap::IndexMap;
 use nautilus_core::{UnixNanos, time::nanos_since_unix_epoch};
 use rust_decimal::Decimal;
 
-use super::display::pprint_own_book;
+use super::{BookViewError, OwnBookError, display::pprint_own_book};
 use crate::{
     enums::{OrderSideSpecified, OrderStatus, OrderType, TimeInForce},
     identifiers::{ClientOrderId, InstrumentId, TraderId, VenueOrderId},
@@ -46,7 +46,11 @@ use crate::{
 #[derive(Clone, Copy, Eq)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct OwnBookOrder {
     /// The trader ID.
@@ -65,7 +69,7 @@ pub struct OwnBookOrder {
     pub order_type: OrderType,
     /// The order time in force.
     pub time_in_force: TimeInForce,
-    /// The current order status (SUBMITTED/ACCEPTED/PENDING_CANCEL/PENDING_UPDATE/PARTIALLY_FILLED).
+    /// The current order status (`SUBMITTED/ACCEPTED/PENDING_CANCEL/PENDING_UPDATE/PARTIALLY_FILLED`).
     pub status: OrderStatus,
     /// UNIX timestamp (nanoseconds) when the last order event occurred for this order.
     pub ts_last: UnixNanos,
@@ -80,7 +84,7 @@ pub struct OwnBookOrder {
 impl OwnBookOrder {
     /// Creates a new [`OwnBookOrder`] instance.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         trader_id: TraderId,
         client_order_id: ClientOrderId,
@@ -137,8 +141,9 @@ impl OwnBookOrder {
 
 impl Ord for OwnBookOrder {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Compare solely based on ts_init.
-        self.ts_init.cmp(&other.ts_init)
+        self.ts_init
+            .cmp(&other.ts_init)
+            .then_with(|| self.client_order_id.cmp(&other.client_order_id))
     }
 }
 
@@ -151,8 +156,6 @@ impl PartialOrd for OwnBookOrder {
 impl PartialEq for OwnBookOrder {
     fn eq(&self, other: &Self) -> bool {
         self.client_order_id == other.client_order_id
-            && self.status == other.status
-            && self.ts_last == other.ts_last
     }
 }
 
@@ -207,10 +210,14 @@ impl Display for OwnBookOrder {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct OwnOrderBook {
     /// The instrument ID for the order book.
@@ -282,7 +289,7 @@ impl OwnOrderBook {
     /// # Errors
     ///
     /// Returns an error if the order is not found.
-    pub fn update(&mut self, order: OwnBookOrder) -> anyhow::Result<()> {
+    pub fn update(&mut self, order: OwnBookOrder) -> Result<(), OwnBookError> {
         let result = match order.side {
             OrderSideSpecified::Buy => self.bids.update(order),
             OrderSideSpecified::Sell => self.asks.update(order),
@@ -300,7 +307,7 @@ impl OwnOrderBook {
     /// # Errors
     ///
     /// Returns an error if the order is not found.
-    pub fn delete(&mut self, order: OwnBookOrder) -> anyhow::Result<()> {
+    pub fn delete(&mut self, order: OwnBookOrder) -> Result<(), OwnBookError> {
         let result = match order.side {
             OrderSideSpecified::Buy => self.bids.delete(order),
             OrderSideSpecified::Sell => self.asks.delete(order),
@@ -330,16 +337,19 @@ impl OwnOrderBook {
     }
 
     /// Returns the client order IDs currently on the bid side.
+    #[must_use]
     pub fn bid_client_order_ids(&self) -> Vec<ClientOrderId> {
         self.bids.cache.keys().copied().collect()
     }
 
     /// Returns the client order IDs currently on the ask side.
+    #[must_use]
     pub fn ask_client_order_ids(&self) -> Vec<ClientOrderId> {
         self.asks.cache.keys().copied().collect()
     }
 
     /// Return whether the given client order ID is in the own book.
+    #[must_use]
     pub fn is_order_in_book(&self, client_order_id: &ClientOrderId) -> bool {
         self.asks.cache.contains_key(client_order_id)
             || self.bids.cache.contains_key(client_order_id)
@@ -349,26 +359,28 @@ impl OwnOrderBook {
     ///
     /// Filters by `status` if provided. With `accepted_buffer_ns`, only includes orders accepted
     /// at least that many nanoseconds before `ts_now` (defaults to now).
+    #[must_use]
     pub fn bids_as_map(
         &self,
-        status: Option<AHashSet<OrderStatus>>,
+        status: Option<&AHashSet<OrderStatus>>,
         accepted_buffer_ns: Option<u64>,
         ts_now: Option<u64>,
     ) -> IndexMap<Decimal, Vec<OwnBookOrder>> {
-        filter_orders(self.bids(), status.as_ref(), accepted_buffer_ns, ts_now)
+        filter_orders(self.bids(), status, accepted_buffer_ns, ts_now)
     }
 
     /// Maps ask price levels to their own orders, excluding empty levels after filtering.
     ///
     /// Filters by `status` if provided. With `accepted_buffer_ns`, only includes orders accepted
     /// at least that many nanoseconds before `ts_now` (defaults to now).
+    #[must_use]
     pub fn asks_as_map(
         &self,
-        status: Option<AHashSet<OrderStatus>>,
+        status: Option<&AHashSet<OrderStatus>>,
         accepted_buffer_ns: Option<u64>,
         ts_now: Option<u64>,
     ) -> IndexMap<Decimal, Vec<OwnBookOrder>> {
-        filter_orders(self.asks(), status.as_ref(), accepted_buffer_ns, ts_now)
+        filter_orders(self.asks(), status, accepted_buffer_ns, ts_now)
     }
 
     /// Aggregates own bid quantities per price level, omitting zero-quantity levels.
@@ -378,9 +390,10 @@ impl OwnOrderBook {
     ///
     /// If `group_size` is provided, groups quantities into price buckets.
     /// If `depth` is provided, limits the number of price levels returned.
+    #[must_use]
     pub fn bid_quantity(
         &self,
-        status: Option<AHashSet<OrderStatus>>,
+        status: Option<&AHashSet<OrderStatus>>,
         depth: Option<usize>,
         group_size: Option<Decimal>,
         accepted_buffer_ns: Option<u64>,
@@ -409,9 +422,10 @@ impl OwnOrderBook {
     ///
     /// If `group_size` is provided, groups quantities into price buckets.
     /// If `depth` is provided, limits the number of price levels returned.
+    #[must_use]
     pub fn ask_quantity(
         &self,
-        status: Option<AHashSet<OrderStatus>>,
+        status: Option<&AHashSet<OrderStatus>>,
         depth: Option<usize>,
         group_size: Option<Decimal>,
         accepted_buffer_ns: Option<u64>,
@@ -434,6 +448,40 @@ impl OwnOrderBook {
         } else {
             quantities
         }
+    }
+
+    /// Returns a new own book containing this books orders plus parity-transformed opposite orders.
+    ///
+    /// Opposite asks are transformed into bids with price `1 - price`.
+    /// Opposite bids are transformed into asks with price `1 - price`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BookViewError::OppositeInstrumentMatch`] if `self` and `opposite` have the
+    /// same instrument ID.
+    pub fn combined_with_opposite(&self, opposite: &Self) -> Result<Self, BookViewError> {
+        if self.instrument_id == opposite.instrument_id {
+            return Err(BookViewError::OppositeInstrumentMatch(
+                self.instrument_id,
+                opposite.instrument_id,
+            ));
+        }
+
+        let mut combined = self.clone();
+
+        for level in opposite.asks() {
+            for order in level.iter() {
+                combined.add(transform_opposite_order(*order, OrderSideSpecified::Buy));
+            }
+        }
+
+        for level in opposite.bids() {
+            for order in level.iter() {
+                combined.add(transform_opposite_order(*order, OrderSideSpecified::Sell));
+            }
+        }
+
+        Ok(combined)
     }
 
     /// Return a formatted string representation of the order book.
@@ -485,6 +533,27 @@ fn log_audit_error(client_order_id: &ClientOrderId) {
     );
 }
 
+fn transform_opposite_order(order: OwnBookOrder, side: OrderSideSpecified) -> OwnBookOrder {
+    let parity_price = Price::from_decimal(Decimal::ONE - order.price.as_decimal())
+        .expect("Invalid parity transformed price for OwnOrderBook::combined_with_opposite");
+
+    OwnBookOrder::new(
+        order.trader_id,
+        order.client_order_id,
+        order.venue_order_id,
+        side,
+        parity_price,
+        order.size,
+        order.order_type,
+        order.time_in_force,
+        order.status,
+        order.ts_last,
+        order.ts_accepted,
+        order.ts_submitted,
+        order.ts_init,
+    )
+}
+
 /// Filters orders by status and accepted timestamp.
 ///
 /// `accepted_buffer_ns` acts as a grace period after `ts_accepted`. Orders whose
@@ -524,7 +593,7 @@ fn group_quantities(
     is_bid: bool,
 ) -> IndexMap<Decimal, Decimal> {
     if group_size <= Decimal::ZERO {
-        log::error!("Invalid group_size: {group_size}, must be positive; returning empty map");
+        log::warn!("Invalid group_size: {group_size}, must be positive; returning empty map");
         return IndexMap::new();
     }
 
@@ -573,56 +642,54 @@ where
 }
 
 /// Represents a ladder of price levels for one side of an order book.
+#[derive(Clone)]
 pub(crate) struct OwnBookLadder {
     pub side: OrderSideSpecified,
     pub levels: BTreeMap<BookPrice, OwnBookLevel>,
-    pub cache: AHashMap<ClientOrderId, BookPrice>,
+    pub cache: IndexMap<ClientOrderId, BookPrice>,
 }
 
 impl OwnBookLadder {
     /// Creates a new [`OwnBookLadder`] instance.
     #[must_use]
-    pub fn new(side: OrderSideSpecified) -> Self {
+    pub(crate) fn new(side: OrderSideSpecified) -> Self {
         Self {
             side,
             levels: BTreeMap::new(),
-            cache: AHashMap::new(),
+            cache: IndexMap::new(),
         }
     }
 
     /// Returns the number of price levels in the ladder.
     #[must_use]
     #[allow(dead_code)]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.levels.len()
     }
 
     /// Returns true if the ladder has no price levels.
     #[must_use]
     #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.levels.is_empty()
     }
 
     /// Removes all orders and price levels from the ladder.
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.levels.clear();
         self.cache.clear();
     }
 
     /// Adds an order to the ladder at its price level.
-    pub fn add(&mut self, order: OwnBookOrder) {
+    pub(crate) fn add(&mut self, order: OwnBookOrder) {
         let book_price = order.to_book_price();
         self.cache.insert(order.client_order_id, book_price);
 
-        match self.levels.get_mut(&book_price) {
-            Some(level) => {
-                level.add(order);
-            }
-            None => {
-                let level = OwnBookLevel::from_order(order);
-                self.levels.insert(book_price, level);
-            }
+        if let Some(level) = self.levels.get_mut(&book_price) {
+            level.add(order);
+        } else {
+            let level = OwnBookLevel::from_order(order);
+            self.levels.insert(book_price, level);
         }
     }
 
@@ -631,36 +698,34 @@ impl OwnBookLadder {
     /// # Errors
     ///
     /// Returns an error if the order is not found.
-    pub fn update(&mut self, order: OwnBookOrder) -> anyhow::Result<()> {
+    pub(crate) fn update(&mut self, order: OwnBookOrder) -> Result<(), OwnBookError> {
+        let client_order_id = order.client_order_id;
+
         let Some(price) = self.cache.get(&order.client_order_id).copied() else {
-            log::error!(
-                "Own book update failed - order {client_order_id} not in cache",
-                client_order_id = order.client_order_id
-            );
-            anyhow::bail!(
-                "Order {} not found in own book (cache)",
-                order.client_order_id
-            );
+            return Err(OwnBookError::OrderNotFoundInCache { client_order_id });
         };
 
         let Some(level) = self.levels.get_mut(&price) else {
-            log::error!(
-                "Own book update failed - order {client_order_id} cached level {price:?} missing",
-                client_order_id = order.client_order_id
-            );
-            anyhow::bail!(
-                "Order {} not found in own book (level)",
-                order.client_order_id
-            );
+            return Err(OwnBookError::CachedLevelMissing {
+                client_order_id,
+                price,
+            });
         };
 
         if order.price == level.price.value {
             level.update(order);
+            if order.size.is_zero() {
+                self.cache.shift_remove(&order.client_order_id);
+
+                if level.is_empty() {
+                    self.levels.remove(&price);
+                }
+            }
             return Ok(());
         }
 
-        level.delete(&order.client_order_id)?;
-        self.cache.remove(&order.client_order_id);
+        level.delete(&client_order_id)?;
+        self.cache.shift_remove(&order.client_order_id);
 
         if level.is_empty() {
             self.levels.remove(&price);
@@ -675,7 +740,7 @@ impl OwnBookLadder {
     /// # Errors
     ///
     /// Returns an error if the order is not found.
-    pub fn delete(&mut self, order: OwnBookOrder) -> anyhow::Result<()> {
+    pub(crate) fn delete(&mut self, order: OwnBookOrder) -> Result<(), OwnBookError> {
         self.remove(&order.client_order_id)
     }
 
@@ -684,17 +749,18 @@ impl OwnBookLadder {
     /// # Errors
     ///
     /// Returns an error if the order is not found.
-    pub fn remove(&mut self, client_order_id: &ClientOrderId) -> anyhow::Result<()> {
+    pub(crate) fn remove(&mut self, client_order_id: &ClientOrderId) -> Result<(), OwnBookError> {
         let Some(price) = self.cache.get(client_order_id).copied() else {
-            log::error!("Own book remove failed - order {client_order_id} not in cache");
-            anyhow::bail!("Order {client_order_id} not found in own book (cache)");
+            return Err(OwnBookError::OrderNotFoundInCache {
+                client_order_id: *client_order_id,
+            });
         };
 
         let Some(level) = self.levels.get_mut(&price) else {
-            log::error!(
-                "Own book remove failed - order {client_order_id} cached level {price:?} missing"
-            );
-            anyhow::bail!("Order {client_order_id} not found in own book (level)");
+            return Err(OwnBookError::CachedLevelMissing {
+                client_order_id: *client_order_id,
+                price,
+            });
         };
 
         level.delete(client_order_id)?;
@@ -702,7 +768,7 @@ impl OwnBookLadder {
         if level.is_empty() {
             self.levels.remove(&price);
         }
-        self.cache.remove(client_order_id);
+        self.cache.shift_remove(client_order_id);
 
         Ok(())
     }
@@ -710,21 +776,21 @@ impl OwnBookLadder {
     /// Returns the total size of all orders in the ladder.
     #[must_use]
     #[allow(dead_code)]
-    pub fn sizes(&self) -> f64 {
+    pub(crate) fn sizes(&self) -> f64 {
         self.levels.values().map(OwnBookLevel::size).sum()
     }
 
     /// Returns the total value exposure (price * size) of all orders in the ladder.
     #[must_use]
     #[allow(dead_code)]
-    pub fn exposures(&self) -> f64 {
+    pub(crate) fn exposures(&self) -> f64 {
         self.levels.values().map(OwnBookLevel::exposure).sum()
     }
 
     /// Returns the best price level in the ladder.
     #[must_use]
     #[allow(dead_code)]
-    pub fn top(&self) -> Option<&OwnBookLevel> {
+    pub(crate) fn top(&self) -> Option<&OwnBookLevel> {
         match self.levels.iter().next() {
             Some((_, l)) => Option::Some(l),
             None => Option::None,
@@ -737,6 +803,7 @@ impl Debug for OwnBookLadder {
         f.debug_struct(stringify!(OwnBookLadder))
             .field("side", &self.side)
             .field("levels", &self.levels)
+            .field("cache", &self.cache)
             .finish()
     }
 }
@@ -847,7 +914,11 @@ impl OwnBookLevel {
     pub fn update(&mut self, order: OwnBookOrder) {
         debug_assert_eq!(order.price, self.price.value);
 
-        self.orders[&order.client_order_id] = order;
+        if order.size.is_zero() {
+            self.orders.shift_remove(&order.client_order_id);
+        } else {
+            self.orders[&order.client_order_id] = order;
+        }
     }
 
     /// Deletes an order from this price level.
@@ -855,11 +926,13 @@ impl OwnBookLevel {
     /// # Errors
     ///
     /// Returns an error if the order is not found.
-    pub fn delete(&mut self, client_order_id: &ClientOrderId) -> anyhow::Result<()> {
+    pub fn delete(&mut self, client_order_id: &ClientOrderId) -> Result<(), OwnBookError> {
         if self.orders.shift_remove(client_order_id).is_none() {
-            // TODO: Use a generic anyhow result for now pending specific error types
-            anyhow::bail!("Order {client_order_id} not found for delete");
-        };
+            return Err(OwnBookError::OrderNotFoundAtLevel {
+                client_order_id: *client_order_id,
+                price: self.price,
+            });
+        }
         Ok(())
     }
 }
@@ -884,6 +957,7 @@ impl Ord for OwnBookLevel {
     }
 }
 
+#[must_use]
 pub fn should_handle_own_book_order(order: &OrderAny) -> bool {
     order.has_price()
         && order.time_in_force() != TimeInForce::Ioc

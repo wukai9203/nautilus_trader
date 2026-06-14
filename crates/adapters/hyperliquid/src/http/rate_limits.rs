@@ -13,9 +13,21 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::Value;
+
+use crate::{
+    common::enums::HyperliquidInfoRequestType,
+    http::{
+        models::HyperliquidExecAction,
+        query::{ExchangeAction, ExchangeActionParams, InfoRequest},
+    },
+};
 
 #[derive(Debug)]
 pub struct WeightedLimiter {
@@ -46,6 +58,7 @@ impl WeightedLimiter {
     /// Acquire `weight` tokens, sleeping until available.
     pub async fn acquire(&self, weight: u32) {
         let need = weight as f64;
+
         loop {
             let mut st = self.state.lock().await;
             Self::refill_locked(&mut st, self.refill_per_sec, self.capacity);
@@ -96,45 +109,42 @@ pub struct RateLimitSnapshot {
 }
 
 pub fn backoff_full_jitter(attempt: u32, base: Duration, cap: Duration) -> Duration {
-    use std::{
-        collections::hash_map::DefaultHasher,
-        hash::{Hash, Hasher},
-    };
-
-    // Simple pseudo-random based on attempt and time
     let mut hasher = DefaultHasher::new();
     attempt.hash(&mut hasher);
-    Instant::now().elapsed().as_nanos().hash(&mut hasher);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    nanos.hash(&mut hasher);
     let hash = hasher.finish();
 
     let max = (base.as_millis() as u64)
         .saturating_mul(1u64 << attempt.min(16))
         .min(cap.as_millis() as u64)
         .max(base.as_millis() as u64);
-    Duration::from_millis(hash % max)
+
+    // Floor at 1ms to prevent zero-duration backoff
+    Duration::from_millis((hash % max).max(1))
 }
 
-/// Classify Info requests into weight classes based on request_type.
-/// Since InfoRequest uses struct with request_type string, we match on that.
-pub fn info_base_weight(req: &crate::http::query::InfoRequest) -> u32 {
-    match req.request_type.as_str() {
-        // Cheap (2)
-        "l2Book"
-        | "allMids"
-        | "clearinghouseState"
-        | "orderStatus"
-        | "spotClearinghouseState"
-        | "exchangeStatus" => 2,
-        // Very expensive (60)
-        "userRole" => 60,
-        // Default (20)
+/// Classify Info requests into weight classes based on request type.
+pub fn info_base_weight(req: &InfoRequest) -> u32 {
+    match req.request_type {
+        HyperliquidInfoRequestType::L2Book
+        | HyperliquidInfoRequestType::AllMids
+        | HyperliquidInfoRequestType::ClearinghouseState
+        | HyperliquidInfoRequestType::OrderStatus
+        | HyperliquidInfoRequestType::SpotClearinghouseState
+        | HyperliquidInfoRequestType::ExchangeStatus
+        | HyperliquidInfoRequestType::UserFees => 2,
+        HyperliquidInfoRequestType::UserRole => 60,
         _ => 20,
     }
 }
 
 /// Extra weight for heavy Info endpoints: +1 per 20 (most), +1 per 60 for candleSnapshot.
 /// We count the largest array in the response (robust to schema variants).
-pub fn info_extra_weight(req: &crate::http::query::InfoRequest, json: &Value) -> u32 {
+pub fn info_extra_weight(req: &InfoRequest, json: &Value) -> u32 {
     let items = match json {
         Value::Array(a) => a.len(),
         Value::Object(m) => m
@@ -145,30 +155,27 @@ pub fn info_extra_weight(req: &crate::http::query::InfoRequest, json: &Value) ->
         _ => 0,
     };
 
-    let unit = match req.request_type.as_str() {
-        "candleSnapshot" => 60usize, // +1 per 60
-        "recentTrades"
-        | "historicalOrders"
-        | "userFills"
-        | "userFillsByTime"
-        | "fundingHistory"
-        | "userFunding"
-        | "nonUserFundingUpdates"
-        | "twapHistory"
-        | "userTwapSliceFills"
-        | "userTwapSliceFillsByTime"
-        | "delegatorHistory"
-        | "delegatorRewards"
-        | "validatorStats" => 20usize, // +1 per 20
+    let unit = match req.request_type {
+        HyperliquidInfoRequestType::CandleSnapshot => 60usize,
+        HyperliquidInfoRequestType::HistoricalOrders
+        | HyperliquidInfoRequestType::UserFills
+        | HyperliquidInfoRequestType::UserFillsByTime
+        | HyperliquidInfoRequestType::FundingHistory
+        | HyperliquidInfoRequestType::UserFunding
+        | HyperliquidInfoRequestType::NonUserFundingUpdates
+        | HyperliquidInfoRequestType::TwapHistory
+        | HyperliquidInfoRequestType::UserTwapSliceFills
+        | HyperliquidInfoRequestType::UserTwapSliceFillsByTime
+        | HyperliquidInfoRequestType::DelegatorHistory
+        | HyperliquidInfoRequestType::DelegatorRewards
+        | HyperliquidInfoRequestType::ValidatorStats => 20usize,
         _ => return 0,
     };
     (items / unit) as u32
 }
 
 /// Exchange: 1 + floor(batch_len / 40)
-pub fn exchange_weight(action: &crate::http::query::ExchangeAction) -> u32 {
-    use crate::http::query::ExchangeActionParams;
-
+pub fn exchange_weight(action: &ExchangeAction) -> u32 {
     // Extract batch size from typed params
     let batch_size = match &action.params {
         ExchangeActionParams::Order(params) => params.orders.len(),
@@ -184,15 +191,74 @@ pub fn exchange_weight(action: &crate::http::query::ExchangeAction) -> u32 {
     1 + (batch_size as u32 / 40)
 }
 
+/// Exchange weight for the canonical typed execution action model.
+pub fn exec_action_weight(action: &HyperliquidExecAction) -> u32 {
+    let batch_size = match action {
+        HyperliquidExecAction::Order { orders, .. } => orders.len(),
+        HyperliquidExecAction::Cancel { cancels } => cancels.len(),
+        HyperliquidExecAction::CancelByCloid { cancels } => cancels.len(),
+        HyperliquidExecAction::Modify { .. } => 1,
+        HyperliquidExecAction::BatchModify { modifies } => modifies.len(),
+        HyperliquidExecAction::UpdateLeverage { .. }
+        | HyperliquidExecAction::UpdateIsolatedMargin { .. }
+        | HyperliquidExecAction::ScheduleCancel { .. }
+        | HyperliquidExecAction::UsdClassTransfer { .. }
+        | HyperliquidExecAction::UserOutcome { .. }
+        | HyperliquidExecAction::TwapPlace { .. }
+        | HyperliquidExecAction::TwapCancel { .. }
+        | HyperliquidExecAction::Noop => 0,
+    };
+    1 + (batch_size as u32 / 40)
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal::Decimal;
 
-    use super::*;
+    use super::{
+        super::models::{
+            Cloid, HyperliquidExecAction, HyperliquidExecCancelByCloidRequest,
+            HyperliquidExecCancelOrderRequest, HyperliquidExecGrouping, HyperliquidExecLimitParams,
+            HyperliquidExecModifyOrderRequest, HyperliquidExecOrderKind,
+            HyperliquidExecPlaceOrderRequest, HyperliquidExecTif,
+        },
+        *,
+    };
     use crate::http::query::{
         CancelParams, ExchangeAction, ExchangeActionParams, ExchangeActionType, OrderParams,
         UpdateLeverageParams,
     };
+
+    fn exec_order() -> HyperliquidExecPlaceOrderRequest {
+        HyperliquidExecPlaceOrderRequest {
+            asset: 0,
+            is_buy: true,
+            price: Decimal::new(50000, 0),
+            size: Decimal::new(1, 0),
+            reduce_only: false,
+            kind: HyperliquidExecOrderKind::Limit {
+                limit: HyperliquidExecLimitParams {
+                    tif: HyperliquidExecTif::Gtc,
+                },
+            },
+            cloid: Some(Cloid::from_hex("0x00000000000000000000000000000000").unwrap()),
+        }
+    }
+
+    fn exec_modify() -> HyperliquidExecModifyOrderRequest {
+        HyperliquidExecModifyOrderRequest {
+            oid: 12345,
+            order: exec_order(),
+        }
+    }
+
+    fn exec_cancel_by_cloid() -> HyperliquidExecCancelByCloidRequest {
+        HyperliquidExecCancelByCloidRequest {
+            asset: 0,
+            cloid: Cloid::from_hex("0x00000000000000000000000000000000").unwrap(),
+        }
+    }
 
     #[rstest]
     #[case(1, 1)]
@@ -204,28 +270,8 @@ mod tests {
         #[case] array_len: usize,
         #[case] expected_weight: u32,
     ) {
-        use rust_decimal::Decimal;
-
-        use super::super::models::{
-            Cloid, HyperliquidExecGrouping, HyperliquidExecLimitParams, HyperliquidExecOrderKind,
-            HyperliquidExecPlaceOrderRequest, HyperliquidExecTif,
-        };
-
-        let orders: Vec<HyperliquidExecPlaceOrderRequest> = (0..array_len)
-            .map(|_| HyperliquidExecPlaceOrderRequest {
-                asset: 0,
-                is_buy: true,
-                price: Decimal::new(50000, 0),
-                size: Decimal::new(1, 0),
-                reduce_only: false,
-                kind: HyperliquidExecOrderKind::Limit {
-                    limit: HyperliquidExecLimitParams {
-                        tif: HyperliquidExecTif::Gtc,
-                    },
-                },
-                cloid: Some(Cloid::from_hex("0x00000000000000000000000000000000").unwrap()),
-            })
-            .collect();
+        let orders: Vec<HyperliquidExecPlaceOrderRequest> =
+            (0..array_len).map(|_| exec_order()).collect();
 
         let action = ExchangeAction {
             action_type: ExchangeActionType::Order,
@@ -239,15 +285,104 @@ mod tests {
     }
 
     #[rstest]
-    fn test_exchange_weight_cancel() {
-        use super::super::models::{Cloid, HyperliquidExecCancelByCloidRequest};
+    #[case(1, 1)]
+    #[case(39, 1)]
+    #[case(40, 2)]
+    #[case(79, 2)]
+    #[case(80, 3)]
+    fn test_exec_action_weight_order_steps_every_40(
+        #[case] array_len: usize,
+        #[case] expected_weight: u32,
+    ) {
+        let action = HyperliquidExecAction::Order {
+            orders: (0..array_len).map(|_| exec_order()).collect(),
+            grouping: HyperliquidExecGrouping::Na,
+            builder: None,
+        };
 
-        let cancels: Vec<HyperliquidExecCancelByCloidRequest> = (0..40)
-            .map(|_| HyperliquidExecCancelByCloidRequest {
-                asset: 0,
-                cloid: Cloid::from_hex("0x00000000000000000000000000000000").unwrap(),
-            })
-            .collect();
+        assert_eq!(exec_action_weight(&action), expected_weight);
+    }
+
+    #[rstest]
+    #[case(1, 1)]
+    #[case(39, 1)]
+    #[case(40, 2)]
+    #[case(79, 2)]
+    #[case(80, 3)]
+    fn test_exec_action_weight_cancel_by_oid_steps_every_40(
+        #[case] array_len: usize,
+        #[case] expected_weight: u32,
+    ) {
+        let action = HyperliquidExecAction::Cancel {
+            cancels: (0..array_len)
+                .map(|i| HyperliquidExecCancelOrderRequest {
+                    asset: 0,
+                    oid: i as u64,
+                })
+                .collect(),
+        };
+
+        assert_eq!(exec_action_weight(&action), expected_weight);
+    }
+
+    #[rstest]
+    #[case(1, 1)]
+    #[case(39, 1)]
+    #[case(40, 2)]
+    #[case(79, 2)]
+    #[case(80, 3)]
+    fn test_exec_action_weight_cancel_by_cloid_steps_every_40(
+        #[case] array_len: usize,
+        #[case] expected_weight: u32,
+    ) {
+        let action = HyperliquidExecAction::CancelByCloid {
+            cancels: (0..array_len).map(|_| exec_cancel_by_cloid()).collect(),
+        };
+
+        assert_eq!(exec_action_weight(&action), expected_weight);
+    }
+
+    #[rstest]
+    #[case(1, 1)]
+    #[case(39, 1)]
+    #[case(40, 2)]
+    #[case(79, 2)]
+    #[case(80, 3)]
+    fn test_exec_action_weight_batch_modify_steps_every_40(
+        #[case] array_len: usize,
+        #[case] expected_weight: u32,
+    ) {
+        let action = HyperliquidExecAction::BatchModify {
+            modifies: (0..array_len).map(|_| exec_modify()).collect(),
+        };
+
+        assert_eq!(exec_action_weight(&action), expected_weight);
+    }
+
+    #[rstest]
+    fn test_exec_action_weight_modify() {
+        let action = HyperliquidExecAction::Modify {
+            modify: exec_modify(),
+        };
+
+        assert_eq!(exec_action_weight(&action), 1);
+    }
+
+    #[rstest]
+    fn test_exec_action_weight_non_batch_action() {
+        let action = HyperliquidExecAction::UpdateLeverage {
+            asset: 1,
+            is_cross: true,
+            leverage: 10,
+        };
+
+        assert_eq!(exec_action_weight(&action), 1);
+    }
+
+    #[rstest]
+    fn test_exchange_weight_cancel() {
+        let cancels: Vec<HyperliquidExecCancelByCloidRequest> =
+            (0..40).map(|_| exec_cancel_by_cloid()).collect();
 
         let action = ExchangeAction {
             action_type: ExchangeActionType::Cancel,
@@ -326,7 +461,7 @@ mod tests {
 
         let delay = backoff_full_jitter(attempt, base, cap);
 
-        // Should be in expected ranges (allowing for jitter)
+        assert!(delay.as_millis() >= 1);
         assert!(delay.as_millis() <= max_expected_ms as u128);
     }
 

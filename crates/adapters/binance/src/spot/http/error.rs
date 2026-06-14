@@ -20,7 +20,7 @@ use std::fmt::Display;
 use nautilus_network::http::error::HttpClientError;
 
 // Re-export unified SBE decode error
-pub use crate::common::sbe::SbeDecodeError;
+pub use crate::spot::sbe::SbeDecodeError;
 
 /// Binance Spot HTTP client error type.
 #[derive(Debug)]
@@ -38,6 +38,8 @@ pub enum BinanceSpotHttpError {
     SbeDecodeError(SbeDecodeError),
     /// JSON decode error.
     JsonError(String),
+    /// Response parse error after a venue response was received.
+    ResponseParseError(String),
     /// Request validation error.
     ValidationError(String),
     /// Network or connection error.
@@ -64,6 +66,7 @@ impl Display for BinanceSpotHttpError {
             }
             Self::SbeDecodeError(err) => write!(f, "SBE decode error: {err}"),
             Self::JsonError(msg) => write!(f, "JSON decode error: {msg}"),
+            Self::ResponseParseError(msg) => write!(f, "Response parse error: {msg}"),
             Self::ValidationError(msg) => write!(f, "Validation error: {msg}"),
             Self::NetworkError(msg) => write!(f, "Network error: {msg}"),
             Self::Timeout(msg) => write!(f, "Timeout: {msg}"),

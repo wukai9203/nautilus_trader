@@ -20,30 +20,33 @@ use chrono::{DateTime, Utc};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{
-        Bar, BarType, BookOrder, DEPTH10_LEN, Data, FundingRateUpdate, NULL_ORDER, OrderBookDelta,
+        Bar, BarType, BookOrder, DEPTH10_LEN, Data, FundingRateUpdate, IndexPriceUpdate,
+        MarkPriceUpdate, NULL_ORDER, OptionGreekValues, OptionGreeks, OrderBookDelta,
         OrderBookDeltas, OrderBookDeltas_API, OrderBookDepth10, QuoteTick, TradeTick,
     },
-    enums::{AggregationSource, BookAction, OrderSide, RecordFlag},
+    enums::{AggregationSource, BookAction, GreeksConvention, OrderSide, RecordFlag},
     identifiers::{InstrumentId, TradeId},
     types::{Price, Quantity},
 };
-use uuid::Uuid;
 
 use super::{
     message::{
-        BarMsg, BookChangeMsg, BookLevel, BookSnapshotMsg, DerivativeTickerMsg, TradeMsg, WsMessage,
+        BarMsg, BookChangeMsg, BookLevel, BookSnapshotMsg, DerivativeTickerMsg, OptionSummaryMsg,
+        TradeMsg, WsMessage,
     },
     types::TardisInstrumentMiniInfo,
 };
 use crate::{
+    common::parse::{
+        derive_trade_id, normalize_amount, parse_aggressor_side, parse_bar_spec, parse_book_action,
+    },
     config::BookSnapshotOutput,
-    parse::{normalize_amount, parse_aggressor_side, parse_bar_spec, parse_book_action},
 };
 
 #[must_use]
 pub fn parse_tardis_ws_message(
     msg: WsMessage,
-    info: Arc<TardisInstrumentMiniInfo>,
+    info: &Arc<TardisInstrumentMiniInfo>,
     book_snapshot_output: &BookSnapshotOutput,
 ) -> Option<Data> {
     match msg {
@@ -56,7 +59,7 @@ pub fn parse_tardis_ws_message(
             }
 
             match parse_book_change_msg_as_deltas(
-                msg,
+                &msg,
                 info.price_precision,
                 info.size_precision,
                 info.instrument_id,
@@ -68,10 +71,10 @@ pub fn parse_tardis_ws_message(
                 }
             }
         }
-        WsMessage::BookSnapshot(msg) => match msg.bids.len() {
+        WsMessage::BookSnapshot(msg) => match msg.depth {
             1 => {
                 match parse_book_snapshot_msg_as_quote(
-                    msg,
+                    &msg,
                     info.price_precision,
                     info.size_precision,
                     info.instrument_id,
@@ -86,7 +89,7 @@ pub fn parse_tardis_ws_message(
             _ => match book_snapshot_output {
                 BookSnapshotOutput::Depth10 => {
                     match parse_book_snapshot_msg_as_depth10(
-                        msg,
+                        &msg,
                         info.price_precision,
                         info.size_precision,
                         info.instrument_id,
@@ -100,7 +103,7 @@ pub fn parse_tardis_ws_message(
                 }
                 BookSnapshotOutput::Deltas => {
                     match parse_book_snapshot_msg_as_deltas(
-                        msg,
+                        &msg,
                         info.price_precision,
                         info.size_precision,
                         info.instrument_id,
@@ -116,7 +119,7 @@ pub fn parse_tardis_ws_message(
         },
         WsMessage::Trade(msg) => {
             match parse_trade_msg(
-                msg,
+                &msg,
                 info.price_precision,
                 info.size_precision,
                 info.instrument_id,
@@ -130,7 +133,7 @@ pub fn parse_tardis_ws_message(
         }
         WsMessage::TradeBar(msg) => {
             match parse_bar_msg(
-                msg,
+                &msg,
                 info.price_precision,
                 info.size_precision,
                 info.instrument_id,
@@ -142,6 +145,10 @@ pub fn parse_tardis_ws_message(
                 }
             }
         }
+        WsMessage::OptionSummary(msg) => Some(Data::OptionGreeks(parse_option_summary_msg(
+            &msg,
+            info.instrument_id,
+        ))),
         // Derivative ticker messages are handled through a separate callback path
         // for FundingRateUpdate since they're not part of the Data enum.
         WsMessage::DerivativeTicker(_) => None,
@@ -149,16 +156,124 @@ pub fn parse_tardis_ws_message(
     }
 }
 
+#[must_use]
+pub fn parse_tardis_ws_message_data(
+    msg: WsMessage,
+    info: &Arc<TardisInstrumentMiniInfo>,
+    book_snapshot_output: &BookSnapshotOutput,
+    extract_bbo_as_quotes: bool,
+) -> Vec<Data> {
+    match msg {
+        WsMessage::OptionSummary(msg) if extract_bbo_as_quotes => {
+            let mut data = Vec::with_capacity(2);
+
+            match parse_option_summary_msg_as_quote(
+                &msg,
+                info.price_precision,
+                info.size_precision,
+                info.instrument_id,
+            ) {
+                Ok(Some(quote)) => data.push(Data::Quote(quote)),
+                Ok(None) => {}
+                Err(e) => {
+                    log::error!("Failed to parse option summary quote message: {e}");
+                }
+            }
+
+            data.push(Data::OptionGreeks(parse_option_summary_msg(
+                &msg,
+                info.instrument_id,
+            )));
+            data
+        }
+        msg => parse_tardis_ws_message(msg, info, book_snapshot_output)
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// Parses a Tardis option summary message into a Nautilus `OptionGreeks`.
+///
+/// Greeks absent from the exchange feed default to `0.0` (matching the existing exchange-greeks
+/// producers); implied volatilities, underlying price and open interest stay `None` when the
+/// exchange does not provide them.
+#[must_use]
+pub fn parse_option_summary_msg(
+    msg: &OptionSummaryMsg,
+    instrument_id: InstrumentId,
+) -> OptionGreeks {
+    OptionGreeks {
+        instrument_id,
+        convention: GreeksConvention::BlackScholes,
+        greeks: OptionGreekValues {
+            delta: msg.delta.unwrap_or(0.0),
+            gamma: msg.gamma.unwrap_or(0.0),
+            vega: msg.vega.unwrap_or(0.0),
+            theta: msg.theta.unwrap_or(0.0),
+            rho: msg.rho.unwrap_or(0.0),
+        },
+        mark_iv: msg.mark_iv,
+        bid_iv: msg.best_bid_iv,
+        ask_iv: msg.best_ask_iv,
+        underlying_price: msg.underlying_price,
+        open_interest: msg.open_interest,
+        ts_event: UnixNanos::from(msg.timestamp),
+        ts_init: UnixNanos::from(msg.local_timestamp),
+    }
+}
+
+/// Parses a Tardis option summary best bid/offer into a Nautilus `QuoteTick`.
+///
+/// Returns `Ok(None)` when any best bid/offer field is absent.
+///
+/// # Errors
+///
+/// Returns an error if a provided bid or ask price or size is invalid.
+pub fn parse_option_summary_msg_as_quote(
+    msg: &OptionSummaryMsg,
+    price_precision: u8,
+    size_precision: u8,
+    instrument_id: InstrumentId,
+) -> anyhow::Result<Option<QuoteTick>> {
+    let (Some(best_bid_price), Some(best_bid_amount), Some(best_ask_price), Some(best_ask_amount)) = (
+        msg.best_bid_price,
+        msg.best_bid_amount,
+        msg.best_ask_price,
+        msg.best_ask_amount,
+    ) else {
+        return Ok(None);
+    };
+
+    let bid_price = Price::new_checked(best_bid_price, price_precision)
+        .with_context(|| format!("invalid option summary bid price for message: {msg:?}"))?;
+    let ask_price = Price::new_checked(best_ask_price, price_precision)
+        .with_context(|| format!("invalid option summary ask price for message: {msg:?}"))?;
+    let bid_size = Quantity::non_zero_checked(best_bid_amount, size_precision)
+        .with_context(|| format!("invalid option summary bid size for message: {msg:?}"))?;
+    let ask_size = Quantity::non_zero_checked(best_ask_amount, size_precision)
+        .with_context(|| format!("invalid option summary ask size for message: {msg:?}"))?;
+
+    Ok(Some(QuoteTick::new(
+        instrument_id,
+        bid_price,
+        ask_price,
+        bid_size,
+        ask_size,
+        UnixNanos::from(msg.timestamp),
+        UnixNanos::from(msg.local_timestamp),
+    )))
+}
+
 /// Parse a Tardis WebSocket message specifically for funding rate updates.
 /// Returns `Some(FundingRateUpdate)` if the message contains funding rate data, `None` otherwise.
 #[must_use]
 pub fn parse_tardis_ws_message_funding_rate(
     msg: WsMessage,
-    info: Arc<TardisInstrumentMiniInfo>,
+    info: &Arc<TardisInstrumentMiniInfo>,
 ) -> Option<FundingRateUpdate> {
     match msg {
         WsMessage::DerivativeTicker(msg) => {
-            match parse_derivative_ticker_msg(msg, info.instrument_id) {
+            match parse_derivative_ticker_msg(&msg, info.instrument_id) {
                 Ok(funding_rate) => funding_rate,
                 Err(e) => {
                     log::error!("Failed to parse derivative ticker message for funding rate: {e}");
@@ -177,14 +292,14 @@ pub fn parse_tardis_ws_message_funding_rate(
 ///
 /// Returns an error if timestamp fields cannot be converted to nanoseconds.
 pub fn parse_book_change_msg_as_deltas(
-    msg: BookChangeMsg,
+    msg: &BookChangeMsg,
     price_precision: u8,
     size_precision: u8,
     instrument_id: InstrumentId,
 ) -> anyhow::Result<OrderBookDeltas_API> {
     parse_book_msg_as_deltas(
-        msg.bids,
-        msg.asks,
+        &msg.bids,
+        &msg.asks,
         msg.is_snapshot,
         price_precision,
         size_precision,
@@ -201,14 +316,14 @@ pub fn parse_book_change_msg_as_deltas(
 ///
 /// Returns an error if timestamp fields cannot be converted to nanoseconds.
 pub fn parse_book_snapshot_msg_as_deltas(
-    msg: BookSnapshotMsg,
+    msg: &BookSnapshotMsg,
     price_precision: u8,
     size_precision: u8,
     instrument_id: InstrumentId,
 ) -> anyhow::Result<OrderBookDeltas_API> {
     parse_book_msg_as_deltas(
-        msg.bids,
-        msg.asks,
+        &msg.bids,
+        &msg.asks,
         true,
         price_precision,
         size_precision,
@@ -224,7 +339,7 @@ pub fn parse_book_snapshot_msg_as_deltas(
 ///
 /// Returns an error if timestamp fields cannot be converted to nanoseconds.
 pub fn parse_book_snapshot_msg_as_depth10(
-    msg: BookSnapshotMsg,
+    msg: &BookSnapshotMsg,
     price_precision: u8,
     size_precision: u8,
     instrument_id: InstrumentId,
@@ -280,7 +395,7 @@ pub fn parse_book_snapshot_msg_as_depth10(
         asks,
         bid_counts,
         ask_counts,
-        RecordFlag::F_SNAPSHOT.value(),
+        RecordFlag::F_SNAPSHOT as u8,
         0, // Sequence not available from Tardis
         ts_event,
         ts_init,
@@ -288,15 +403,15 @@ pub fn parse_book_snapshot_msg_as_depth10(
 }
 
 /// Parse raw book levels into order book deltas, returning error for invalid timestamps.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 /// Parse raw book levels into order book deltas.
 ///
 /// # Errors
 ///
 /// Returns an error if timestamp fields cannot be converted to nanoseconds.
 pub fn parse_book_msg_as_deltas(
-    bids: Vec<BookLevel>,
-    asks: Vec<BookLevel>,
+    bids: &[BookLevel],
+    asks: &[BookLevel],
     is_snapshot: bool,
     price_precision: u8,
     size_precision: u8,
@@ -365,7 +480,7 @@ pub fn parse_book_msg_as_deltas(
     }
 
     if let Some(last_delta) = deltas.last_mut() {
-        last_delta.flags |= RecordFlag::F_LAST.value();
+        last_delta.flags |= RecordFlag::F_LAST as u8;
     }
 
     // TODO: Opaque pointer wrapper necessary for Cython (remove once Cython gone)
@@ -380,13 +495,13 @@ pub fn parse_book_msg_as_deltas(
 /// # Errors
 ///
 /// Returns an error if a non-delete action has a zero size after normalization.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn parse_book_level(
     instrument_id: InstrumentId,
     price_precision: u8,
     size_precision: u8,
     side: OrderSide,
-    level: BookLevel,
+    level: &BookLevel,
     is_snapshot: bool,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
@@ -398,7 +513,7 @@ pub fn parse_book_level(
     let order_id = 0; // Not applicable for L2 data
     let order = BookOrder::new(side, price, size, order_id);
     let flags = if is_snapshot {
-        RecordFlag::F_SNAPSHOT.value()
+        RecordFlag::F_SNAPSHOT as u8
     } else {
         0
     };
@@ -427,7 +542,7 @@ pub fn parse_book_level(
 ///
 /// Returns an error if missing bid/ask levels or invalid sizes.
 pub fn parse_book_snapshot_msg_as_quote(
-    msg: BookSnapshotMsg,
+    msg: &BookSnapshotMsg,
     price_precision: u8,
     size_precision: u8,
     instrument_id: InstrumentId,
@@ -469,7 +584,7 @@ pub fn parse_book_snapshot_msg_as_quote(
 ///
 /// Returns an error if invalid trade size is encountered.
 pub fn parse_trade_msg(
-    msg: TradeMsg,
+    msg: &TradeMsg,
     price_precision: u8,
     size_precision: u8,
     instrument_id: InstrumentId,
@@ -478,9 +593,18 @@ pub fn parse_trade_msg(
     let size = Quantity::non_zero_checked(msg.amount, size_precision)
         .with_context(|| format!("Invalid trade size in message: {msg:?}"))?;
     let aggressor_side = parse_aggressor_side(&msg.side);
-    let trade_id = TradeId::new(msg.id.unwrap_or_else(|| Uuid::new_v4().to_string()));
     let ts_event = UnixNanos::from(msg.timestamp);
     let ts_init = UnixNanos::from(msg.local_timestamp);
+    let trade_id = match msg.id.as_deref() {
+        Some(id) if !id.is_empty() => TradeId::new(id),
+        _ => derive_trade_id(
+            msg.symbol,
+            ts_event.as_u64(),
+            msg.price,
+            msg.amount,
+            &msg.side,
+        ),
+    };
 
     Ok(TradeTick::new(
         instrument_id,
@@ -499,7 +623,7 @@ pub fn parse_trade_msg(
 ///
 /// Returns an error if the bar specification cannot be parsed.
 pub fn parse_bar_msg(
-    msg: BarMsg,
+    msg: &BarMsg,
     price_precision: u8,
     size_precision: u8,
     instrument_id: InstrumentId,
@@ -520,21 +644,10 @@ pub fn parse_bar_msg(
     ))
 }
 
-/// Parse a derivative ticker message into a funding rate update.
-///
-/// # Errors
-///
-/// Returns an error if timestamp fields cannot be converted to nanoseconds or decimal conversion fails.
-pub fn parse_derivative_ticker_msg(
-    msg: DerivativeTickerMsg,
-    instrument_id: InstrumentId,
-) -> anyhow::Result<Option<FundingRateUpdate>> {
-    // Only process if we have funding rate data
-    let funding_rate = match msg.funding_rate {
-        Some(rate) => rate,
-        None => return Ok(None), // No funding rate data
-    };
-
+/// Extracts event and init timestamps from a derivative ticker message.
+fn parse_derivative_ticker_timestamps(
+    msg: &DerivativeTickerMsg,
+) -> anyhow::Result<(UnixNanos, UnixNanos)> {
     let ts_event_nanos = msg
         .timestamp
         .timestamp_nanos_opt()
@@ -543,7 +656,6 @@ pub fn parse_derivative_ticker_msg(
         ts_event_nanos >= 0,
         "invalid timestamp: event nanoseconds {ts_event_nanos} is before UNIX epoch"
     );
-    let ts_event = UnixNanos::from(ts_event_nanos as u64);
 
     let ts_init_nanos = msg
         .local_timestamp
@@ -553,18 +665,86 @@ pub fn parse_derivative_ticker_msg(
         ts_init_nanos >= 0,
         "invalid timestamp: init nanoseconds {ts_init_nanos} is before UNIX epoch"
     );
-    let ts_init = UnixNanos::from(ts_init_nanos as u64);
 
+    Ok((
+        UnixNanos::from(ts_event_nanos as u64),
+        UnixNanos::from(ts_init_nanos as u64),
+    ))
+}
+
+/// Parses a derivative ticker message into a funding rate update.
+///
+/// # Errors
+///
+/// Returns an error if timestamp conversion or decimal conversion fails.
+pub fn parse_derivative_ticker_msg(
+    msg: &DerivativeTickerMsg,
+    instrument_id: InstrumentId,
+) -> anyhow::Result<Option<FundingRateUpdate>> {
+    let funding_rate = match msg.funding_rate {
+        Some(rate) => rate,
+        None => return Ok(None),
+    };
+
+    let (ts_event, ts_init) = parse_derivative_ticker_timestamps(msg)?;
     let rate = rust_decimal::Decimal::try_from(funding_rate)
-        .with_context(|| format!("Failed to convert funding rate {funding_rate} to Decimal"))?;
-
-    // For live data, we don't typically have funding timestamp info from derivative ticker
-    let next_funding_ns = None;
+        .with_context(|| format!("failed to convert funding rate {funding_rate} to Decimal"))?;
 
     Ok(Some(FundingRateUpdate::new(
         instrument_id,
         rate,
-        next_funding_ns,
+        None,
+        None,
+        ts_event,
+        ts_init,
+    )))
+}
+
+/// Parses a derivative ticker message into a mark price update.
+///
+/// # Errors
+///
+/// Returns an error if timestamp conversion fails.
+pub fn parse_derivative_ticker_mark_price(
+    msg: &DerivativeTickerMsg,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+) -> anyhow::Result<Option<MarkPriceUpdate>> {
+    let mark_price = match msg.mark_price {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    let (ts_event, ts_init) = parse_derivative_ticker_timestamps(msg)?;
+
+    Ok(Some(MarkPriceUpdate::new(
+        instrument_id,
+        Price::new(mark_price, price_precision),
+        ts_event,
+        ts_init,
+    )))
+}
+
+/// Parses a derivative ticker message into an index price update.
+///
+/// # Errors
+///
+/// Returns an error if timestamp conversion fails.
+pub fn parse_derivative_ticker_index_price(
+    msg: &DerivativeTickerMsg,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+) -> anyhow::Result<Option<IndexPriceUpdate>> {
+    let index_price = match msg.index_price {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    let (ts_event, ts_init) = parse_derivative_ticker_timestamps(msg)?;
+
+    Ok(Some(IndexPriceUpdate::new(
+        instrument_id,
+        Price::new(index_price, price_precision),
         ts_event,
         ts_init,
     )))
@@ -576,7 +756,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::{enums::TardisExchange, tests::load_test_json};
+    use crate::common::{enums::TardisExchange, testing::load_test_json};
 
     #[rstest]
     fn test_parse_book_change_message() {
@@ -587,12 +767,12 @@ mod tests {
         let size_precision = 0;
         let instrument_id = InstrumentId::from("XBTUSD.BITMEX");
         let deltas =
-            parse_book_change_msg_as_deltas(msg, price_precision, size_precision, instrument_id)
+            parse_book_change_msg_as_deltas(&msg, price_precision, size_precision, instrument_id)
                 .unwrap();
 
         assert_eq!(deltas.deltas.len(), 1);
         assert_eq!(deltas.instrument_id, instrument_id);
-        assert_eq!(deltas.flags, RecordFlag::F_LAST.value());
+        assert_eq!(deltas.flags, RecordFlag::F_LAST as u8);
         assert_eq!(deltas.sequence, 0);
         assert_eq!(deltas.ts_event, UnixNanos::from(1571830193469000000));
         assert_eq!(deltas.ts_init, UnixNanos::from(1571830193469000000));
@@ -604,7 +784,7 @@ mod tests {
         assert_eq!(deltas.deltas[0].order.price, Price::from("7985"));
         assert_eq!(deltas.deltas[0].order.size, Quantity::from(283318));
         assert_eq!(deltas.deltas[0].order.order_id, 0);
-        assert_eq!(deltas.deltas[0].flags, RecordFlag::F_LAST.value());
+        assert_eq!(deltas.deltas[0].flags, RecordFlag::F_LAST as u8);
         assert_eq!(deltas.deltas[0].sequence, 0);
         assert_eq!(
             deltas.deltas[0].ts_event,
@@ -625,7 +805,7 @@ mod tests {
         let size_precision = 0;
         let instrument_id = InstrumentId::from("XBTUSD.BITMEX");
         let deltas =
-            parse_book_snapshot_msg_as_deltas(msg, price_precision, size_precision, instrument_id)
+            parse_book_snapshot_msg_as_deltas(&msg, price_precision, size_precision, instrument_id)
                 .unwrap();
 
         let clear_delta = deltas.deltas[0];
@@ -636,7 +816,7 @@ mod tests {
         assert_eq!(deltas.instrument_id, instrument_id);
         assert_eq!(
             deltas.flags,
-            RecordFlag::F_LAST.value() + RecordFlag::F_SNAPSHOT.value()
+            RecordFlag::F_LAST as u8 + RecordFlag::F_SNAPSHOT as u8
         );
         assert_eq!(deltas.sequence, 0);
         assert_eq!(deltas.ts_event, UnixNanos::from(1572010786950000000));
@@ -645,7 +825,7 @@ mod tests {
         // CLEAR delta
         assert_eq!(clear_delta.instrument_id, instrument_id);
         assert_eq!(clear_delta.action, BookAction::Clear);
-        assert_eq!(clear_delta.flags, RecordFlag::F_SNAPSHOT.value());
+        assert_eq!(clear_delta.flags, RecordFlag::F_SNAPSHOT as u8);
         assert_eq!(clear_delta.sequence, 0);
         assert_eq!(clear_delta.ts_event, UnixNanos::from(1572010786950000000));
         assert_eq!(clear_delta.ts_init, UnixNanos::from(1572010786961000000));
@@ -657,7 +837,7 @@ mod tests {
         assert_eq!(bid_delta.order.price, Price::from("7633.5"));
         assert_eq!(bid_delta.order.size, Quantity::from(1906067));
         assert_eq!(bid_delta.order.order_id, 0);
-        assert_eq!(bid_delta.flags, RecordFlag::F_SNAPSHOT.value());
+        assert_eq!(bid_delta.flags, RecordFlag::F_SNAPSHOT as u8);
         assert_eq!(bid_delta.sequence, 0);
         assert_eq!(bid_delta.ts_event, UnixNanos::from(1572010786950000000));
         assert_eq!(bid_delta.ts_init, UnixNanos::from(1572010786961000000));
@@ -669,7 +849,7 @@ mod tests {
         assert_eq!(ask_delta.order.price, Price::from("7634.0"));
         assert_eq!(ask_delta.order.size, Quantity::from(1467849));
         assert_eq!(ask_delta.order.order_id, 0);
-        assert_eq!(ask_delta.flags, RecordFlag::F_SNAPSHOT.value());
+        assert_eq!(ask_delta.flags, RecordFlag::F_SNAPSHOT as u8);
         assert_eq!(ask_delta.sequence, 0);
         assert_eq!(ask_delta.ts_event, UnixNanos::from(1572010786950000000));
         assert_eq!(ask_delta.ts_init, UnixNanos::from(1572010786961000000));
@@ -684,12 +864,16 @@ mod tests {
         let size_precision = 0;
         let instrument_id = InstrumentId::from("XBTUSD.BITMEX");
 
-        let depth10 =
-            parse_book_snapshot_msg_as_depth10(msg, price_precision, size_precision, instrument_id)
-                .unwrap();
+        let depth10 = parse_book_snapshot_msg_as_depth10(
+            &msg,
+            price_precision,
+            size_precision,
+            instrument_id,
+        )
+        .unwrap();
 
         assert_eq!(depth10.instrument_id, instrument_id);
-        assert_eq!(depth10.flags, RecordFlag::F_SNAPSHOT.value());
+        assert_eq!(depth10.flags, RecordFlag::F_SNAPSHOT as u8);
         assert_eq!(depth10.sequence, 0);
         assert_eq!(depth10.ts_event, UnixNanos::from(1572010786950000000));
         assert_eq!(depth10.ts_init, UnixNanos::from(1572010786961000000));
@@ -736,7 +920,7 @@ mod tests {
         let size_precision = 0;
         let instrument_id = InstrumentId::from("XBTUSD.BITMEX");
         let quote =
-            parse_book_snapshot_msg_as_quote(msg, price_precision, size_precision, instrument_id)
+            parse_book_snapshot_msg_as_quote(&msg, price_precision, size_precision, instrument_id)
                 .expect("Failed to parse book snapshot quote message");
 
         assert_eq!(quote.instrument_id, instrument_id);
@@ -756,7 +940,7 @@ mod tests {
         let price_precision = 0;
         let size_precision = 0;
         let instrument_id = InstrumentId::from("XBTUSD.BITMEX");
-        let trade = parse_trade_msg(msg, price_precision, size_precision, instrument_id)
+        let trade = parse_trade_msg(&msg, price_precision, size_precision, instrument_id)
             .expect("Failed to parse trade message");
 
         assert_eq!(trade.instrument_id, instrument_id);
@@ -767,6 +951,41 @@ mod tests {
         assert_eq!(trade.ts_init, UnixNanos::from(1571826769740000000));
     }
 
+    fn build_trade_msg_without_id() -> TradeMsg {
+        let json_data = load_test_json("trade.json");
+        let mut msg: TradeMsg = serde_json::from_str(&json_data).unwrap();
+        msg.id = None;
+        msg
+    }
+
+    #[rstest]
+    fn test_parse_trade_message_derives_trade_id_when_missing() {
+        let instrument_id = InstrumentId::from("XBTUSD.BITMEX");
+
+        let first = parse_trade_msg(&build_trade_msg_without_id(), 0, 0, instrument_id).unwrap();
+        let second = parse_trade_msg(&build_trade_msg_without_id(), 0, 0, instrument_id).unwrap();
+
+        assert_eq!(first.trade_id, second.trade_id, "derivation must be stable");
+        assert_eq!(first.trade_id.as_str().len(), 16);
+
+        let mut altered = build_trade_msg_without_id();
+        altered.price = 7997.0;
+        let altered_trade = parse_trade_msg(&altered, 0, 0, instrument_id).unwrap();
+        assert_ne!(first.trade_id, altered_trade.trade_id);
+    }
+
+    #[rstest]
+    fn test_parse_trade_message_derives_trade_id_when_empty() {
+        let instrument_id = InstrumentId::from("XBTUSD.BITMEX");
+
+        let mut msg = build_trade_msg_without_id();
+        msg.id = Some(String::new());
+
+        let trade = parse_trade_msg(&msg, 0, 0, instrument_id).unwrap();
+        let fallback = parse_trade_msg(&build_trade_msg_without_id(), 0, 0, instrument_id).unwrap();
+        assert_eq!(trade.trade_id, fallback.trade_id);
+    }
+
     #[rstest]
     fn test_parse_bar_message() {
         let json_data = load_test_json("bar.json");
@@ -775,11 +994,11 @@ mod tests {
         let price_precision = 1;
         let size_precision = 0;
         let instrument_id = InstrumentId::from("XBTUSD.BITMEX");
-        let bar = parse_bar_msg(msg, price_precision, size_precision, instrument_id).unwrap();
+        let bar = parse_bar_msg(&msg, price_precision, size_precision, instrument_id).unwrap();
 
         assert_eq!(
             bar.bar_type,
-            BarType::from("XBTUSD.BITMEX-10000-MILLISECOND-LAST-EXTERNAL")
+            BarType::from("XBTUSD.BITMEX-10-SECOND-LAST-EXTERNAL")
         );
         assert_eq!(bar.open, Price::from("7623.5"));
         assert_eq!(bar.high, Price::from("7623.5"));
@@ -805,7 +1024,39 @@ mod tests {
             0,
         ));
 
-        let result = parse_tardis_ws_message(ws_msg, info, &BookSnapshotOutput::Depth10);
+        let result = parse_tardis_ws_message(ws_msg, &info, &BookSnapshotOutput::Depth10);
+
+        assert!(result.is_some());
+        assert!(matches!(result.unwrap(), Data::Depth10(_)));
+    }
+
+    #[rstest]
+    fn test_parse_tardis_ws_message_sparse_book_snapshot_routes_to_depth10() {
+        let json_data = r#"{
+            "type": "book_snapshot",
+            "symbol": "ETC",
+            "exchange": "hyperliquid",
+            "name": "book_snapshot_20_10s",
+            "depth": 20,
+            "interval": 10000,
+            "bids": [{"price": 20.002, "amount": 5.81}],
+            "asks": [{"price": 20.003, "amount": 162.45}, {}],
+            "timestamp": "2025-03-03T10:48:10.000Z",
+            "localTimestamp": "2025-03-03T10:48:10.596818Z"
+        }"#;
+        let msg: BookSnapshotMsg = serde_json::from_str(json_data).unwrap();
+        let ws_msg = WsMessage::BookSnapshot(msg);
+
+        let instrument_id = InstrumentId::from("ETC.HYPERLIQUID");
+        let info = Arc::new(TardisInstrumentMiniInfo::new(
+            instrument_id,
+            None,
+            TardisExchange::Hyperliquid,
+            3,
+            2,
+        ));
+
+        let result = parse_tardis_ws_message(ws_msg, &info, &BookSnapshotOutput::Depth10);
 
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), Data::Depth10(_)));
@@ -826,9 +1077,326 @@ mod tests {
             0,
         ));
 
-        let result = parse_tardis_ws_message(ws_msg, info, &BookSnapshotOutput::Deltas);
+        let result = parse_tardis_ws_message(ws_msg, &info, &BookSnapshotOutput::Deltas);
 
         assert!(result.is_some());
         assert!(matches!(result.unwrap(), Data::Deltas(_)));
+    }
+
+    #[rstest]
+    fn test_parse_tardis_ws_message_option_summary_routes_to_option_greeks() {
+        let json_data = load_test_json("option_summary.json");
+        let msg: OptionSummaryMsg = serde_json::from_str(&json_data).unwrap();
+        let ts_event = UnixNanos::from(msg.timestamp);
+        let ts_init = UnixNanos::from(msg.local_timestamp);
+        let ws_msg = WsMessage::OptionSummary(msg);
+
+        let instrument_id = InstrumentId::from("BTC-28JUN24-70000-C.DERIBIT");
+        let info = Arc::new(TardisInstrumentMiniInfo::new(
+            instrument_id,
+            None,
+            TardisExchange::Deribit,
+            4,
+            1,
+        ));
+
+        let result = parse_tardis_ws_message(ws_msg, &info, &BookSnapshotOutput::Deltas);
+
+        let Some(Data::OptionGreeks(greeks)) = result else {
+            panic!("Expected Data::OptionGreeks, was {result:?}");
+        };
+        assert_eq!(greeks.instrument_id, instrument_id);
+        assert_eq!(greeks.convention, GreeksConvention::BlackScholes);
+        assert_eq!(greeks.greeks.delta, 0.25);
+        assert_eq!(greeks.greeks.gamma, 0.00002);
+        assert_eq!(greeks.greeks.vega, 45.5);
+        assert_eq!(greeks.greeks.theta, -15.2);
+        assert_eq!(greeks.greeks.rho, 0.05);
+        assert_eq!(greeks.mark_iv, Some(0.565));
+        assert_eq!(greeks.bid_iv, Some(0.55));
+        assert_eq!(greeks.ask_iv, Some(0.58));
+        assert_eq!(greeks.underlying_price, Some(63_500.0));
+        assert_eq!(greeks.open_interest, Some(150.0));
+        assert_eq!(greeks.ts_event, ts_event);
+        assert_eq!(greeks.ts_init, ts_init);
+    }
+
+    #[rstest]
+    fn test_parse_tardis_ws_message_data_extracts_option_summary_quote_when_enabled() {
+        let json_data = load_test_json("option_summary.json");
+        let msg: OptionSummaryMsg = serde_json::from_str(&json_data).unwrap();
+        let ts_event = UnixNanos::from(msg.timestamp);
+        let ts_init = UnixNanos::from(msg.local_timestamp);
+        let ws_msg = WsMessage::OptionSummary(msg);
+
+        let instrument_id = InstrumentId::from("BTC-28JUN24-70000-C.DERIBIT");
+        let info = Arc::new(TardisInstrumentMiniInfo::new(
+            instrument_id,
+            None,
+            TardisExchange::Deribit,
+            4,
+            1,
+        ));
+
+        let data = parse_tardis_ws_message_data(ws_msg, &info, &BookSnapshotOutput::Deltas, true);
+
+        assert_eq!(data.len(), 2);
+        let Data::Quote(quote) = &data[0] else {
+            panic!("Expected first data item to be QuoteTick");
+        };
+        let Data::OptionGreeks(greeks) = &data[1] else {
+            panic!("Expected second data item to be OptionGreeks");
+        };
+        assert_eq!(quote.instrument_id, instrument_id);
+        assert_eq!(quote.bid_price, Price::from("0.035"));
+        assert_eq!(quote.bid_size, Quantity::from("5"));
+        assert_eq!(quote.ask_price, Price::from("0.04"));
+        assert_eq!(quote.ask_size, Quantity::from("10"));
+        assert_eq!(quote.ts_event, ts_event);
+        assert_eq!(quote.ts_init, ts_init);
+        assert_eq!(greeks.instrument_id, instrument_id);
+        assert_eq!(greeks.ts_event, ts_event);
+        assert_eq!(greeks.ts_init, ts_init);
+    }
+
+    #[rstest]
+    fn test_parse_tardis_ws_message_data_skips_option_summary_quote_when_disabled() {
+        let json_data = load_test_json("option_summary.json");
+        let msg: OptionSummaryMsg = serde_json::from_str(&json_data).unwrap();
+        let ws_msg = WsMessage::OptionSummary(msg);
+
+        let instrument_id = InstrumentId::from("BTC-28JUN24-70000-C.DERIBIT");
+        let info = Arc::new(TardisInstrumentMiniInfo::new(
+            instrument_id,
+            None,
+            TardisExchange::Deribit,
+            4,
+            1,
+        ));
+
+        let data = parse_tardis_ws_message_data(ws_msg, &info, &BookSnapshotOutput::Deltas, false);
+
+        assert_eq!(data.len(), 1);
+        assert!(
+            matches!(data[0], Data::OptionGreeks(_)),
+            "Expected OptionGreeks, was {:?}",
+            data[0]
+        );
+    }
+
+    #[rstest]
+    fn test_parse_tardis_ws_message_data_skips_option_summary_quote_when_bbo_missing() {
+        let json_data = load_test_json("option_summary.json");
+        let mut msg: OptionSummaryMsg = serde_json::from_str(&json_data).unwrap();
+        msg.best_ask_price = None;
+        let ws_msg = WsMessage::OptionSummary(msg);
+
+        let instrument_id = InstrumentId::from("BTC-28JUN24-70000-C.DERIBIT");
+        let info = Arc::new(TardisInstrumentMiniInfo::new(
+            instrument_id,
+            None,
+            TardisExchange::Deribit,
+            4,
+            1,
+        ));
+
+        let data = parse_tardis_ws_message_data(ws_msg, &info, &BookSnapshotOutput::Deltas, true);
+
+        assert_eq!(data.len(), 1);
+        assert!(
+            matches!(data[0], Data::OptionGreeks(_)),
+            "Expected OptionGreeks, was {:?}",
+            data[0]
+        );
+    }
+
+    #[rstest]
+    fn test_parse_tardis_ws_message_data_keeps_option_summary_when_bbo_size_invalid() {
+        let json_data = load_test_json("option_summary.json");
+        let mut msg: OptionSummaryMsg = serde_json::from_str(&json_data).unwrap();
+        let ts_event = UnixNanos::from(msg.timestamp);
+        let ts_init = UnixNanos::from(msg.local_timestamp);
+        msg.best_bid_amount = Some(0.0);
+        let ws_msg = WsMessage::OptionSummary(msg);
+
+        let instrument_id = InstrumentId::from("BTC-28JUN24-70000-C.DERIBIT");
+        let info = Arc::new(TardisInstrumentMiniInfo::new(
+            instrument_id,
+            None,
+            TardisExchange::Deribit,
+            4,
+            1,
+        ));
+
+        let data = parse_tardis_ws_message_data(ws_msg, &info, &BookSnapshotOutput::Deltas, true);
+
+        assert_eq!(data.len(), 1);
+        let Data::OptionGreeks(greeks) = &data[0] else {
+            panic!("Expected OptionGreeks, was {:?}", data[0]);
+        };
+        assert_eq!(greeks.instrument_id, instrument_id);
+        assert_eq!(greeks.ts_event, ts_event);
+        assert_eq!(greeks.ts_init, ts_init);
+    }
+
+    #[rstest]
+    fn test_parse_tardis_ws_message_data_keeps_option_summary_when_bbo_price_invalid() {
+        let json_data = load_test_json("option_summary.json");
+        let mut msg: OptionSummaryMsg = serde_json::from_str(&json_data).unwrap();
+        let ts_event = UnixNanos::from(msg.timestamp);
+        let ts_init = UnixNanos::from(msg.local_timestamp);
+        msg.best_bid_price = Some(f64::MAX);
+        let ws_msg = WsMessage::OptionSummary(msg);
+
+        let instrument_id = InstrumentId::from("BTC-28JUN24-70000-C.DERIBIT");
+        let info = Arc::new(TardisInstrumentMiniInfo::new(
+            instrument_id,
+            None,
+            TardisExchange::Deribit,
+            4,
+            1,
+        ));
+
+        let data = parse_tardis_ws_message_data(ws_msg, &info, &BookSnapshotOutput::Deltas, true);
+
+        assert_eq!(data.len(), 1);
+        let Data::OptionGreeks(greeks) = &data[0] else {
+            panic!("Expected OptionGreeks, was {:?}", data[0]);
+        };
+        assert_eq!(greeks.instrument_id, instrument_id);
+        assert_eq!(greeks.ts_event, ts_event);
+        assert_eq!(greeks.ts_init, ts_init);
+    }
+
+    #[rstest]
+    fn test_parse_option_summary_msg_defaults_absent_fields() {
+        let ts = DateTime::parse_from_rfc3339("2024-01-15T10:30:00.123Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let msg = OptionSummaryMsg {
+            symbol: ustr::Ustr::from("BTC-28JUN24-70000-C"),
+            exchange: TardisExchange::Deribit,
+            option_type: "call".to_string(),
+            strike_price: 70_000.0,
+            expiration_date: ts,
+            best_bid_price: None,
+            best_bid_amount: None,
+            best_bid_iv: None,
+            best_ask_price: None,
+            best_ask_amount: None,
+            best_ask_iv: None,
+            last_price: None,
+            open_interest: None,
+            mark_price: None,
+            mark_iv: None,
+            delta: None,
+            gamma: None,
+            vega: None,
+            theta: None,
+            rho: None,
+            underlying_price: None,
+            underlying_index: "BTC-USD".to_string(),
+            timestamp: ts,
+            local_timestamp: ts,
+        };
+
+        let instrument_id = InstrumentId::from("BTC-28JUN24-70000-C.DERIBIT");
+        let greeks = parse_option_summary_msg(&msg, instrument_id);
+
+        // Absent greeks default to 0.0; absent IVs, underlying and open interest stay None.
+        assert_eq!(greeks.greeks.delta, 0.0);
+        assert_eq!(greeks.greeks.gamma, 0.0);
+        assert_eq!(greeks.greeks.vega, 0.0);
+        assert_eq!(greeks.greeks.theta, 0.0);
+        assert_eq!(greeks.greeks.rho, 0.0);
+        assert_eq!(greeks.mark_iv, None);
+        assert_eq!(greeks.bid_iv, None);
+        assert_eq!(greeks.ask_iv, None);
+        assert_eq!(greeks.underlying_price, None);
+        assert_eq!(greeks.open_interest, None);
+    }
+
+    #[rstest]
+    fn test_parse_derivative_ticker_funding_rate() {
+        let json_data = load_test_json("derivative_ticker.json");
+        let msg: DerivativeTickerMsg = serde_json::from_str(&json_data).unwrap();
+
+        let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+
+        let result = parse_derivative_ticker_msg(&msg, instrument_id).unwrap();
+        assert!(result.is_some());
+
+        let funding = result.unwrap();
+        assert_eq!(funding.instrument_id, instrument_id);
+        assert_eq!(funding.rate.to_string(), "-0.00001568");
+        assert!(funding.ts_event.as_u64() > 0);
+        assert!(funding.ts_init.as_u64() > 0);
+    }
+
+    #[rstest]
+    fn test_parse_derivative_ticker_mark_price() {
+        let json_data = load_test_json("derivative_ticker.json");
+        let msg: DerivativeTickerMsg = serde_json::from_str(&json_data).unwrap();
+
+        let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+        let price_precision = 2;
+
+        let result =
+            parse_derivative_ticker_mark_price(&msg, instrument_id, price_precision).unwrap();
+        assert!(result.is_some());
+
+        let mark = result.unwrap();
+        assert_eq!(mark.instrument_id, instrument_id);
+        assert_eq!(mark.value, Price::new(7987.56, price_precision));
+        assert!(mark.ts_event.as_u64() > 0);
+        assert!(mark.ts_init.as_u64() > 0);
+    }
+
+    #[rstest]
+    fn test_parse_derivative_ticker_index_price() {
+        let json_data = load_test_json("derivative_ticker.json");
+        let msg: DerivativeTickerMsg = serde_json::from_str(&json_data).unwrap();
+
+        let instrument_id = InstrumentId::from("BTC-PERPETUAL.DERIBIT");
+        let price_precision = 2;
+
+        let result =
+            parse_derivative_ticker_index_price(&msg, instrument_id, price_precision).unwrap();
+        assert!(result.is_some());
+
+        let index = result.unwrap();
+        assert_eq!(index.instrument_id, instrument_id);
+        assert_eq!(index.value, Price::new(7989.28, price_precision));
+        assert!(index.ts_event.as_u64() > 0);
+        assert!(index.ts_init.as_u64() > 0);
+    }
+
+    #[rstest]
+    fn test_parse_derivative_ticker_missing_fields() {
+        // Test with minimal data (only funding_rate, no mark/index)
+        let json = r#"{
+            "type": "derivative_ticker",
+            "symbol": "BTCUSD",
+            "exchange": "bitmex",
+            "lastPrice": null,
+            "openInterest": null,
+            "fundingRate": 0.0001,
+            "indexPrice": null,
+            "markPrice": null,
+            "timestamp": "2024-01-01T00:00:00.000Z",
+            "localTimestamp": "2024-01-01T00:00:00.100Z"
+        }"#;
+        let msg: DerivativeTickerMsg = serde_json::from_str(json).unwrap();
+
+        let instrument_id = InstrumentId::from("BTCUSD.BITMEX");
+
+        let funding = parse_derivative_ticker_msg(&msg, instrument_id).unwrap();
+        assert!(funding.is_some());
+
+        let mark = parse_derivative_ticker_mark_price(&msg, instrument_id, 1).unwrap();
+        assert!(mark.is_none());
+
+        let index = parse_derivative_ticker_index_price(&msg, instrument_id, 1).unwrap();
+        assert!(index.is_none());
     }
 }

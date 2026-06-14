@@ -20,7 +20,7 @@
 //! active `LogGuard` instances, ensuring the logging thread completes all pending writes before
 //! termination.
 //!
-//! # LogGuard Reference Counting
+//! # `LogGuard` reference counting
 //!
 //! The logging system maintains a global count of active `LogGuard` instances using an atomic
 //! counter (`LOGGING_GUARDS_ACTIVE`). When a `LogGuard` is created, the counter is incremented,
@@ -129,6 +129,40 @@ pub fn logging_shutdown() {
     crate::logging::logger::shutdown_graceful();
 }
 
+/// Arms shutdown-on-error handling for the current run.
+pub fn arm_shutdown_on_error(enabled: bool) {
+    crate::logging::logger::arm_shutdown_on_error(enabled);
+}
+
+/// Disarms shutdown-on-error handling.
+pub fn disarm_shutdown_on_error() {
+    crate::logging::logger::disarm_shutdown_on_error();
+}
+
+/// Returns and clears the pending shutdown-on-error trigger, if one was recorded.
+pub fn take_shutdown_on_error_trigger() -> Option<crate::logging::logger::ShutdownOnErrorTrigger> {
+    crate::logging::logger::take_shutdown_on_error_trigger()
+}
+
+/// Conditionally drains the pending shutdown-on-error trigger.
+pub fn try_drain_shutdown_on_error_trigger<F>(drain: F) -> bool
+where
+    F: FnOnce(&crate::logging::logger::ShutdownOnErrorTrigger) -> bool,
+{
+    crate::logging::logger::try_drain_shutdown_on_error_trigger(drain)
+}
+
+/// Flushes and syncs file logs to disk.
+///
+/// This is a no-op when logging is not initialized or file logging is disabled.
+///
+/// # Errors
+///
+/// Returns an error if the sync request cannot be delivered or acknowledged.
+pub fn logging_sync_to_disk() -> anyhow::Result<()> {
+    crate::logging::logger::sync_to_disk()
+}
+
 /// Returns whether the core logger is using ANSI colors.
 pub fn logging_is_colored() -> bool {
     LOGGING_COLORED.load(Ordering::Relaxed)
@@ -157,14 +191,8 @@ pub fn logging_clock_set_static_time(time_ns: u64) {
 /// Logging can be configured to filter components and write up to a specific level only
 /// by passing a configuration using the `NAUTILUS_LOG` environment variable.
 ///
-/// # Safety
-///
 /// Should only be called once during an applications run, ideally at the
 /// beginning of the run.
-///
-/// Logging should be used for Python and sync Rust logic which is most of
-/// the components in the `nautilus_trader` package.
-/// Logging can be configured via the `NAUTILUS_LOG` environment variable.
 ///
 /// # Errors
 ///
@@ -215,6 +243,7 @@ pub fn parse_component_levels(
     match original_map {
         Some(map) => {
             let mut new_map = AHashMap::new();
+
             for (key, value) in map {
                 let ustr_key = Ustr::from(&key);
                 let s = value.as_str().ok_or_else(|| {

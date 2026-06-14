@@ -20,7 +20,7 @@ use nautilus_core::UnixNanos;
 use super::ladder::BookPrice;
 use crate::{
     enums::{BookType, OrderSide},
-    identifiers::InstrumentId,
+    identifiers::{ClientOrderId, InstrumentId},
 };
 
 #[derive(thiserror::Error, Debug, PartialEq)]
@@ -49,4 +49,31 @@ pub enum BookIntegrityError {
     TooManyLevels(OrderSide, usize),
     #[error("Integrity error: instrument ID mismatch: book={0}, delta={1}")]
     InstrumentMismatch(InstrumentId, InstrumentId),
+}
+
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub enum BookViewError {
+    #[error("Instrument ID mismatch: book={0}, own_book={1}")]
+    InstrumentMismatch(InstrumentId, InstrumentId),
+
+    #[error("Opposite own book must have different instrument ID: book={0}, opposite={1}")]
+    OppositeInstrumentMatch(InstrumentId, InstrumentId),
+}
+
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub enum OwnBookError {
+    #[error("Own book order not found in cache: client_order_id={client_order_id}")]
+    OrderNotFoundInCache { client_order_id: ClientOrderId },
+    #[error("Own book cached level missing: client_order_id={client_order_id}, price={price:?}")]
+    CachedLevelMissing {
+        client_order_id: ClientOrderId,
+        price: BookPrice,
+    },
+    #[error(
+        "Own book order not found at level: client_order_id={client_order_id}, price={price:?}"
+    )]
+    OrderNotFoundAtLevel {
+        client_order_id: ClientOrderId,
+        price: BookPrice,
+    },
 }

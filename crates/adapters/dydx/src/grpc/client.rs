@@ -18,29 +18,32 @@
 //! This module provides the main gRPC client for interacting with dYdX v4 validator nodes.
 //! It handles transaction signing, broadcasting, and querying account state.
 
-use prost::Message as ProstMessage;
+use cosmrs::Tx;
 use tonic::transport::Channel;
 
 use crate::{
     error::DydxError,
     proto::{
         AccountAuthenticator, AccountPlusClient, GetAuthenticatorsRequest,
-        cosmos_sdk_proto::cosmos::{
-            auth::v1beta1::{
-                BaseAccount, QueryAccountRequest, query_client::QueryClient as AuthClient,
-            },
-            bank::v1beta1::{QueryAllBalancesRequest, query_client::QueryClient as BankClient},
-            base::{
-                tendermint::v1beta1::{
-                    Block, GetLatestBlockRequest, GetNodeInfoRequest, GetNodeInfoResponse,
-                    service_client::ServiceClient as BaseClient,
+        cosmos_sdk_proto::{
+            cosmos::{
+                auth::v1beta1::{
+                    BaseAccount, QueryAccountRequest, query_client::QueryClient as AuthClient,
                 },
-                v1beta1::Coin,
+                bank::v1beta1::{QueryAllBalancesRequest, query_client::QueryClient as BankClient},
+                base::{
+                    tendermint::v1beta1::{
+                        Block, GetLatestBlockRequest, GetNodeInfoRequest, GetNodeInfoResponse,
+                        service_client::ServiceClient as BaseClient,
+                    },
+                    v1beta1::Coin,
+                },
+                tx::v1beta1::{
+                    BroadcastMode, BroadcastTxRequest, GetTxRequest, SimulateRequest,
+                    service_client::ServiceClient as TxClient,
+                },
             },
-            tx::v1beta1::{
-                BroadcastMode, BroadcastTxRequest, GetTxRequest, SimulateRequest,
-                service_client::ServiceClient as TxClient,
-            },
+            traits::Message as ProstMessage,
         },
         dydxprotocol::{
             clob::{ClobPair, QueryAllClobPairRequest, query_client::QueryClient as ClobClient},
@@ -91,7 +94,9 @@ impl DydxGrpcClient {
     /// Returns an error if the gRPC connection cannot be established.
     pub async fn new(grpc_url: String) -> Result<Self, DydxError> {
         let mut endpoint = Channel::from_shared(grpc_url.clone())
-            .map_err(|e| DydxError::Config(format!("Invalid gRPC URL: {e}")))?;
+            .map_err(|e| DydxError::Config(format!("Invalid gRPC URL: {e}")))?
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30));
 
         // Enable TLS for HTTPS URLs (required for public gRPC nodes)
         if grpc_url.starts_with("https://") {
@@ -201,7 +206,9 @@ impl DydxGrpcClient {
             let mut endpoint = match Channel::from_shared(url_str.to_string())
                 .map_err(|e| DydxError::Config(format!("Invalid gRPC URL: {e}")))
             {
-                Ok(ep) => ep,
+                Ok(ep) => ep
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .timeout(std::time::Duration::from_secs(30)),
                 Err(e) => {
                     last_error = Some(e);
                     continue;
@@ -495,7 +502,7 @@ impl DydxGrpcClient {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub async fn get_tx(&mut self, hash: &str) -> Result<cosmrs::Tx, anyhow::Error> {
+    pub async fn get_tx(&mut self, hash: &str) -> Result<Tx, anyhow::Error> {
         let req = GetTxRequest {
             hash: hash.to_string(),
         };
@@ -504,7 +511,7 @@ impl DydxGrpcClient {
         if let Some(tx) = response.tx {
             // Convert through bytes since the types are incompatible
             let tx_bytes = tx.encode_to_vec();
-            cosmrs::Tx::try_from(tx_bytes.as_slice()).map_err(|e| anyhow::anyhow!("{e}"))
+            Tx::try_from(tx_bytes.as_slice()).map_err(|e| anyhow::anyhow!("{e}"))
         } else {
             anyhow::bail!("Transaction not found")
         }

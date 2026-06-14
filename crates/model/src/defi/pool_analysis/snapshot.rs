@@ -14,6 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use alloy_primitives::{U160, U256};
+use nautilus_core::UnixNanos;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -25,12 +26,16 @@ use crate::{
 
 /// Complete snapshot of a liquidity pool's state at a specific point in time.
 ///
-/// `PoolSnapshot` provides a comprehensive, self-contained representation of a pool's
+/// `PoolSnapshot` provides a self-contained representation of a pool's
 /// entire state, bundling together the global state variables, all liquidity positions,
 /// and the complete tick distribution.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PoolSnapshot {
@@ -46,10 +51,18 @@ pub struct PoolSnapshot {
     pub analytics: PoolAnalytics,
     /// Block position where this snapshot was taken.
     pub block_position: BlockPosition,
+    /// UNIX timestamp (nanoseconds) when the snapshot event occurred.
+    #[serde(default)]
+    pub ts_event: UnixNanos,
+    /// UNIX timestamp (nanoseconds) when the instance was created.
+    #[serde(default)]
+    pub ts_init: UnixNanos,
 }
 
 impl PoolSnapshot {
     /// Creates a new `PoolSnapshot` with the specified parameters.
+    #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         instrument_id: InstrumentId,
         state: PoolState,
@@ -57,6 +70,8 @@ impl PoolSnapshot {
         ticks: Vec<PoolTick>,
         analytics: PoolAnalytics,
         block_position: BlockPosition,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
     ) -> Self {
         Self {
             instrument_id,
@@ -65,6 +80,8 @@ impl PoolSnapshot {
             ticks,
             analytics,
             block_position,
+            ts_event,
+            ts_init,
         }
     }
 }
@@ -76,7 +93,11 @@ impl PoolSnapshot {
 /// deposit/withdrawal flows, and protocol fee configuration.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PoolState {
@@ -100,6 +121,7 @@ pub struct PoolState {
 
 impl PoolState {
     /// Creates a new `PoolState` with the specified parameters.
+    #[must_use]
     pub fn new(protocol_fees_token0: U256, protocol_fees_token1: U256, fee_protocol: u8) -> Self {
         Self {
             current_tick: 0,
@@ -135,7 +157,11 @@ impl Default for PoolState {
 /// deposit and collection flows, event counts, and performance metrics for debugging.
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PoolAnalytics {

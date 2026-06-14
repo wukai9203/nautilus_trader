@@ -42,7 +42,17 @@ use strum::{AsRefStr, Display, EnumIter, EnumString};
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.deribit")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.deribit",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.deribit")
 )]
 pub enum DeribitUpdateInterval {
     /// Raw updates - immediate delivery of each event.
@@ -101,7 +111,16 @@ impl Display for DeribitUpdateInterval {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.deribit")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.deribit",
+        from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.deribit")
 )]
 pub enum DeribitWsChannel {
     // Public Market Data Channels
@@ -202,7 +221,7 @@ impl DeribitWsChannel {
         }
     }
 
-    /// Formats the instrument state channel for subscription.
+    /// Formats the instrument status channel for subscription.
     ///
     /// Returns the full channel string: `instrument.state.{kind}.{currency}`
     ///
@@ -275,6 +294,20 @@ impl DeribitWsChannel {
                 | Self::UserAccessLog
         )
     }
+
+    /// Returns whether a channel string requires authentication.
+    ///
+    /// This includes private `user.*` channels and any channel with
+    /// a `.raw` interval (book, trades, ticker) which Deribit gates
+    /// behind auth.
+    #[must_use]
+    pub fn requires_auth(channel: &str) -> bool {
+        match Self::from_channel_string(channel) {
+            Some(ch) if ch.is_private() => true,
+            Some(_) => channel.ends_with(".raw"),
+            None => false,
+        }
+    }
 }
 
 /// Deribit JSON-RPC WebSocket methods.
@@ -326,7 +359,6 @@ pub enum DeribitWsMethod {
     #[strum(serialize = "public/get_time")]
     GetTime,
 
-    // Private methods (for future execution support)
     /// Subscribe to private channels.
     #[serde(rename = "private/subscribe")]
     #[strum(serialize = "private/subscribe")]
@@ -339,25 +371,37 @@ pub enum DeribitWsMethod {
     #[serde(rename = "private/logout")]
     #[strum(serialize = "private/logout")]
     Logout,
+    /// Submit a buy order.
+    #[serde(rename = "private/buy")]
+    #[strum(serialize = "private/buy")]
+    Buy,
+    /// Submit a sell order.
+    #[serde(rename = "private/sell")]
+    #[strum(serialize = "private/sell")]
+    Sell,
+    /// Modify an order.
+    #[serde(rename = "private/edit")]
+    #[strum(serialize = "private/edit")]
+    Edit,
+    /// Cancel an order.
+    #[serde(rename = "private/cancel")]
+    #[strum(serialize = "private/cancel")]
+    Cancel,
+    /// Cancel all orders for an instrument.
+    #[serde(rename = "private/cancel_all_by_instrument")]
+    #[strum(serialize = "private/cancel_all_by_instrument")]
+    CancelAllByInstrument,
+    /// Get order state.
+    #[serde(rename = "private/get_order_state")]
+    #[strum(serialize = "private/get_order_state")]
+    GetOrderState,
 }
 
 impl DeribitWsMethod {
     /// Returns the JSON-RPC method string.
     #[must_use]
-    pub fn as_method_str(&self) -> &'static str {
-        match self {
-            Self::PublicSubscribe => "public/subscribe",
-            Self::PublicUnsubscribe => "public/unsubscribe",
-            Self::PublicAuth => "public/auth",
-            Self::SetHeartbeat => "public/set_heartbeat",
-            Self::DisableHeartbeat => "public/disable_heartbeat",
-            Self::Test => "public/test",
-            Self::Hello => "public/hello",
-            Self::GetTime => "public/get_time",
-            Self::PrivateSubscribe => "private/subscribe",
-            Self::PrivateUnsubscribe => "private/unsubscribe",
-            Self::Logout => "private/logout",
-        }
+    pub fn as_method_str(&self) -> &str {
+        self.as_ref()
     }
 }
 
@@ -401,6 +445,50 @@ pub enum DeribitBookMsgType {
     /// Incremental update.
     #[serde(rename = "change")]
     Change,
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_requires_auth_user_channels() {
+        assert!(DeribitWsChannel::requires_auth("user.orders.any.any.raw"));
+        assert!(DeribitWsChannel::requires_auth("user.trades.any.any.raw"));
+        assert!(DeribitWsChannel::requires_auth("user.portfolio.any"));
+        assert!(DeribitWsChannel::requires_auth("user.changes.any.any.raw"));
+        assert!(DeribitWsChannel::requires_auth("user.access_log"));
+    }
+
+    #[rstest]
+    fn test_requires_auth_raw_channels() {
+        assert!(DeribitWsChannel::requires_auth("book.BTC-PERPETUAL.raw"));
+        assert!(DeribitWsChannel::requires_auth("book.ETH-25DEC25.raw"));
+        assert!(DeribitWsChannel::requires_auth("trades.BTC-PERPETUAL.raw"));
+        assert!(DeribitWsChannel::requires_auth("ticker.BTC-PERPETUAL.raw"));
+    }
+
+    #[rstest]
+    fn test_requires_auth_public_channels() {
+        assert!(!DeribitWsChannel::requires_auth(
+            "book.BTC-PERPETUAL.none.10.100ms"
+        ));
+        assert!(!DeribitWsChannel::requires_auth(
+            "book.BTC-PERPETUAL.none.20.agg2"
+        ));
+        assert!(!DeribitWsChannel::requires_auth(
+            "trades.BTC-PERPETUAL.100ms"
+        ));
+        assert!(!DeribitWsChannel::requires_auth(
+            "ticker.BTC-PERPETUAL.100ms"
+        ));
+        assert!(!DeribitWsChannel::requires_auth("quote.BTC-PERPETUAL"));
+        assert!(!DeribitWsChannel::requires_auth("deribit_price_index.btc"));
+        assert!(!DeribitWsChannel::requires_auth("platform_state"));
+        assert!(!DeribitWsChannel::requires_auth("announcements"));
+    }
 }
 
 /// Deribit heartbeat types.

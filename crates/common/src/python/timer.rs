@@ -17,7 +17,7 @@ use std::str::FromStr;
 
 use nautilus_core::{
     UUID4, UnixNanos,
-    python::{IntoPyObjectNautilusExt, to_pyvalue_err},
+    python::{IntoPyObjectNautilusExt, clone_py_object, to_pyvalue_err},
 };
 use pyo3::{
     IntoPyObjectExt,
@@ -57,8 +57,11 @@ impl From<TimeEventHandler> for TimeEventHandler_Py {
         Self {
             event: value.event,
             callback: match value.callback {
-                #[cfg(feature = "python")]
-                TimeEventCallback::Python(callback) => callback,
+                TimeEventCallback::Python(callback) => {
+                    // `TimeEventHandler_Py` is a PyO3 v2 wrapper; legacy capsule
+                    // callbacks use `TimeEventHandler_API` instead.
+                    clone_py_object(callback.callback())
+                }
                 TimeEventCallback::Rust(_) | TimeEventCallback::RustLocal(_) => {
                     panic!("Python time event handler is not supported for Rust callbacks")
                 }
@@ -68,7 +71,12 @@ impl From<TimeEventHandler> for TimeEventHandler_Py {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl TimeEvent {
+    /// Represents a time event occurring at the event timestamp.
+    ///
+    /// A `TimeEvent` carries metadata such as the event's name, a unique event ID,
+    /// and timestamps indicating when the event was scheduled to occur and when it was initialized.
     #[new]
     fn py_new(name: &str, event_id: UUID4, ts_event: u64, ts_init: u64) -> Self {
         Self::new(Ustr::from(name), event_id, ts_event.into(), ts_init.into())
@@ -180,9 +188,8 @@ mod tests {
     };
 
     #[pyfunction]
-    const fn receive_event(_py: Python, _event: TimeEvent) -> PyResult<()> {
+    const fn receive_event(_py: Python, _event: TimeEvent) {
         // TODO: Assert the length of a handler vec
-        Ok(())
     }
 
     #[derive(Debug)]

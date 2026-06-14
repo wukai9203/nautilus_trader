@@ -23,29 +23,33 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(feature = "python")]
+use nautilus_core::python::IntoPyObjectNautilusExt;
 use nautilus_core::{
     UUID4, UnixNanos,
     correctness::{FAILED, check_valid_string_utf8},
 };
 #[cfg(feature = "python")]
-use pyo3::{Py, PyAny, Python};
+use pyo3::{Py, PyAny, PyResult, Python, types::PyCapsule};
 use ustr::Ustr;
 
 /// Creates a valid nanoseconds interval that is guaranteed to be positive.
 ///
-/// # Panics
-///
-/// Panics if `interval_ns` is zero.
+/// Coerces zero to one to ensure a valid `NonZeroU64`.
 #[must_use]
 pub fn create_valid_interval(interval_ns: u64) -> NonZeroU64 {
-    NonZeroU64::new(std::cmp::max(interval_ns, 1)).expect("`interval_ns` must be positive")
+    NonZeroU64::new(interval_ns).unwrap_or(NonZeroU64::MIN)
 }
 
 #[repr(C)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.common")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.common", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.common")
 )]
 /// Represents a time event occurring at the event timestamp.
 ///
@@ -64,10 +68,6 @@ pub struct TimeEvent {
 
 impl TimeEvent {
     /// Creates a new [`TimeEvent`] instance.
-    ///
-    /// # Safety
-    ///
-    /// Assumes `name` is a valid string.
     #[must_use]
     pub const fn new(name: Ustr, event_id: UUID4, ts_event: UnixNanos, ts_init: UnixNanos) -> Self {
         Self {
@@ -129,6 +129,63 @@ impl Ord for ScheduledTimeEvent {
     }
 }
 
+#[cfg(feature = "python")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Python time event callback argument mode.
+pub enum PythonTimeEventCallbackArg {
+    /// Callbacks receive the PyO3 `TimeEvent` object.
+    TimeEvent,
+    /// Legacy Cython callbacks receive a `PyCapsule` containing the Rust event.
+    LegacyCapsule,
+}
+
+#[cfg(feature = "python")]
+/// Python callback for time events.
+pub struct PythonTimeEventCallback {
+    callback: Py<PyAny>,
+    arg: PythonTimeEventCallbackArg,
+}
+
+#[cfg(feature = "python")]
+impl PythonTimeEventCallback {
+    /// Creates a new [`PythonTimeEventCallback`] instance.
+    #[must_use]
+    pub const fn new(callback: Py<PyAny>, arg: PythonTimeEventCallbackArg) -> Self {
+        Self { callback, arg }
+    }
+
+    /// Returns the Python callable.
+    #[must_use]
+    pub const fn callback(&self) -> &Py<PyAny> {
+        &self.callback
+    }
+
+    /// Invokes the Python callback for the given `TimeEvent`.
+    pub fn call(&self, event: TimeEvent) {
+        Python::attach(|py| {
+            let result = match self.arg {
+                PythonTimeEventCallbackArg::TimeEvent => self.callback.call1(py, (event,)),
+                PythonTimeEventCallbackArg::LegacyCapsule => {
+                    call_legacy_python_time_event_callback(py, event, &self.callback)
+                }
+            };
+
+            if let Err(e) = result {
+                log::error!("Python time event callback raised exception: {e}");
+            }
+        });
+    }
+}
+
+#[cfg(feature = "python")]
+impl Debug for PythonTimeEventCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(PythonTimeEventCallback))
+            .field("arg", &self.arg)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Callback type for time events.
 ///
 /// # Variants
@@ -147,9 +204,8 @@ impl Ord for ScheduledTimeEvent {
 /// - The callback captures `Rc<RefCell<...>>` for shared mutable state.
 /// - Thread safety constraints prevent using `Arc`.
 ///
-/// Both variants work with `TestClock` and `LiveClock`. The `RustLocal` variant is safe
-/// with `LiveClock` because callbacks are sent through a channel and executed on the
-/// originating thread's event loop - they never actually cross thread boundaries.
+/// `RustLocal` works with `TestClock`. With `LiveClock`, use it only for existing
+/// single-threaded callback paths; live timer callback registry dispatch is still pending.
 ///
 /// # Automatic Conversion
 ///
@@ -159,7 +215,7 @@ impl Ord for ScheduledTimeEvent {
 pub enum TimeEventCallback {
     /// Python callable for use from Python via PyO3.
     #[cfg(feature = "python")]
-    Python(Py<PyAny>),
+    Python(Arc<PythonTimeEventCallback>),
     /// Thread-safe Rust callback using `Arc` (`Send + Sync`).
     Rust(Arc<dyn Fn(TimeEvent) + Send + Sync>),
     /// Local Rust callback using `Rc` (not `Send`/`Sync`).
@@ -170,7 +226,7 @@ impl Clone for TimeEventCallback {
     fn clone(&self) -> Self {
         match self {
             #[cfg(feature = "python")]
-            Self::Python(obj) => Self::Python(nautilus_core::python::clone_py_object(obj)),
+            Self::Python(callback) => Self::Python(callback.clone()),
             Self::Rust(cb) => Self::Rust(cb.clone()),
             Self::RustLocal(cb) => Self::RustLocal(cb.clone()),
         }
@@ -197,8 +253,8 @@ impl TimeEventCallback {
 
     /// Returns `true` if this is a local (non-thread-safe) Rust callback.
     ///
-    /// Local callbacks use `Rc` internally. They work with both `TestClock` and
-    /// `LiveClock` since callbacks are executed on the originating thread.
+    /// Local callbacks use `Rc` internally and require creation, cloning, dropping,
+    /// and invocation to stay on the originating thread.
     #[must_use]
     pub const fn is_local(&self) -> bool {
         matches!(self, Self::RustLocal(_))
@@ -210,13 +266,7 @@ impl TimeEventCallback {
     pub fn call(&self, event: TimeEvent) {
         match self {
             #[cfg(feature = "python")]
-            Self::Python(callback) => {
-                Python::attach(|py| {
-                    if let Err(e) = callback.call1(py, (event,)) {
-                        log::error!("Python time event callback raised exception: {e}");
-                    }
-                });
-            }
+            Self::Python(callback) => callback.call(event),
             Self::Rust(callback) => callback(event),
             Self::RustLocal(callback) => callback(event),
         }
@@ -247,29 +297,67 @@ impl From<Rc<dyn Fn(TimeEvent)>> for TimeEventCallback {
 #[cfg(feature = "python")]
 impl From<Py<PyAny>> for TimeEventCallback {
     fn from(value: Py<PyAny>) -> Self {
-        Self::Python(value)
+        Self::from_python_time_event(value)
+    }
+}
+
+#[cfg(feature = "python")]
+impl TimeEventCallback {
+    /// Creates a Python callback that receives a PyO3 `TimeEvent`.
+    #[must_use]
+    pub fn from_python_time_event(callback: Py<PyAny>) -> Self {
+        Self::Python(Arc::new(PythonTimeEventCallback::new(
+            callback,
+            PythonTimeEventCallbackArg::TimeEvent,
+        )))
+    }
+
+    /// Creates a legacy Python callback that receives a `PyCapsule`.
+    #[must_use]
+    pub fn from_python_legacy_capsule(callback: Py<PyAny>) -> Self {
+        Self::Python(Arc::new(PythonTimeEventCallback::new(
+            callback,
+            PythonTimeEventCallbackArg::LegacyCapsule,
+        )))
     }
 }
 
 // SAFETY: TimeEventCallback is Send + Sync with the following invariants:
 //
-// - Python variant: Py<PyAny> is inherently Send + Sync (GIL acquired when needed).
+// - Python variant: Arc clone/drop does not require the GIL, and the callable is
+//   only invoked after acquiring the GIL.
 //
 // - Rust variant: Arc<dyn Fn + Send + Sync> is inherently Send + Sync.
 //
-// - RustLocal variant: Uses Rc<dyn Fn> which is NOT Send/Sync. This is safe because:
-//   1. RustLocal callbacks are created and executed on the same thread
-//   2. They are sent through a channel but execution happens on the originating thread's
-//      event loop (see LiveClock/TestClock usage patterns)
-//   3. The Rc is never cloned across thread boundaries
+// - RustLocal variant: Rc<dyn Fn> is not Send/Sync. This unsafe impl preserves
+//   existing API compatibility and relies on callers to keep RustLocal callbacks
+//   on the originating event-loop thread. LiveTimer logs a warning because its
+//   callback registry dispatch follow-up is still pending.
 //
-//   INVARIANT: RustLocal callbacks must only be called from the thread that created them.
-//   Violating this invariant causes undefined behavior (data races on Rc's reference count).
-//   Use the Rust variant (with Arc) if cross-thread execution is needed.
+//   INVARIANT: RustLocal callbacks must only be cloned, dropped, or called from
+//   the thread that created them. Violating this invariant causes undefined behavior.
+//   Use the Rust variant with Arc if cross-thread execution is needed.
 #[allow(unsafe_code)]
 unsafe impl Send for TimeEventCallback {}
 #[allow(unsafe_code)]
 unsafe impl Sync for TimeEventCallback {}
+
+#[cfg(feature = "python")]
+fn call_legacy_python_time_event_callback(
+    py: Python<'_>,
+    event: TimeEvent,
+    callback: &Py<PyAny>,
+) -> PyResult<Py<PyAny>> {
+    #[allow(
+        deprecated,
+        reason = "unnamed capsules are required for legacy Cython time-event callbacks"
+    )]
+    let capsule: Py<PyAny> = PyCapsule::new_with_destructor(py, event, None, |_, _| {})
+        .expect("Error creating `PyCapsule`")
+        .into_py_any_unwrap(py);
+
+    callback.call1(py, (capsule,))
+}
 
 #[repr(C)]
 #[derive(Clone, Debug)]
@@ -291,13 +379,24 @@ impl TimeEventHandler {
         Self { event, callback }
     }
 
+    fn cmp_event(&self, other: &Self) -> Ordering {
+        self.event
+            .ts_event
+            .cmp(&other.event.ts_event)
+            .then_with(|| self.event.name.cmp(&other.event.name))
+            .then_with(|| self.event.ts_init.cmp(&other.event.ts_init))
+            .then_with(|| {
+                self.event
+                    .event_id
+                    .as_str()
+                    .cmp(other.event.event_id.as_str())
+            })
+    }
+
     /// Executes the handler by invoking its callback for the associated event.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the underlying callback invocation fails (e.g., a Python callback raises an exception).
     pub fn run(self) {
         let Self { event, callback } = self;
+        crate::msgbus::dispatch_tap_time_event(&event);
         callback.call(event);
     }
 }
@@ -310,7 +409,7 @@ impl PartialOrd for TimeEventHandler {
 
 impl PartialEq for TimeEventHandler {
     fn eq(&self, other: &Self) -> bool {
-        self.event.ts_event == other.event.ts_event
+        self.cmp_event(other).is_eq()
     }
 }
 
@@ -318,8 +417,13 @@ impl Eq for TimeEventHandler {}
 
 impl Ord for TimeEventHandler {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.event.ts_event.cmp(&other.event.ts_event)
+        self.cmp_event(other)
     }
+}
+
+pub(crate) trait Timer {
+    fn is_expired(&self) -> bool;
+    fn cancel(&mut self);
 }
 
 /// A test timer for user with a `TestClock`.
@@ -425,6 +529,16 @@ impl TestTimer {
     }
 }
 
+impl Timer for TestTimer {
+    fn is_expired(&self) -> bool {
+        self.is_expired
+    }
+
+    fn cancel(&mut self) {
+        self.is_expired = true;
+    }
+}
+
 impl Iterator for TestTimer {
     type Item = (TimeEvent, UnixNanos);
 
@@ -466,13 +580,32 @@ impl Iterator for TestTimer {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
+    use std::{cell::RefCell, num::NonZeroU64, rc::Rc};
 
-    use nautilus_core::UnixNanos;
+    use nautilus_core::{UUID4, UnixNanos};
+    #[cfg(feature = "python")]
+    use pyo3::{
+        Bound, PyResult, Python,
+        types::{
+            PyAnyMethods, PyCFunction, PyDict, PyList, PyListMethods, PyTuple, PyTupleMethods,
+            PyTypeMethods,
+        },
+    };
     use rstest::*;
     use ustr::Ustr;
 
-    use super::{TestTimer, TimeEvent};
+    use super::{TestTimer, TimeEvent, TimeEventCallback, TimeEventHandler, create_valid_interval};
+    use crate::msgbus::{
+        BusTap, Endpoint, MStr, MessagingSwitchboard, Topic, clear_bus_tap, set_bus_tap,
+    };
+
+    #[rstest]
+    #[case(0, 1)]
+    #[case(1, 1)]
+    #[case(25, 25)]
+    fn test_create_valid_interval(#[case] interval_ns: u64, #[case] expected: u64) {
+        assert_eq!(create_valid_interval(interval_ns).get(), expected);
+    }
 
     #[rstest]
     fn test_test_timer_pop_event() {
@@ -624,6 +757,162 @@ mod tests {
         assert_eq!(events[0].ts_event, UnixNanos::from(15));
     }
 
+    #[rstest]
+    fn test_time_event_handler_ordering_uses_tie_breakers() {
+        let callback = TimeEventCallback::from(|_: TimeEvent| {});
+
+        let later_name = TimeEventHandler::new(
+            TimeEvent::new(
+                Ustr::from("TIME_BAR_ESM4-2-MINUTE-ASK-INTERNAL"),
+                UUID4::from("00000000-0000-4000-8000-000000000003"),
+                100.into(),
+                100.into(),
+            ),
+            callback.clone(),
+        );
+        let earlier_name = TimeEventHandler::new(
+            TimeEvent::new(
+                Ustr::from("SPREAD_QUOTE_ESM4"),
+                UUID4::from("00000000-0000-4000-8000-000000000002"),
+                100.into(),
+                100.into(),
+            ),
+            callback.clone(),
+        );
+        let later_init = TimeEventHandler::new(
+            TimeEvent::new(
+                Ustr::from("SPREAD_QUOTE_ESM4"),
+                UUID4::from("00000000-0000-4000-8000-000000000004"),
+                100.into(),
+                101.into(),
+            ),
+            callback.clone(),
+        );
+        let later_id = TimeEventHandler::new(
+            TimeEvent::new(
+                Ustr::from("SPREAD_QUOTE_ESM4"),
+                UUID4::from("00000000-0000-4000-8000-000000000005"),
+                100.into(),
+                100.into(),
+            ),
+            callback,
+        );
+
+        assert!(earlier_name < later_name);
+        assert!(earlier_name < later_init);
+        assert!(earlier_name < later_id);
+        assert_ne!(earlier_name, later_id);
+    }
+
+    #[cfg(feature = "python")]
+    #[rstest]
+    fn test_python_callback_modes_pass_expected_argument_types() {
+        Python::initialize();
+
+        Python::attach(|py| {
+            let seen = PyList::empty(py);
+            let seen_obj = seen.clone().unbind().into_any();
+            let callback = new_sync_py_callback(
+                py,
+                move |args: &Bound<'_, PyTuple>,
+                      _kwargs: Option<&Bound<'_, PyDict>>|
+                      -> PyResult<()> {
+                    let arg = args.get_item(0)?;
+                    let type_name = arg.get_type().name()?.to_string();
+                    Python::attach(|py| seen_obj.call_method1(py, "append", (type_name,)))?;
+                    Ok(())
+                },
+            )
+            .expect("callback should create")
+            .into_any()
+            .unbind();
+
+            let event = TimeEvent::new(
+                Ustr::from("PY_CALLBACK_MODE"),
+                UUID4::from("00000000-0000-4000-8000-000000000007"),
+                UnixNanos::from(100),
+                UnixNanos::from(99),
+            );
+
+            TimeEventCallback::from_python_time_event(callback.clone_ref(py)).call(event.clone());
+            TimeEventCallback::from_python_legacy_capsule(callback).call(event);
+
+            assert_eq!(
+                seen.get_item(0).unwrap().extract::<String>().unwrap(),
+                "TimeEvent"
+            );
+            assert_eq!(
+                seen.get_item(1).unwrap().extract::<String>().unwrap(),
+                "PyCapsule"
+            );
+        });
+    }
+
+    #[cfg(feature = "python")]
+    fn new_sync_py_callback<F>(py: Python<'_>, closure: F) -> PyResult<Bound<'_, PyCFunction>>
+    where
+        F: Fn(&Bound<'_, PyTuple>, Option<&Bound<'_, PyDict>>) -> PyResult<()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        PyCFunction::new_closure(py, None, None, closure)
+    }
+
+    #[derive(Default)]
+    struct RecordingTimeEventTap {
+        time_events: RefCell<Vec<(String, TimeEvent)>>,
+    }
+
+    impl RecordingTimeEventTap {
+        fn time_events(&self) -> Vec<(String, TimeEvent)> {
+            self.time_events.borrow().clone()
+        }
+    }
+
+    impl BusTap for RecordingTimeEventTap {
+        fn on_publish(&self, topic: MStr<Topic>, message: &dyn std::any::Any) {
+            if let Some(event) = message.downcast_ref::<TimeEvent>() {
+                self.time_events
+                    .borrow_mut()
+                    .push((topic.to_string(), event.clone()));
+            }
+        }
+
+        fn on_send(&self, _endpoint: MStr<Endpoint>, _message: &dyn std::any::Any) {}
+    }
+
+    #[rstest]
+    fn test_time_event_handler_run_dispatches_tap_before_callback() {
+        let event = TimeEvent::new(
+            Ustr::from("strategy.heartbeat"),
+            UUID4::from("00000000-0000-4000-8000-000000000006"),
+            UnixNanos::from(100),
+            UnixNanos::from(99),
+        );
+        let tap = Rc::new(RecordingTimeEventTap::default());
+        let callback_seen: Rc<RefCell<Vec<TimeEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let expected_topic = MessagingSwitchboard::time_event_topic().to_string();
+        let callback_expected = event.clone();
+        let callback_expected_topic = expected_topic.clone();
+        let callback_tap = Rc::clone(&tap);
+        let callback_seen_ref = Rc::clone(&callback_seen);
+        let callback: Rc<dyn Fn(TimeEvent)> = Rc::new(move |callback_event| {
+            assert_eq!(
+                callback_tap.time_events(),
+                vec![(callback_expected_topic.clone(), callback_expected.clone())],
+            );
+            callback_seen_ref.borrow_mut().push(callback_event);
+        });
+
+        set_bus_tap(tap.clone());
+        TimeEventHandler::new(event.clone(), TimeEventCallback::from(callback)).run();
+        clear_bus_tap();
+
+        assert_eq!(tap.time_events(), vec![(expected_topic, event.clone())]);
+        assert_eq!(*callback_seen.borrow(), vec![event]);
+    }
+
     ////////////////////////////////////////////////////////////////////////////////
     // Property-based testing
     ////////////////////////////////////////////////////////////////////////////////
@@ -660,7 +949,7 @@ mod tests {
         )
     }
 
-    #[allow(clippy::needless_collect)] // Collect needed for indexing and .is_empty()
+    #[expect(clippy::needless_collect)] // Collect needed for indexing and .is_empty()
     fn test_timer_with_operations(
         operations: Vec<TimerOperation>,
         (interval_ns, start_time_ns, stop_time_ns, fire_immediately): (u64, u64, Option<u64>, bool),

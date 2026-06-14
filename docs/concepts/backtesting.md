@@ -1,13 +1,12 @@
 # Backtesting
 
-Backtesting with NautilusTrader is a methodical simulation process that replicates trading
-activities using a specific system implementation. This system is composed of various components
-including the built-in engines, `Cache`, [MessageBus](message_bus.md), `Portfolio`, [Actors](actors.md), [Strategies](strategies.md), [Execution Algorithms](execution.md),
-and other user-defined modules. The entire trading simulation is predicated on a stream of historical data processed by a
-`BacktestEngine`. Once this data stream is exhausted, the engine concludes its operation, producing
-detailed results and performance metrics for in-depth analysis.
+Backtesting simulates trading using a specific system implementation. The system comprises the
+built-in engines, `Cache`, [MessageBus](message_bus.md), `Portfolio`, [Actors](actors.md),
+[Strategies](strategies.md), [Execution Algorithms](execution.md), and user-defined modules.
+A `BacktestEngine` processes a stream of historical data. When the stream is exhausted, the
+engine produces results and performance metrics for analysis.
 
-It's important to recognize that NautilusTrader offers two distinct API levels for setting up and conducting backtests:
+NautilusTrader offers two API levels for backtesting:
 
 - **High-level API**: Uses a `BacktestNode` and configuration objects (`BacktestEngine`s are used internally).
 - **Low-level API**: Uses a `BacktestEngine` directly with more "manual" setup.
@@ -24,7 +23,7 @@ Consider using the **low-level** API when:
 Consider using the **high-level** API when:
 
 - Your data stream exceeds available memory, requiring streaming data in batches.
-- You want to leverage the performance and convenience of the `ParquetDataCatalog` for storing data in the Nautilus-specific Parquet format.
+- You want the performance and convenience of the `ParquetDataCatalog` for storing data in the Nautilus-specific Parquet format.
 - You value the flexibility and functionality of passing configuration objects to define and manage multiple backtest runs across various engines simultaneously.
 
 ## Low-level API
@@ -100,7 +99,10 @@ engine.add_data(all_bars, sort=True)
 
 **Strategy 3: Use streaming API for very large datasets**
 
-For datasets that don't fit in memory, use the streaming API:
+For datasets that don't fit in memory, there are two streaming approaches:
+
+**Automatic chunking** - supply a generator that yields batches. The engine pulls chunks
+lazily during a single `run()` call:
 
 ```python
 def data_generator():
@@ -113,13 +115,31 @@ engine.add_data_iterator(
     data_name="my_data_stream",
     generator=data_generator(),
 )
+
+engine.run()  # Chunks are consumed on-demand
+```
+
+**Manual chunking** - load and run each batch yourself. This is the pattern
+used internally by `BacktestNode` and gives full control over batch boundaries:
+
+```python
+engine.add_strategy(strategy)
+
+for batch in data_batches:
+    engine.add_data(batch)
+    engine.run(streaming=True)
+    engine.clear_data()
+
+engine.end()  # Finalize: flushes remaining timers, stops engines, produces results
 ```
 
 :::note
-The streaming API processes data chunks on-demand during the backtest run, avoiding the need to load all data into memory upfront.
+In streaming mode, timer advancement stops when data exhausts for each batch. Timers scheduled
+past the last data point (e.g. bar aggregation intervals) are deferred until more data arrives
+or `end()` is called, which flushes up to the `end` boundary from the last `run()` call.
 :::
 
-:::tip Performance impact
+:::tip[Performance impact]
 For a backtest with 10 instruments, each with 1M bars:
 
 - Sorting on each call: ~10 sorts of increasing size (1M, 2M, 3M, ... 10M bars).
@@ -147,6 +167,30 @@ The `BacktestEngine` enforces important invariants to ensure data integrity:
 
 This design ensures data integrity while enabling performance optimizations for large datasets.
 
+## Funding
+
+Backtests settle perpetual funding at funding boundaries from `FundingRateUpdate` data.
+When an update has `next_funding_ns`, the simulated exchange stores the latest rate and the
+backtest clock emits one `FundingSettlement` at that timestamp. Without `next_funding_ns`, the
+exchange settles only when `ts_event` lands on the `interval` boundary. Updates without a boundary
+remain strategy data and do not create funding payments.
+
+```mermaid
+flowchart LR
+    A[FundingRateUpdate] --> B[SimulatedExchange stores latest rate]
+    B --> C[Backtest clock reaches funding boundary]
+    C --> D[FundingSettlement]
+    D --> E[Open positions]
+    E --> F[PositionAdjusted: Funding]
+    E --> G[AccountState]
+    F --> H[Portfolio]
+    G --> H
+```
+
+`PositionAdjusted` remains the position accounting event. A positive funding rate debits long
+positions and credits short positions. The resulting adjustment changes realized PnL, and the
+matching account balance update records the cash movement.
+
 ## High-level API
 
 The high-level API centers around a `BacktestNode`, which orchestrates the management of multiple `BacktestEngine` instances,
@@ -162,18 +206,41 @@ Each `BacktestRunConfig` object consists of the following:
 - An optional `ImportableControllerConfig` object.
 - An optional `BacktestEngineConfig` object, with a default configuration if not specified.
 
+## Shutdown on error
+
+Set `BacktestEngineConfig.shutdown_on_error=True` so that a Rust error log ends the
+backtest run. The Rust logger records the first `log::error!` emitted after the kernel
+starts, and the kernel converts that trigger into a `ShutdownSystem` command the next time
+the backtest loop checks for shutdown.
+
+The shutdown request follows the normal backtest stop path. It stops the trader and
+engines, then returns the backtest results collected up to the shutdown point. It does not
+abort the process.
+
+```python
+from nautilus_trader.backtest import BacktestEngineConfig
+
+config = BacktestEngineConfig(shutdown_on_error=True)
+```
+
+Error logs suppressed by component filters or `bypass_logging=True` still request shutdown.
+The trigger is cleared and re-armed when a new kernel run starts, so a process can run
+another backtest without reinitializing the logging system. Shutdown-on-error observes Rust
+`log` records, not Python `logging.error(...)` calls.
+
 ## Repeated runs
 
 When conducting multiple backtest runs, it's important to understand how components reset to avoid unexpected behavior.
 
 ### BacktestEngine.reset()
 
-The `.reset()` method returns all stateful fields to their **initial value**, except for data and instruments which persist.
+The `.reset()` method returns engine state and loaded component state to their **initial value**.
+It keeps loaded components, data, instruments, and venues registered.
 
 **What gets reset:**
 
 - All trading state (orders, positions, account balances).
-- Strategy instances are removed (you must re-add strategies before the next run).
+- Loaded actors, strategies, and execution algorithms are reset in place.
 - Engine counters and timestamps.
 
 **What persists:**
@@ -181,6 +248,7 @@ The `.reset()` method returns all stateful fields to their **initial value**, ex
 - Data added via `.add_data()` (use `.clear_data()` to remove).
 - Instruments (must match the persisted data).
 - Venue configurations.
+- Loaded actors, strategies, and execution algorithms.
 
 **Instrument handling:**
 
@@ -231,14 +299,14 @@ engine.add_data(data)
 engine.add_strategy(strategy1)
 engine.run()
 
-# Reset and run 2 - instruments and data persist
+# Reset and run 2 with the same loaded strategy
 engine.reset()
-engine.add_strategy(strategy2)
 engine.run()
 
-# Reset and run 3
+# Reset and run 3 with a different strategy
 engine.reset()
-engine.add_strategy(strategy3)
+engine.clear_strategies()
+engine.add_strategy(strategy2)
 engine.run()
 ```
 
@@ -246,11 +314,13 @@ engine.run()
 Instruments and data persist across resets by default for `BacktestEngine`, making parameter optimizations straightforward.
 :::
 
-:::tip Best practices
+:::tip[Best practices]
 
 - **For production backtesting:** Use `BacktestNode` with configuration objects.
-- **For parameter optimizations:** Use `BacktestEngine.reset()` to run multiple strategies against the same data.
+- **For parameter optimizations:** Use `BacktestEngine.reset()` to keep data and instruments,
+  then call `clear_strategies()` before adding a replacement strategy instance.
 - **For quick experiments:** Either approach works - choose based on individual use case.
+
 :::
 
 ## Data
@@ -282,7 +352,7 @@ flowchart LR
 ```
 
 1. **Order Book Data/Deltas (L3 market-by-order)**:
-   - Comprehensive market depth with visibility of all individual orders.
+   - Full market depth with visibility of all individual orders.
 
 2. **Order Book Data/Deltas (L2 market-by-price)**:
    - Market depth visibility across all price levels.
@@ -319,18 +389,38 @@ When initializing a venue for backtesting, you must specify its internal order `
 - `L2_MBP`: Level 2 market-by-price. Order book depth is maintained, with a single order aggregated per price level.
 - `L3_MBO`: Level 3 market-by-order. Order book depth is maintained, with all individual orders tracked as provided by the data.
 
+The `book_type` determines which data types the matching engine uses to update book
+state and drive execution. Data types not applicable for a given `book_type` are
+ignored for book and price updates, though precision validation still applies and
+the engine clock still advances. Strategies always receive all subscribed data via
+the data engine regardless of `book_type`.
+
+| Data Type          | L1_MBP            | L2_MBP            | L3_MBO            |
+| ------------------ | ----------------- | ----------------- | ----------------- |
+| `QuoteTick`        | Updates book      | *Ignored*         | *Ignored*         |
+| `TradeTick`        | Triggers matching | Triggers matching | Triggers matching |
+| `Bar`              | Updates book      | *Ignored*         | *Ignored*         |
+| `OrderBookDelta`   | *Ignored*         | Updates book      | Updates book      |
+| `OrderBookDeltas`  | *Ignored*         | Updates book      | Updates book      |
+| `OrderBookDepth10` | Updates book      | Updates book      | Updates book      |
+
 :::note
-The granularity of the data must match the specified order `book_type`. Nautilus cannot generate higher granularity data (L2 or L3) from lower-level data such as quotes, trades, or bars.
+The granularity of the data must match the specified order `book_type`. Nautilus
+cannot generate higher granularity data (L2 or L3) from lower-level data such as
+quotes, trades, or bars.
 :::
 
 :::warning
-If you specify `L2_MBP` or `L3_MBO` as the venue’s `book_type`, all non-order book data (such as quotes, trades, and bars) will be ignored for execution processing.
-This may cause orders to appear as though they are never filled. We are actively working on improved validation logic to prevent configuration and data mismatches.
+If you specify `L2_MBP` or `L3_MBO` as the venue’s `book_type`, quotes and bars
+will not update the book. Ensure you provide order book delta data, otherwise
+orders may appear as though they are never filled.
 :::
 
 :::warning
-When providing L2 or higher order book data, ensure that the `book_type` is updated to reflect the data's granularity.
-Failing to do so will result in data aggregation: L2 data will be reduced to a single order per level, and L1 data will reflect only top-of-book levels.
+When using `L1_MBP` (the default), order book deltas are ignored by the matching
+engine. If you subscribe to order book deltas, set the venue `book_type` to
+`L2_MBP` or `L3_MBO`. This also applies to sandbox execution, where the matching
+engine uses the same `book_type` configuration.
 :::
 
 ## Execution
@@ -339,17 +429,103 @@ Failing to do so will result in data aggregation: L2 data will be reduced to a s
 
 In the main backtesting loop, new market data is processed for order execution before being dispatched to actors/strategies via the data engine.
 
+#### Main loop flow
+
+For each data point the engine runs three phases:
+
+- **Exchange processes data.** The simulated exchange updates its order book from
+  the incoming market data and iterates the matching engine. This fills any existing
+  orders that now match against the new market state.
+- **Strategy receives data.** The data engine dispatches the data point to actors
+  and strategies via their callbacks (e.g. `on_quote_tick`, `on_bar`). Strategies
+  may submit, cancel, or modify orders during these callbacks.
+- **Settle venues.** The engine drains all queued venue commands and then iterates
+  matching engines to fill newly submitted orders. This loop repeats until no
+  pending commands remain, so cascading orders (e.g. a hedge submitted from
+  `on_order_filled`) settle within the same timestamp.
+
+```mermaid
+sequenceDiagram
+    participant BL as Backtest Loop
+    participant Exch as SimulatedExchange
+    participant ME as MatchingEngine
+    participant DE as DataEngine
+    participant Stgy as Strategy
+
+    BL->>BL: next data point (ts=T)
+
+    rect rgb(240, 248, 255)
+    note right of BL: Phase 1 - Exchange processes data
+    BL->>Exch: process_quote_tick / process_bar
+    Exch->>ME: update book + iterate()
+    note right of ME: Matches existing orders<br/>against new market state
+    end
+
+    rect rgb(245, 255, 245)
+    note right of BL: Phase 2 - Strategy receives data
+    BL->>DE: process(data)
+    DE->>Stgy: on_quote_tick() / on_bar()
+    Stgy-->>Exch: submit_order (queued or immediate)
+    end
+
+    rect rgb(255, 248, 240)
+    note right of BL: Phase 3 - Settle venues
+    BL->>BL: _process_and_settle_venues(T)
+    BL->>Exch: _drain_commands(T)
+    note right of Exch: Processes queued commands,<br/>adds orders to matching core
+    BL->>ME: _core.iterate(T)
+    note right of ME: Matches newly added orders<br/>against current market state
+    note right of ME: Fills may trigger strategy callbacks<br/>that enqueue further commands,<br/>repeats until no pending commands
+    BL->>Exch: run simulation modules
+    BL->>Exch: check instrument expirations
+    end
+```
+
+Timer events use the same settle mechanism but batch by timestamp: all callbacks at
+timestamp T execute first, then venues are settled for T before advancing to T+1.
+
+#### Command settling
+
+When an order fill triggers a strategy callback that submits additional orders (e.g., a stop-loss submitted
+in `on_order_filled`), those cascading commands are settled within the same timestamp/event cycle. The engine
+repeatedly drains venue command queues and any newly generated commands until no commands remain pending
+for the current timestamp. Simulation modules are run only once per cycle, after all commands have settled.
+
+When a `LatencyModel` is configured, commands are placed in the venue's inflight queue with a future
+timestamp derived from the simulated latency. The settle loop considers inflight commands that are due
+at the current timestamp as pending, so zero-latency or same-tick latency configurations still settle
+correctly. Commands with future timestamps are deferred and processed when the engine reaches that time.
+
+#### Shutdown semantics
+
+`BacktestEngine::end()` invokes each strategy's `on_stop` handler, drains and settles any commands
+it emits (e.g. `close_all_positions`, `cancel_all_orders`), then stops the engines.
+
+- `on_stop` commands use normal venue queueing and latency. They do not get priority over earlier inflight commands.
+- If a pre-stop order reaches the venue before an `on_stop` cancel, it may still fill. A later
+  reduce-only close can then reject if the fill changed net exposure.
+- Strategies that need deterministic flattening should enter an exit-only state before stopping and
+  avoid new opening orders while cancel and close commands are in-flight.
+- Strategy event handlers do not fire for the resulting events: the strategy is already `Stopped`,
+  so `OrderFilled` and similar events log but bypass `on_order_filled` and friends. Logic that
+  reacts to fills must run before `on_stop` returns.
+- Simulation modules do not re-run at shutdown. `SimulationModule::process` is once per timestamp;
+  re-invoking would double-apply side effects like FX rollover interest.
+- A `LatencyModel` adds its configured delay to trailing commands (those emitted on the final
+  data tick or in `on_stop`). The shutdown path advances the engine clock to the latest inflight
+  arrival timestamp so those commands still settle before the engines stop.
+
 ### Fill modeling philosophy
 
-NautilusTrader treats historical order book and trade data as **immutable** during backtesting. What happened in the market is preserved exactly as recorded—fills never modify the underlying book state.
+NautilusTrader treats historical order book and trade data as **immutable** during backtesting. What happened in the market is preserved exactly as recorded. Fills never modify the underlying book state.
 
-This addresses a gap in academic literature: most research focuses on live market dynamics where the book actually evolves. Historical backtesting with frozen snapshots is a distinct engineering problem—how do we simulate realistic fills against data that doesn't change in response to our orders?
+This addresses a gap in academic literature: most research focuses on live market dynamics where the book actually evolves. Historical backtesting with frozen snapshots is a distinct engineering problem: how do we simulate realistic fills against data that doesn't change in response to our orders?
 
 **Design choices:**
 
 - **Immutable historical data**: Order book and trade data are never modified.
 - **Optional consumption tracking**: When `liquidity_consumption=True`, the engine tracks consumed liquidity per price level to prevent duplicate fills. See [Order book immutability](#order-book-immutability) for configuration.
-- **Deterministic results**: The same backtest with the same data and configuration produces identical results when probabilistic fill models use a fixed `random_seed`.
+- **Reproducible results**: A fixed `random_seed` pins the probabilistic fill model's PRNG. Same-process reruns are expected to match; cross-process reruns may differ in rare cases due to hash-ordering effects outside the fill model.
 
 ### Fill price determination
 
@@ -359,17 +535,17 @@ The matching engine determines fill prices based on order type, book type, and m
 
 With full order book depth, fills are determined by actual book simulation:
 
-| Order Type              | Fill Price                                                    |
-|-------------------------|---------------------------------------------------------------|
-| `MARKET`                | Walks the book, filling at each price level (taker).          |
-| `MARKET_TO_LIMIT`       | Walks the book, filling at each price level (taker).          |
-| `LIMIT`                 | Order's limit price when matched (maker).                     |
-| `STOP_MARKET`           | Walks the book when triggered.                                |
-| `STOP_LIMIT`            | Order's limit price when triggered and matched.               |
-| `MARKET_IF_TOUCHED`     | Walks the book when triggered.                                |
-| `LIMIT_IF_TOUCHED`      | Order's limit price when triggered.                           |
-| `TRAILING_STOP_MARKET`  | Walks the book when activated and triggered.                  |
-| `TRAILING_STOP_LIMIT`   | Order's limit price when activated, triggered, and matched.   |
+| Order Type             | Fill Price                                                  |
+| ---------------------- | ----------------------------------------------------------- |
+| `MARKET`               | Walks the book, filling at each price level (taker).        |
+| `MARKET_TO_LIMIT`      | Walks the book, filling at each price level (taker).        |
+| `LIMIT`                | Order's limit price when matched (maker).                   |
+| `STOP_MARKET`          | Walks the book when triggered.                              |
+| `STOP_LIMIT`           | Order's limit price when triggered and matched.             |
+| `MARKET_IF_TOUCHED`    | Walks the book when triggered.                              |
+| `LIMIT_IF_TOUCHED`     | Order's limit price when triggered.                         |
+| `TRAILING_STOP_MARKET` | Walks the book when activated and triggered.                |
+| `TRAILING_STOP_LIMIT`  | Order's limit price when activated, triggered, and matched. |
 
 With L2/L3 data, market-type orders may partially fill across multiple price levels if insufficient liquidity exists at the top of book.
 Limit-type orders act as resting orders after triggering and may remain unfilled if the market doesn't reach the limit price.
@@ -379,17 +555,17 @@ Limit-type orders act as resting orders after triggering and may remain unfilled
 
 With only top-of-book data, the same book simulation is used with a single-level book:
 
-| Order Type              | BUY Fill Price | SELL Fill Price |
-|-------------------------|----------------|-----------------|
-| `MARKET`                | Best ask       | Best bid        |
-| `MARKET_TO_LIMIT`       | Best ask       | Best bid        |
-| `LIMIT`                 | Limit price    | Limit price     |
-| `STOP_MARKET`           | Best ask       | Best bid        |
-| `STOP_LIMIT`            | Limit price    | Limit price     |
-| `MARKET_IF_TOUCHED`     | Best ask       | Best bid        |
-| `LIMIT_IF_TOUCHED`      | Limit price    | Limit price     |
-| `TRAILING_STOP_MARKET`  | Best ask       | Best bid        |
-| `TRAILING_STOP_LIMIT`   | Limit price    | Limit price     |
+| Order Type             | BUY Fill Price | SELL Fill Price |
+| ---------------------- | -------------- | --------------- |
+| `MARKET`               | Best ask       | Best bid        |
+| `MARKET_TO_LIMIT`      | Best ask       | Best bid        |
+| `LIMIT`                | Limit price    | Limit price     |
+| `STOP_MARKET`          | Best ask       | Best bid        |
+| `STOP_LIMIT`           | Limit price    | Limit price     |
+| `MARKET_IF_TOUCHED`    | Best ask       | Best bid        |
+| `LIMIT_IF_TOUCHED`     | Limit price    | Limit price     |
+| `TRAILING_STOP_MARKET` | Best ask       | Best bid        |
+| `TRAILING_STOP_LIMIT`  | Limit price    | Limit price     |
 
 With L1 data, the simulated book has a single price level. Orders fill against the available size at that level. If an order has remaining quantity after exhausting top-of-book liquidity, market and marketable limit-style orders will slip one tick to fill the residual.
 
@@ -523,7 +699,7 @@ The order book itself handles slippage naturally based on available liquidity at
 :::warning
 The historical order book is immutable during backtesting. Book depth is **not** decremented after fills.
 By default (`liquidity_consumption=False`), the same liquidity can be consumed repeatedly within an iteration.
-Enable `liquidity_consumption=True` to track consumed liquidity per price level—consumption resets when fresh
+Enable `liquidity_consumption=True` to track consumed liquidity per price level. Consumption resets when fresh
 data arrives at that level. See [Order book immutability](#order-book-immutability) for details.
 :::
 
@@ -578,8 +754,8 @@ venue_config = BacktestVenueConfig(
 
 For each price level, the engine maintains:
 
-- `original_size`: The book's quantity when tracking began
-- `consumed`: How much has been filled against this level
+- `original_size`: The book's quantity when tracking began.
+- `consumed`: How much has been filled against this level.
 
 When processing a fill:
 
@@ -602,10 +778,10 @@ With L1 data (quotes, trades, bars), the book has only a single price level per 
 moves through a passive (MAKER) limit order's price, the engine must decide how to handle remaining
 order quantity after exhausting displayed liquidity.
 
-| `liquidity_consumption` | Behavior when market moves through passive limit |
-|-------------------------|--------------------------------------------------|
+| `liquidity_consumption` | Behavior when market moves through passive limit                                                |
+| ----------------------- | ----------------------------------------------------------------------------------------------- |
 | `False` (default)       | Fill entire order at limit price. Assumes market movement implies sufficient liquidity existed. |
-| `True`                  | Fill only against displayed liquidity. Order remains open for subsequent fills. |
+| `True`                  | Fill only against displayed liquidity. Order remains open for subsequent fills.                 |
 
 **Example scenario** (`liquidity_consumption=True`):
 
@@ -617,7 +793,7 @@ order quantity after exhausting displayed liquidity.
 6. Order fills another 200 units. 770 units remain open.
 7. Fills continue as fresh liquidity arrives at crossed price levels.
 
-This behavior provides conservative fill simulation—your order only fills against liquidity
+This behavior provides conservative fill simulation: your order only fills against liquidity
 actually observed in the data, rather than inferring liquidity from price movements.
 
 **Trade tick liquidity:**
@@ -625,6 +801,24 @@ actually observed in the data, rather than inferring liquidity from price moveme
 Trade ticks provide evidence of executable liquidity at the trade price. When a trade occurs at a price level
 not reflected in the current book, the engine can use the trade quantity as available liquidity, subject to
 the same consumption tracking rules (when enabled).
+
+**Trade consumption seeding:**
+
+When using L2/L3 book data and a trade tick triggers order matching (e.g., triggering a resting stop order),
+the trade itself consumed liquidity from the book. Before simulating fills for triggered orders, the engine
+pre-seeds the consumption maps with the trade's consumed volume. This prevents triggered orders from filling
+against liquidity that the triggering trade already consumed. This seeding is skipped for L1 books, where the
+trade tick has already updated the single top-of-book level directly.
+
+For example, if the book has 10 units at the best ask and a BUY trade of size 8 triggers a stop market BUY
+for 5 units, the stop order sees only 2 units remaining at best ask (10 - 8) and must fill the remaining
+3 units at the next price level. Without this seeding, the stop would incorrectly fill all 5 units at the
+best ask price.
+
+The engine uses a timestamp guard to avoid double-counting: if the book's most recent update (`ts_last`)
+is newer than the trade's event time (`ts_event`), seeding is skipped. This handles exchanges like Binance
+where depth deltas arrive before the corresponding trade tick, so the book already reflects the consumed
+liquidity, so additional seeding would over-penalize fills.
 
 :::note
 As the `FillModel` continues to evolve, future versions may introduce more sophisticated simulation of order execution dynamics, including:
@@ -644,7 +838,7 @@ to simulate queue position probabilistically.
 the engine uses this as fill evidence. However, this represents liquidity that existed momentarily and may
 not reflect sustained availability.
 
-### Trade based execution
+### Trade-based execution
 
 Trade tick data triggers order fills by default (`trade_execution=True`). A trade tick indicates that liquidity
 was accessed at the trade price, allowing resting limit orders to match. This mirrors the default behavior
@@ -679,7 +873,7 @@ When a trade tick triggers order matching, the engine determines fills as follow
 1. **Book reflects trade price**: If the order book has liquidity at the trade price, fills use book depth (standard behavior).
 2. **Book doesn't reflect trade price**: If the book's liquidity is at a different price, the engine uses a "trade-driven fill" at the order's limit price, capped to `min(order.leaves_qty, trade.size)`.
 
-This ensures that when a trade prints through the spread but the book hasn't updated, fills are bounded by what the trade tick actually evidences. When `liquidity_consumption=False` (default), the same trade size can fill multiple orders within an iteration. When `liquidity_consumption=True`, consumption tracking applies to trade-driven fills as well—repeated fills at the same trade price will be bounded by consumed liquidity until fresh data arrives.
+This ensures that when a trade prints through the spread but the book hasn't updated, fills are bounded by what the trade tick actually evidences. When `liquidity_consumption=False` (default), the same trade size can fill multiple orders within an iteration. When `liquidity_consumption=True`, consumption tracking applies to trade-driven fills as well. Repeated fills at the same trade price will be bounded by consumed liquidity until fresh data arrives.
 
 **Restoration behavior:**
 
@@ -708,10 +902,10 @@ while trade ticks trigger execution for orders that might be inside the spread o
 
 A common source of confusion is the `aggressor_side` field on trade ticks:
 
-- **SELLER trade**: A seller aggressed—they sold into the bid. This provides evidence of fill-able liquidity for **BUY** orders at the trade price.
-- **BUYER trade**: A buyer aggressed—they bought from the ask. This provides evidence of fill-able liquidity for **SELL** orders at the trade price.
+- **SELLER trade**: A seller aggressed, selling into the bid. This provides evidence of fill-able liquidity for **BUY** orders at the trade price.
+- **BUYER trade**: A buyer aggressed, buying from the ask. This provides evidence of fill-able liquidity for **SELL** orders at the trade price.
 
-In other words, trade ticks trigger fills for orders on the **opposite** side of the aggressor. A SELLER trade at 100.00 can fill your resting BUY LIMIT at 100.00, but cannot fill your SELL LIMIT—the trade already represents someone else selling.
+In other words, trade ticks trigger fills for orders on the **opposite** side of the aggressor. A SELLER trade at 100.00 can fill your resting BUY LIMIT at 100.00, but cannot fill your SELL LIMIT, since the trade already represents someone else selling.
 
 #### Combining L2 book data with trade ticks
 
@@ -730,8 +924,8 @@ When using L2 order book data (e.g., 100ms throttled depth snapshots) combined w
 **Common misconception**: Users sometimes expect every trade tick to trigger fills. Remember:
 
 - Only trades on the **opposite** side can fill your orders.
-- SELLER trades → potential BUY fills.
-- BUYER trades → potential SELL fills.
+- SELLER trades -> potential BUY fills.
+- BUYER trades -> potential SELL fills.
 - Book UPDATE events move the market but only trigger fills if prices cross your order.
 
 #### Queue position tracking
@@ -748,18 +942,18 @@ orders are "ahead" of your order at a given price level.
 2. **Trade ticks**: When trade ticks occur at the order's price level, the "quantity ahead" is
    decremented by the trade size. Only trades on the correct side affect the queue (BUYER trades
    decrement queue for SELL orders, SELLER trades decrement queue for BUY orders). Trades with
-   `NO_AGGRESSOR` (common in historical datasets lacking aggressor metadata) affect both sides—
-   this is pessimistic but prevents orders from stalling indefinitely.
+   `NO_AGGRESSOR` (common in historical datasets lacking aggressor metadata) affect both sides.
+   This is pessimistic but prevents orders from stalling indefinitely.
 
 3. **Fill eligibility**: The order becomes eligible to fill only when the quantity ahead reaches zero.
    On the tick that clears the queue, only the excess volume (trade size minus queue ahead) is
-   available for fill—preventing overfill.
+   available for fill, preventing overfill.
 
 4. **Price level DELETE**: If the order book level is deleted (BookAction.DELETE), the queue clears
    immediately, making the order fill-eligible. UPDATE actions are ignored (queue unchanged).
 
 5. **Order modification**: If the order is modified (price or quantity change), the queue position
-   resets—the order moves to the back of the queue at its new price level.
+   resets. The order moves to the back of the queue at its new price level.
 
 **Configuration:**
 
@@ -780,9 +974,9 @@ venue_config = BacktestVenueConfig(
 
 1. Order book shows 100 units at bid 100.00.
 2. You place a BUY LIMIT at 100.00 for 50 units. Queue ahead = 100.
-3. SELLER trade of 80 units at 100.00 → queue ahead = 20. No fill yet.
-4. SELLER trade of 30 units at 100.00 → queue clears with 10 excess. Fill = 10 units.
-5. Next SELLER trade of 50 units → fill remaining 40 units.
+3. SELLER trade of 80 units at 100.00 -> queue ahead = 20. No fill yet.
+4. SELLER trade of 30 units at 100.00 -> queue clears with 10 excess. Fill = 10 units.
+5. Next SELLER trade of 50 units -> fill remaining 40 units.
 
 **Limitations:**
 
@@ -791,13 +985,39 @@ venue_config = BacktestVenueConfig(
 - The queue snapshot is based on book state at order acceptance time.
 - Trades with `NO_AGGRESSOR` decrement queue for both sides, which may cause orders to fill sooner than in reality (pessimistic for queue estimation, but prevents stalling).
 
+**L1 quote-based mode:**
+
+When using `BookType.L1_MBP` (top-of-book quotes only), queue position tracking uses
+trade ticks to decrement the queue (the same mechanism as L2/L3), while quote ticks
+handle price-move detection and deferred snapshot resolution.
+
+- **Trade ticks**: Trades at the order's price level decrement the queue ahead by the trade
+  size, identical to L2/L3 behavior. Only trades on the correct aggressor side affect the
+  queue (SELLER trades decrement queue for BUY orders, BUYER trades for SELL orders).
+- **Price moves away**: If the bid drops below a BUY order's price (or ask rises above a
+  SELL order's price), the order's price level has been "crossed" and the queue clears to zero,
+  making the order fill-eligible on the next matching trade.
+- **Price moves toward**: If the bid rises (or ask drops), the level at the order's price was
+  not consumed, so queue positions are preserved.
+- **Price returns to a level**: When the price returns after moving away, the queue ahead is
+  capped at the new displayed size if it was previously larger.
+- **Orders behind BBO (pending)**: When a limit order is placed behind the best bid/ask
+  (e.g., BUY below best bid), the queue snapshot is deferred because L1 data has no visible
+  depth at that level. Fills are blocked until the BBO reaches the order's price, at which
+  point the queue is snapshotted from the displayed size. Pending orders are also resolved
+  when trades cross through their price level.
+
+L1 mode uses the same configuration: set `queue_position=True` with `book_type=BookType.L1_MBP`.
+This provides a lightweight alternative to full L2/L3 data when only top-of-book quotes are
+available.
+
 :::note
 Queue position tracking provides a heuristic simulation of queue dynamics. Real exchange queue
 behavior depends on many factors (order priority rules, hidden orders, etc.) that cannot be
 perfectly reconstructed from historical data.
 :::
 
-### Bar based execution
+### Bar-based execution
 
 Bar data provides a summary of market activity with four key prices for each time period (assuming bars are aggregated by trades):
 
@@ -820,7 +1040,7 @@ granular data such as quotes, trades, or bars (although the simulation will only
 :::warning
 When using bars for execution simulation (enabled by default with `bar_execution=True` in venue configurations),
 Nautilus strictly expects the initialization timestamp (`ts_init`) of each bar to represent its **closing time**.
-This ensures accurate chronological processing, prevents look-ahead bias, and aligns market updates (Open → High → Low → Close) with the moment the bar is complete.
+This ensures accurate chronological processing, prevents look-ahead bias, and aligns market updates (Open -> High -> Low -> Close) with the moment the bar is complete.
 
 The event timestamp (`ts_event`) can represent either the open or close time of the bar:
 
@@ -859,7 +1079,7 @@ Even when you provide bar data, Nautilus maintains an internal order book for ea
      - If your bars are timestamped at the **open**, set `ts_init_delta` to the bar's duration in nanoseconds (e.g., 60_000_000_000 for 1-minute bars) to shift `ts_init` to the close time.
    - The platform ensures all events happen in the correct sequence based on `ts_init`, preventing any possibility of look-ahead bias in your backtests.
 
-:::note Exceptions for bar execution
+:::note[Exceptions for bar execution]
 Bars will **not** be processed for execution (and will not update the order book) in the following cases:
 
 - **Internally aggregated bars**: Bars with `AggregationSource.INTERNAL` are skipped to avoid processing bars that are derived from already-processed tick data.
@@ -870,7 +1090,7 @@ In these cases, bars will still be received by strategies for analytics and deci
 
 2. **Price processing**:
    - The platform converts each bar's OHLC prices into a sequence of market updates.
-   - By default, updates follow the order: Open → High → Low → Close (configurable via `bar_adaptive_high_low_ordering`).
+   - By default, updates follow the order: Open -> High -> Low -> Close (configurable via `bar_adaptive_high_low_ordering`).
    - If you provide multiple timeframes (like both 1-minute and 5-minute bars), the platform uses the more granular data for highest accuracy.
 
 3. **Executions**:
@@ -899,13 +1119,13 @@ How these price points are sequenced can be controlled via the `bar_adaptive_hig
 Nautilus supports two modes of bar processing:
 
 1. **Fixed ordering** (`bar_adaptive_high_low_ordering=False`, default)
-   - Processes every bar in a fixed sequence: `Open → High → Low → Close`.
+   - Processes every bar in a fixed sequence: `Open -> High -> Low -> Close`.
    - Simple and deterministic approach.
 
 2. **Adaptive ordering** (`bar_adaptive_high_low_ordering=True`)
    - Uses bar structure to estimate likely price path:
-     - If Open is closer to High: processes as `Open → High → Low → Close`.
-     - If Open is closer to Low: processes as `Open → Low → High → Close`.
+     - If Open is closer to High: processes as `Open -> High -> Low -> Close`.
+     - If Open is closer to Low: processes as `Open -> Low -> High -> Close`.
    - [Research](https://gist.github.com/stefansimik/d387e1d9ff784a8973feca0cde51e363) shows this approach achieves ~75-85% accuracy in predicting correct High/Low sequence (compared to statistical ~50% accuracy with fixed ordering).
    - This is particularly important when both take-profit and stop-loss levels occur within the same bar - as the sequence determines which order fills first.
 
@@ -929,10 +1149,41 @@ engine.add_venue(
 )
 ```
 
+#### Order submission timing
+
+Bar N's OHLC sequence processes before `on_bar(N)` fires. Without a `LatencyModel`,
+an order submitted from `on_bar` settles immediately and matches against the current
+book, whose top reflects bar N's close.
+
+Attach a `LatencyModel` to the venue to defer the order's effective arrival. With
+bar-only data and no intervening timer events, the order settles after the next bar's
+OHLC sweep, so the fill price is that bar's close (or a later bar's close if latency
+exceeds the bar interval). Finer-grained data (quotes, trades) or timer-driven
+settlement between bars can drain the order earlier, against the book as it stands at
+that point:
+
+```python
+from nautilus_trader.backtest.models import LatencyModel
+
+engine.add_venue(
+    venue=venue,
+    oms_type=OmsType.NETTING,
+    account_type=AccountType.CASH,
+    starting_balances=[Money(10_000, Currency.from_str("USDT"))],
+    latency_model=LatencyModel(base_latency_nanos=1_000_000_000),  # 1 second
+)
+```
+
+:::note
+A native "next-bar-open" execution mode is not provided. A bar's `ts_init` is its
+close timestamp, so the open price is only known once the bar arrives. Filling at
+that open from a signal generated on the prior bar would require look-ahead.
+:::
+
 ### Internal bar aggregation timing
 
 When aggregating time bars internally from tick data, the data engine uses timers to close bars at
-interval boundaries. A timing edge case occurs when data arrives at the exact bar close timestamp—the
+interval boundaries. A timing edge case occurs when data arrives at the exact bar close timestamp: the
 timer may fire before processing boundary data.
 
 Configure `time_bars_build_delay` in `DataEngineConfig` to delay bar close timers:
@@ -981,19 +1232,19 @@ for more sophisticated liquidity modeling.
 
 #### Available fill models
 
-| Model                        | Description                                              | Use Case                                    |
-|------------------------------|----------------------------------------------------------|---------------------------------------------|
-| `FillModel`                  | Base model with probabilistic fill/slippage parameters.  | Simple queue position and slippage.         |
-| `BestPriceFillModel`         | Fills at best price with unlimited liquidity.            | Testing basic strategy logic optimistically.|
-| `OneTickSlippageFillModel`   | Forces exactly one tick of slippage on all orders.       | Conservative slippage testing.              |
-| `TwoTierFillModel`           | 10 contracts at best price, remainder one tick worse.    | Basic market depth simulation.              |
-| `ThreeTierFillModel`         | 50/30/20 contracts across three price levels.            | More realistic depth simulation.            |
-| `ProbabilisticFillModel`     | 50% chance best price, 50% chance one tick slippage.     | Randomized execution quality.               |
-| `SizeAwareFillModel`         | Different execution based on order size (≤10 vs >10).    | Size-dependent market impact.               |
-| `LimitOrderPartialFillModel` | Max 5 contracts fill per price touch.                    | Queue position via partial fills.           |
-| `MarketHoursFillModel`       | Wider spreads during low liquidity periods.              | Session-aware execution.                    |
-| `VolumeSensitiveFillModel`   | Liquidity based on recent trading volume.                | Volume-adaptive depth.                      |
-| `CompetitionAwareFillModel`  | Only percentage of visible liquidity available.          | Multi-participant competition.              |
+| Model                        | Description                                             | Use Case                                     |
+| ---------------------------- | ------------------------------------------------------- | -------------------------------------------- |
+| `FillModel`                  | Base model with probabilistic fill/slippage parameters. | Simple queue position and slippage.          |
+| `BestPriceFillModel`         | Fills at best price with unlimited liquidity.           | Testing basic strategy logic optimistically. |
+| `OneTickSlippageFillModel`   | Forces exactly one tick of slippage on all orders.      | Conservative slippage testing.               |
+| `TwoTierFillModel`           | 10 contracts at best price, remainder one tick worse.   | Basic market depth simulation.               |
+| `ThreeTierFillModel`         | 50/30/20 contracts across three price levels.           | More realistic depth simulation.             |
+| `ProbabilisticFillModel`     | 50% chance best price, 50% chance one tick slippage.    | Randomized execution quality.                |
+| `SizeAwareFillModel`         | Different execution based on order size (≤10 vs >10).   | Size‑dependent market impact.                |
+| `LimitOrderPartialFillModel` | Max 5 contracts fill per price touch.                   | Queue position via partial fills.            |
+| `MarketHoursFillModel`       | Wider spreads during low liquidity periods.             | Session‑aware execution.                     |
+| `VolumeSensitiveFillModel`   | Liquidity based on recent trading volume.               | Volume‑adaptive depth.                       |
+| `CompetitionAwareFillModel`  | Only percentage of visible liquidity available.         | Multi‑participant competition.               |
 
 #### Configuring fill models
 
@@ -1115,24 +1366,24 @@ The matching engine enforces strict precision invariants to ensure data integrit
 All prices and quantities must match the instrument's configured precision (`price_precision` and `size_precision`).
 Mismatches raise a `RuntimeError` immediately, preventing silent corruption of fill quantities.
 
-| Data/Operation | Field                          | Required Precision           | Validation Location          |
-|----------------|--------------------------------|------------------------------|------------------------------|
-| `QuoteTick`    | `bid_price`, `ask_price`       | `instrument.price_precision` | `process_quote_tick`         |
-| `QuoteTick`    | `bid_size`, `ask_size`         | `instrument.size_precision`  | `process_quote_tick`         |
-| `TradeTick`    | `price`                        | `instrument.price_precision` | `process_trade_tick`         |
-| `TradeTick`    | `size`                         | `instrument.size_precision`  | `process_trade_tick`         |
-| `Bar`          | `open`, `high`, `low`, `close` | `instrument.price_precision` | `process_bar`                |
-| `Bar`          | `volume` (base units)          | `instrument.size_precision`  | `process_bar`                |
-| `Order`        | `quantity`                     | `instrument.size_precision`  | `process_order`              |
-| `Order`        | `price`                        | `instrument.price_precision` | `process_order`              |
-| `Order`        | `trigger_price`                | `instrument.price_precision` | `process_order`              |
-| `Order`        | `activation_price`*            | `instrument.price_precision` | `process_order`              |
-| Order update   | `quantity`                     | `instrument.size_precision`  | `update_order`               |
-| Order update   | `price`, `trigger_price`       | `instrument.price_precision` | `update_order`               |
-| Fill           | `fill_qty`                     | `instrument.size_precision`  | `apply_fills`, `fill_order`  |
-| Fill           | `fill_px`                      | `instrument.price_precision` | `apply_fills`                |
+| Data/Operation | Field                          | Required Precision           | Validation Location         |
+| -------------- | ------------------------------ | ---------------------------- | --------------------------- |
+| `QuoteTick`    | `bid_price`, `ask_price`       | `instrument.price_precision` | `process_quote_tick`        |
+| `QuoteTick`    | `bid_size`, `ask_size`         | `instrument.size_precision`  | `process_quote_tick`        |
+| `TradeTick`    | `price`                        | `instrument.price_precision` | `process_trade_tick`        |
+| `TradeTick`    | `size`                         | `instrument.size_precision`  | `process_trade_tick`        |
+| `Bar`          | `open`, `high`, `low`, `close` | `instrument.price_precision` | `process_bar`               |
+| `Bar`          | `volume` (base units)          | `instrument.size_precision`  | `process_bar`               |
+| `Order`        | `quantity`                     | `instrument.size_precision`  | `process_order`             |
+| `Order`        | `price`                        | `instrument.price_precision` | `process_order`             |
+| `Order`        | `trigger_price`                | `instrument.price_precision` | `process_order`             |
+| `Order`        | `activation_price`\*           | `instrument.price_precision` | `process_order`             |
+| Order update   | `quantity`                     | `instrument.size_precision`  | `update_order`              |
+| Order update   | `price`, `trigger_price`       | `instrument.price_precision` | `update_order`              |
+| Fill           | `fill_qty`                     | `instrument.size_precision`  | `apply_fills`, `fill_order` |
+| Fill           | `fill_px`                      | `instrument.price_precision` | `apply_fills`               |
 
-*`activation_price` is immutable after order submission.
+\*`activation_price` is immutable after order submission.
 
 :::warning
 `Bar.volume` must be in **base currency units**. Some data providers report quote-currency volume;
@@ -1156,15 +1407,11 @@ Also verify that:
 
 :::
 
-## Account types
+## Accounts
 
-When you attach a venue to the engine—either for live trading or a back‑test—you must pick one of three accounting modes by passing the `account_type` parameter:
-
-| Account type           | Typical use-case                                          | What the engine locks                                                                                              |
-| ---------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------|
-| Cash                   | Spot trading (e.g., BTC/USDT, stocks).                    | Notional value for every position a pending order would open.                                                      |
-| Margin                 | Derivatives or any product that allows leverage.          | Initial margin for each order plus maintenance margin for open positions.                                          |
-| Betting                | Sports betting, bookmaking.                               | Stake required by the venue; no leverage.                                                                          |
+Every backtest venue is attached with one of three `account_type` values:
+`CASH`, `MARGIN`, or `BETTING`. For the full data model, query API, and margin
+model reference, see [Accounting](accounting.md).
 
 Example of adding a `CASH` account for a backtest venue:
 
@@ -1187,108 +1434,19 @@ engine.add_venue(
 )
 ```
 
-### Cash accounts
-
-Cash accounts settle trades in full; there is no leverage and therefore no concept of margin.
-
-### Margin accounts
-
-A *margin account* facilitates trading of instruments requiring margin, such as futures or leveraged products.
-It tracks account balances, calculates required margins, and manages leverage to ensure sufficient collateral for positions and orders.
-
-**Key concepts**:
-
-- **Leverage**: Amplifies trading exposure relative to account equity. Higher leverage increases potential returns and risks.
-- **Initial Margin**: Collateral required to submit an order to open a position.
-- **Maintenance Margin**: Minimum collateral required to maintain an open position.
-- **Locked Balance**: Funds reserved as collateral, unavailable for new orders or withdrawals.
-
-:::note
-Reduce-only orders **do not** contribute to `balance_locked` in cash accounts,
-nor do they add to initial margin in margin accounts—as they can only reduce existing exposure.
-:::
-
-### Betting accounts
-
-Betting accounts are specialised for venues where you stake an amount to win or lose a fixed payout (some prediction markets, sports books, etc.).
-The engine locks only the stake required by the venue; leverage and margin are not applicable.
-
 ## Margin models
 
-NautilusTrader provides flexible margin calculation models to accommodate different venue types and trading scenarios.
+Margin models determine how the simulated exchange reserves collateral for
+orders and positions in backtest runs. The model types (`StandardMarginModel`
+vs `LeveragedMarginModel`), their formulas, the default behavior, and custom
+model authoring are covered in the dedicated
+[Accounting](accounting.md#margin-models) guide.
 
-### Overview
+This section covers only the backtest-specific configuration.
 
-Different venues and brokers have varying approaches to calculating margin requirements:
+### Backtest venue configuration
 
-- **Traditional Brokers** (Interactive Brokers, TD Ameritrade): Fixed margin percentages regardless of leverage.
-- **Crypto Exchanges** (Binance, some others): Leverage may reduce margin requirements.
-- **Futures Exchanges** (CME, ICE): Fixed margin amounts per contract.
-
-### Available models
-
-#### StandardMarginModel
-
-Uses fixed percentages without leverage division, matching traditional broker behavior.
-
-**Formula:**
-
-```python
-# Fixed percentages - leverage ignored
-margin = notional * instrument.margin_init
-```
-
-- Initial Margin = `notional_value * instrument.margin_init`
-- Maintenance Margin = `notional_value * instrument.margin_maint`
-
-**Use cases:**
-
-- Traditional brokers (Interactive Brokers, TD Ameritrade).
-- Futures exchanges (CME, ICE).
-- Forex brokers with fixed margin requirements.
-
-#### LeveragedMarginModel
-
-Divides margin requirements by leverage.
-
-**Formula:**
-
-```python
-# Leverage reduces margin requirements
-adjusted_notional = notional / leverage
-margin = adjusted_notional * instrument.margin_init
-```
-
-- Initial Margin = `(notional_value / leverage) * instrument.margin_init`
-- Maintenance Margin = `(notional_value / leverage) * instrument.margin_maint`
-
-**Use cases:**
-
-- Crypto exchanges that reduce margin with leverage.
-- Venues where leverage affects margin requirements.
-
-### Usage
-
-#### Programmatic configuration
-
-```python
-from nautilus_trader.backtest.models import LeveragedMarginModel
-from nautilus_trader.backtest.models import StandardMarginModel
-from nautilus_trader.test_kit.stubs.execution import TestExecStubs
-
-# Create account
-account = TestExecStubs.margin_account()
-
-# Set standard model for traditional brokers
-standard_model = StandardMarginModel()
-account.set_margin_model(standard_model)
-
-# Or use leveraged model for crypto exchanges
-leveraged_model = LeveragedMarginModel()
-account.set_margin_model(leveraged_model)
-```
-
-#### Backtest configuration
+Specify the margin model on `BacktestVenueConfig` via `MarginModelConfig`:
 
 ```python
 from nautilus_trader.backtest.config import BacktestVenueConfig
@@ -1303,166 +1461,39 @@ venue_config = BacktestVenueConfig(
 )
 ```
 
-#### Available model types
+Available `model_type` values:
 
-- `"leveraged"`: Margin reduced by leverage (default).
-- `"standard"`: Fixed percentages (traditional brokers).
-- Custom class path: `"my_package.my_module.MyMarginModel"`.
+- `"leveraged"`: margin reduced by leverage (default).
+- `"standard"`: fixed percentages (traditional brokers).
+- Fully-qualified class path for a custom model:
+  `"my_package.my_module:MyMarginModel"`.
 
-#### Default behavior
+### High-level backtest API
 
-By default, `MarginAccount` uses `LeveragedMarginModel`.
-
-#### Real-world example
-
-**EUR/USD Trading Scenario:**
-
-- **Instrument**: EUR/USD
-- **Quantity**: 100,000 EUR
-- **Price**: 1.10000
-- **Notional Value**: $110,000
-- **Leverage**: 50x
-- **Instrument Margin Init**: 3%
-
-**Margin calculations:**
-
-| Model     | Calculation           | Result  | Percentage |
-|-----------|----------------------|---------|------------|
-| Standard  | $110,000 × 0.03      | $3,300  | 3.00%      |
-| Leveraged | ($110,000 ÷ 50) × 0.03 | $66   | 0.06%      |
-
-**Account balance impact:**
-
-- **Account Balance**: $10,000.
-- **Standard Model**: Cannot trade (requires $3,300 margin).
-- **Leveraged Model**: Can trade (requires only $66 margin).
-
-### Real-world scenarios
-
-#### Interactive Brokers EUR/USD futures
+When using the high-level API, attach the margin model in the same way:
 
 ```python
-# IB requires fixed margin regardless of leverage
-account.set_margin_model(StandardMarginModel())
-margin = account.calculate_margin_init(instrument, quantity, price)
-# Result: Fixed percentage of notional value
-```
-
-#### Binance crypto trading
-
-```python
-# Binance may reduce margin with leverage
-account.set_margin_model(LeveragedMarginModel())
-margin = account.calculate_margin_init(instrument, quantity, price)
-# Result: Margin reduced by leverage factor
-```
-
-### Model selection
-
-#### Using the default model
-
-The default `LeveragedMarginModel` works out of the box:
-
-```python
-account = TestExecStubs.margin_account()
-margin = account.calculate_margin_init(instrument, quantity, price)
-```
-
-#### Using the standard model
-
-For traditional broker behavior:
-
-```python
-account.set_margin_model(StandardMarginModel())
-margin = account.calculate_margin_init(instrument, quantity, price)
-```
-
-### Custom models
-
-You can create custom margin models by inheriting from `MarginModel`. Custom models receive configuration through the `MarginModelConfig`:
-
-```python
-from nautilus_trader.backtest.models import MarginModel
-from nautilus_trader.backtest.config import MarginModelConfig
-
-class RiskAdjustedMarginModel(MarginModel):
-    def __init__(self, config: MarginModelConfig):
-        """Initialize with configuration parameters."""
-        self.risk_multiplier = Decimal(str(config.config.get("risk_multiplier", 1.0)))
-        self.use_leverage = config.config.get("use_leverage", False)
-
-    def calculate_margin_init(self, instrument, quantity, price, leverage, use_quote_for_inverse=False):
-        notional = instrument.notional_value(quantity, price, use_quote_for_inverse)
-        if self.use_leverage:
-            adjusted_notional = notional.as_decimal() / leverage
-        else:
-            adjusted_notional = notional.as_decimal()
-        margin = adjusted_notional * instrument.margin_init * self.risk_multiplier
-        return Money(margin, instrument.quote_currency)
-
-    def calculate_margin_maint(self, instrument, side, quantity, price, leverage, use_quote_for_inverse=False):
-        return self.calculate_margin_init(instrument, quantity, price, leverage, use_quote_for_inverse)
-```
-
-#### Using custom models
-
-**Programmatic:**
-
-```python
-from nautilus_trader.backtest.config import MarginModelConfig
-from nautilus_trader.backtest.config import MarginModelFactory
-
-config = MarginModelConfig(
-    model_type="my_package.my_module:RiskAdjustedMarginModel",
-    config={"risk_multiplier": 1.5, "use_leverage": False}
-)
-
-custom_model = MarginModelFactory.create(config)
-account.set_margin_model(custom_model)
-```
-
-### High-level backtest API configuration
-
-When using the high-level backtest API, you can specify margin models in your venue configuration using `MarginModelConfig`:
-
-```python
-from nautilus_trader.backtest.config import MarginModelConfig
 from nautilus_trader.backtest.config import BacktestVenueConfig
+from nautilus_trader.backtest.config import MarginModelConfig
 from nautilus_trader.config import BacktestRunConfig
 
-# Configure venue with specific margin model
 venue_config = BacktestVenueConfig(
     name="SIM",
     oms_type="NETTING",
     account_type="MARGIN",
     starting_balances=["1_000_000 USD"],
     margin_model=MarginModelConfig(
-        model_type="standard"  # Use standard model for traditional broker simulation
+        model_type="standard",  # Traditional broker simulation
     ),
 )
 
-# Use in backtest configuration
 config = BacktestRunConfig(
     venues=[venue_config],
     # ... other config
 )
 ```
 
-#### Configuration examples
-
-**Standard model (traditional brokers):**
-
-```python
-margin_model=MarginModelConfig(model_type="standard")
-```
-
-**Leveraged model (default):**
-
-```python
-margin_model=MarginModelConfig(model_type="leveraged")  # Default
-```
-
-**Custom model with configuration:**
+Custom model with parameters:
 
 ```python
 margin_model=MarginModelConfig(
@@ -1471,11 +1502,35 @@ margin_model=MarginModelConfig(
         "risk_multiplier": 1.5,
         "use_leverage": False,
         "volatility_threshold": 0.02,
-    }
+    },
 )
 ```
 
-The margin model will be automatically applied to the simulated exchange during backtest execution.
+The model is applied to the simulated exchange during backtest execution.
+
+## Trade ID derivation
+
+The simulated exchange (used by both backtest and sandbox execution) emits a
+deterministic `TradeId` for each generated fill. The ID is formatted as
+`T-{hash:016x}-{count:03d}`, where the 16-character hex is an FNV-1a hash of
+`(venue, raw_id, ts_init)` and the trailing counter distinguishes multiple
+fills at the same `ts_init` (e.g. several legs of a bar-driven fill).
+
+**Properties**:
+
+- Deterministic across runs: the same replayed data produces the same
+  `TradeId` every time, so downstream dedup and golden-output comparisons stay
+  stable.
+- Collision-safe across resets: `ts_init` is pinned in backtest data and
+  monotonic in live/sandbox, so a `BacktestEngine.reset()` (or an in-memory
+  `IdsGenerator` reset in a sandbox with persisted orders) cannot mint a
+  `TradeId` that collides with one already in the cache.
+- Bounded length: the hash keeps the identifier under the 36-character
+  `TradeId` cap regardless of venue name length.
+
+The `use_random_ids` venue flag still governs `VenueOrderId` and `PositionId`
+generation, but `TradeId` is always deterministic and is not affected by the
+flag.
 
 ## Related guides
 

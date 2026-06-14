@@ -22,7 +22,7 @@ use std::{
     fmt::Debug,
     path::PathBuf,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -34,38 +34,45 @@ use nautilus_common::{
     clients::DataClient,
     live::{runner::get_data_event_sender, runtime::get_runtime},
     messages::{
-        DataEvent,
+        DataEvent, DataResponse,
         data::{
-            RequestBars, RequestInstruments, RequestQuotes, RequestTrades, SubscribeBookDeltas,
+            InstrumentResponse, InstrumentsResponse, RequestBars, RequestInstrument,
+            RequestInstruments, RequestQuotes, RequestTrades, SubscribeBookDeltas,
             SubscribeInstrument, SubscribeInstrumentStatus, SubscribeQuotes, SubscribeTrades,
             UnsubscribeBookDeltas, UnsubscribeInstrumentStatus, UnsubscribeQuotes,
             UnsubscribeTrades,
         },
     },
 };
-use nautilus_core::{MUTEX_POISONED, time::AtomicTime};
+use nautilus_core::{
+    AtomicMap, MUTEX_POISONED, Params, UnixNanos,
+    string::secret::REDACTED,
+    time::{AtomicTime, get_atomic_clock_realtime},
+};
 use nautilus_model::{
     enums::BarAggregation,
-    identifiers::{ClientId, Symbol, Venue},
-    instruments::Instrument,
+    identifiers::{ClientId, InstrumentId, Symbol, Venue},
+    instruments::{Instrument, InstrumentAny},
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::Credential,
+    common::{Credential, DATABENTO_VENUE},
     historical::{DatabentoHistoricalClient, RangeQueryParams},
-    live::{DatabentoFeedHandler, LiveCommand, LiveMessage},
+    live::{DatabentoFeedHandler, DatabentoMessage, HandlerCommand},
     loader::DatabentoDataLoader,
     symbology::instrument_id_to_symbol_string,
     types::PublisherId,
 };
 
+const PRICE_PRECISION_PARAM: &str = "price_precision";
+
 /// Configuration for the Databento data client.
 #[derive(Clone)]
 pub struct DatabentoDataClientConfig {
     /// Databento API credential.
-    credential: Credential,
+    pub(crate) credential: Credential,
     /// Path to publishers.json file.
     pub publishers_filepath: PathBuf,
     /// Whether to use exchange as venue for GLBX instruments.
@@ -74,22 +81,16 @@ pub struct DatabentoDataClientConfig {
     pub bars_timestamp_on_close: bool,
     /// Reconnection timeout in minutes (None for infinite retries).
     pub reconnect_timeout_mins: Option<u64>,
-    /// Optional HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL.
-    pub ws_proxy_url: Option<String>,
 }
 
 impl Debug for DatabentoDataClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(DatabentoDataClientConfig))
-            .field("credential", &"<redacted>")
+            .field("credential", &REDACTED)
             .field("publishers_filepath", &self.publishers_filepath)
             .field("use_exchange_as_venue", &self.use_exchange_as_venue)
             .field("bars_timestamp_on_close", &self.bars_timestamp_on_close)
             .field("reconnect_timeout_mins", &self.reconnect_timeout_mins)
-            .field("http_proxy_url", &self.http_proxy_url)
-            .field("ws_proxy_url", &self.ws_proxy_url)
             .finish()
     }
 }
@@ -109,8 +110,6 @@ impl DatabentoDataClientConfig {
             use_exchange_as_venue,
             bars_timestamp_on_close,
             reconnect_timeout_mins: Some(10), // Default: 10 minutes
-            http_proxy_url: None,
-            ws_proxy_url: None,
         }
     }
 
@@ -133,6 +132,10 @@ impl DatabentoDataClientConfig {
 /// and `DatabentoHistoricalClient` for historical data requests. It supports multiple
 /// datasets simultaneously, with separate feed handlers per dataset.
 #[cfg_attr(feature = "python", pyo3::pyclass)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.databento")
+)]
 #[derive(Debug)]
 pub struct DatabentoDataClient {
     /// Client identifier.
@@ -146,7 +149,7 @@ pub struct DatabentoDataClient {
     /// Data loader for venue-to-dataset mapping.
     loader: DatabentoDataLoader,
     /// Feed handler command senders per dataset.
-    cmd_channels: Arc<Mutex<AHashMap<String, tokio::sync::mpsc::UnboundedSender<LiveCommand>>>>,
+    cmd_channels: Arc<Mutex<AHashMap<String, tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>>,
     /// Task handles for lifecycle management.
     task_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
     /// Cancellation token for graceful shutdown.
@@ -154,7 +157,7 @@ pub struct DatabentoDataClient {
     /// Publisher to venue mapping.
     publisher_venue_map: Arc<IndexMap<PublisherId, Venue>>,
     /// Symbol to venue mapping (for caching).
-    symbol_venue_map: Arc<RwLock<AHashMap<Symbol, Venue>>>,
+    symbol_venue_map: Arc<AtomicMap<Symbol, Venue>>,
     /// Data event sender for forwarding data to the async runner.
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
 }
@@ -171,7 +174,7 @@ impl DatabentoDataClient {
         clock: &'static AtomicTime,
     ) -> anyhow::Result<Self> {
         let historical = DatabentoHistoricalClient::new(
-            config.api_key().to_string(),
+            config.credential.clone(),
             config.publishers_filepath.clone(),
             clock,
             config.use_exchange_as_venue,
@@ -202,7 +205,7 @@ impl DatabentoDataClient {
             task_handles: Arc::new(Mutex::new(Vec::new())),
             cancellation_token: CancellationToken::new(),
             publisher_venue_map: Arc::new(publisher_venue_map),
-            symbol_venue_map: Arc::new(RwLock::new(AHashMap::new())),
+            symbol_venue_map: Arc::new(AtomicMap::new()),
             data_sender,
         })
     }
@@ -220,22 +223,16 @@ impl DatabentoDataClient {
     }
 
     /// Gets or creates a feed handler for the specified dataset.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the feed handler cannot be created.
-    fn get_or_create_feed_handler(&self, dataset: &str) -> anyhow::Result<()> {
+    fn get_or_create_feed_handler(&self, dataset: &str) {
         let mut channels = self.cmd_channels.lock().expect(MUTEX_POISONED);
 
         if !channels.contains_key(dataset) {
             log::info!("Creating new feed handler for dataset: {dataset}");
-            let cmd_tx = self.initialize_live_feed(dataset.to_string())?;
+            let cmd_tx = self.initialize_live_feed(dataset.to_string());
             channels.insert(dataset.to_string(), cmd_tx);
 
             log::debug!("Feed handler created for dataset: {dataset}, channel stored");
         }
-
-        Ok(())
     }
 
     /// Sends a command to a specific dataset's feed handler.
@@ -243,7 +240,7 @@ impl DatabentoDataClient {
     /// # Errors
     ///
     /// Returns an error if the command cannot be sent.
-    fn send_command_to_dataset(&self, dataset: &str, cmd: LiveCommand) -> anyhow::Result<()> {
+    fn send_command_to_dataset(&self, dataset: &str, cmd: HandlerCommand) -> anyhow::Result<()> {
         let channels = self.cmd_channels.lock().expect(MUTEX_POISONED);
         if let Some(tx) = channels.get(dataset) {
             tx.send(cmd)
@@ -255,19 +252,15 @@ impl DatabentoDataClient {
     }
 
     /// Initializes the live feed handler for streaming data.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the feed handler cannot be started.
     fn initialize_live_feed(
         &self,
         dataset: String,
-    ) -> anyhow::Result<tokio::sync::mpsc::UnboundedSender<LiveCommand>> {
+    ) -> tokio::sync::mpsc::UnboundedSender<HandlerCommand> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(1000);
 
         let mut feed_handler = DatabentoFeedHandler::new(
-            self.config.api_key().to_string(),
+            self.config.credential.clone(),
             dataset,
             cmd_rx,
             msg_tx,
@@ -300,42 +293,43 @@ impl DatabentoDataClient {
         // Spawn message processing task with cancellation support
         let msg_handle = get_runtime().spawn(async move {
             let mut msg_rx = msg_rx;
+
             loop {
                 tokio::select! {
                     msg = msg_rx.recv() => {
                         match msg {
-                            Some(LiveMessage::Data(data)) => {
+                            Some(DatabentoMessage::Data(data)) => {
                                 log::debug!("Received data: {data:?}");
                                 if let Err(e) = data_sender.send(DataEvent::Data(data)) {
                                     log::error!("Failed to send data event: {e}");
                                 }
                             }
-                            Some(LiveMessage::Instrument(instrument)) => {
+                            Some(DatabentoMessage::Instrument(instrument)) => {
                                 log::info!("Received instrument definition: {}", instrument.id());
-                                if let Err(e) = data_sender.send(DataEvent::Instrument(instrument)) {
+                                if let Err(e) = data_sender.send(DataEvent::Instrument(*instrument)) {
                                     log::error!("Failed to send instrument: {e}");
                                 }
                             }
-                            Some(LiveMessage::Status(status)) => {
+                            Some(DatabentoMessage::Status(status)) => {
                                 log::debug!("Received status: {status:?}");
                                 // TODO: Forward to appropriate handler
                             }
-                            Some(LiveMessage::Imbalance(imbalance)) => {
+                            Some(DatabentoMessage::Imbalance(imbalance)) => {
                                 log::debug!("Received imbalance: {imbalance:?}");
                                 // TODO: Forward to appropriate handler
                             }
-                            Some(LiveMessage::Statistics(statistics)) => {
+                            Some(DatabentoMessage::Statistics(statistics)) => {
                                 log::debug!("Received statistics: {statistics:?}");
                                 // TODO: Forward to appropriate handler
                             }
-                            Some(LiveMessage::SubscriptionAck(ack)) => {
+                            Some(DatabentoMessage::SubscriptionAck(ack)) => {
                                 log::debug!("Received subscription ack: {}", ack.message);
                             }
-                            Some(LiveMessage::Error(error)) => {
+                            Some(DatabentoMessage::Error(error)) => {
                                 log::error!("Feed handler error: {error}");
                                 // TODO: Handle error appropriately
                             }
-                            Some(LiveMessage::Close) => {
+                            Some(DatabentoMessage::Close) => {
                                 log::info!("Feed handler closed");
                                 break;
                             }
@@ -359,7 +353,7 @@ impl DatabentoDataClient {
             handles.push(msg_handle);
         }
 
-        Ok(cmd_tx)
+        cmd_tx
     }
 }
 
@@ -399,8 +393,8 @@ impl DataClient for DatabentoDataClient {
         // Send close command to all active feed handlers
         let channels = self.cmd_channels.lock().expect(MUTEX_POISONED);
         for (dataset, tx) in channels.iter() {
-            if let Err(e) = tx.send(LiveCommand::Close) {
-                log::error!("Failed to send close command to dataset {dataset}: {e}");
+            if let Err(e) = tx.send(HandlerCommand::Close) {
+                log::warn!("Failed to send close command to dataset {dataset}: {e}");
             }
         }
 
@@ -440,8 +434,8 @@ impl DataClient for DatabentoDataClient {
         {
             let channels = self.cmd_channels.lock().expect(MUTEX_POISONED);
             for (dataset, tx) in channels.iter() {
-                if let Err(e) = tx.send(LiveCommand::Close) {
-                    log::error!("Failed to send close command to dataset {dataset}: {e}");
+                if let Err(e) = tx.send(HandlerCommand::Close) {
+                    log::warn!("Failed to send close command to dataset {dataset}: {e}");
                 }
             }
         }
@@ -485,7 +479,7 @@ impl DataClient for DatabentoDataClient {
     /// # Errors
     ///
     /// Returns an error if the subscription request fails.
-    fn subscribe_instrument(&mut self, cmd: &SubscribeInstrument) -> anyhow::Result<()> {
+    fn subscribe_instrument(&mut self, cmd: SubscribeInstrument) -> anyhow::Result<()> {
         log::debug!("Subscribe instrument: {cmd:?}");
 
         let dataset = self.get_dataset_for_venue(cmd.instrument_id.venue)?;
@@ -494,24 +488,23 @@ impl DataClient for DatabentoDataClient {
             !channels.contains_key(&dataset)
         };
 
-        self.get_or_create_feed_handler(&dataset)?;
+        self.get_or_create_feed_handler(&dataset);
 
         // Start the feed handler if it was newly created
         if was_new_handler {
-            self.send_command_to_dataset(&dataset, LiveCommand::Start)?;
+            self.send_command_to_dataset(&dataset, HandlerCommand::Start)?;
         }
 
-        let symbol = instrument_id_to_symbol_string(
-            cmd.instrument_id,
-            &mut self.symbol_venue_map.write().unwrap(),
-        );
+        self.symbol_venue_map
+            .insert(cmd.instrument_id.symbol, cmd.instrument_id.venue);
+        let symbol = cmd.instrument_id.symbol.to_string();
 
         let subscription = Subscription::builder()
             .schema(databento::dbn::Schema::Definition)
             .symbols(symbol)
             .build();
 
-        self.send_command_to_dataset(&dataset, LiveCommand::Subscribe(subscription))?;
+        self.send_command_to_dataset(&dataset, HandlerCommand::Subscribe(subscription))?;
 
         Ok(())
     }
@@ -521,7 +514,7 @@ impl DataClient for DatabentoDataClient {
     /// # Errors
     ///
     /// Returns an error if the subscription request fails.
-    fn subscribe_quotes(&mut self, cmd: &SubscribeQuotes) -> anyhow::Result<()> {
+    fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
         log::debug!("Subscribe quotes: {cmd:?}");
 
         let dataset = self.get_dataset_for_venue(cmd.instrument_id.venue)?;
@@ -530,24 +523,29 @@ impl DataClient for DatabentoDataClient {
             !channels.contains_key(&dataset)
         };
 
-        self.get_or_create_feed_handler(&dataset)?;
+        self.get_or_create_feed_handler(&dataset);
 
         // Start the feed handler if it was newly created
         if was_new_handler {
-            self.send_command_to_dataset(&dataset, LiveCommand::Start)?;
+            self.send_command_to_dataset(&dataset, HandlerCommand::Start)?;
         }
 
-        let symbol = instrument_id_to_symbol_string(
-            cmd.instrument_id,
-            &mut self.symbol_venue_map.write().unwrap(),
-        );
+        self.symbol_venue_map
+            .insert(cmd.instrument_id.symbol, cmd.instrument_id.venue);
+        let symbol = cmd.instrument_id.symbol.to_string();
+        if let Some(price_precision) = price_precision_from_params(cmd.params.as_ref())? {
+            self.send_command_to_dataset(
+                &dataset,
+                HandlerCommand::SetPricePrecision(cmd.instrument_id.symbol, price_precision),
+            )?;
+        }
 
         let subscription = Subscription::builder()
             .schema(databento::dbn::Schema::Mbp1) // Market by price level 1 for quotes
             .symbols(symbol)
             .build();
 
-        self.send_command_to_dataset(&dataset, LiveCommand::Subscribe(subscription))?;
+        self.send_command_to_dataset(&dataset, HandlerCommand::Subscribe(subscription))?;
 
         Ok(())
     }
@@ -557,7 +555,7 @@ impl DataClient for DatabentoDataClient {
     /// # Errors
     ///
     /// Returns an error if the subscription request fails.
-    fn subscribe_trades(&mut self, cmd: &SubscribeTrades) -> anyhow::Result<()> {
+    fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
         log::debug!("Subscribe trades: {cmd:?}");
 
         let dataset = self.get_dataset_for_venue(cmd.instrument_id.venue)?;
@@ -566,24 +564,29 @@ impl DataClient for DatabentoDataClient {
             !channels.contains_key(&dataset)
         };
 
-        self.get_or_create_feed_handler(&dataset)?;
+        self.get_or_create_feed_handler(&dataset);
 
         // Start the feed handler if it was newly created
         if was_new_handler {
-            self.send_command_to_dataset(&dataset, LiveCommand::Start)?;
+            self.send_command_to_dataset(&dataset, HandlerCommand::Start)?;
         }
 
-        let symbol = instrument_id_to_symbol_string(
-            cmd.instrument_id,
-            &mut self.symbol_venue_map.write().unwrap(),
-        );
+        self.symbol_venue_map
+            .insert(cmd.instrument_id.symbol, cmd.instrument_id.venue);
+        let symbol = cmd.instrument_id.symbol.to_string();
+        if let Some(price_precision) = price_precision_from_params(cmd.params.as_ref())? {
+            self.send_command_to_dataset(
+                &dataset,
+                HandlerCommand::SetPricePrecision(cmd.instrument_id.symbol, price_precision),
+            )?;
+        }
 
         let subscription = Subscription::builder()
             .schema(databento::dbn::Schema::Trades)
             .symbols(symbol)
             .build();
 
-        self.send_command_to_dataset(&dataset, LiveCommand::Subscribe(subscription))?;
+        self.send_command_to_dataset(&dataset, HandlerCommand::Subscribe(subscription))?;
 
         Ok(())
     }
@@ -593,7 +596,7 @@ impl DataClient for DatabentoDataClient {
     /// # Errors
     ///
     /// Returns an error if the subscription request fails.
-    fn subscribe_book_deltas(&mut self, cmd: &SubscribeBookDeltas) -> anyhow::Result<()> {
+    fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
         log::debug!("Subscribe book deltas: {cmd:?}");
 
         let dataset = self.get_dataset_for_venue(cmd.instrument_id.venue)?;
@@ -602,24 +605,23 @@ impl DataClient for DatabentoDataClient {
             !channels.contains_key(&dataset)
         };
 
-        self.get_or_create_feed_handler(&dataset)?;
+        self.get_or_create_feed_handler(&dataset);
 
         // Start the feed handler if it was newly created
         if was_new_handler {
-            self.send_command_to_dataset(&dataset, LiveCommand::Start)?;
+            self.send_command_to_dataset(&dataset, HandlerCommand::Start)?;
         }
 
-        let symbol = instrument_id_to_symbol_string(
-            cmd.instrument_id,
-            &mut self.symbol_venue_map.write().unwrap(),
-        );
+        self.symbol_venue_map
+            .insert(cmd.instrument_id.symbol, cmd.instrument_id.venue);
+        let symbol = cmd.instrument_id.symbol.to_string();
 
         let subscription = Subscription::builder()
             .schema(databento::dbn::Schema::Mbo) // Market by order for book deltas
             .symbols(symbol)
             .build();
 
-        self.send_command_to_dataset(&dataset, LiveCommand::Subscribe(subscription))?;
+        self.send_command_to_dataset(&dataset, HandlerCommand::Subscribe(subscription))?;
 
         Ok(())
     }
@@ -631,7 +633,7 @@ impl DataClient for DatabentoDataClient {
     /// Returns an error if the subscription request fails.
     fn subscribe_instrument_status(
         &mut self,
-        cmd: &SubscribeInstrumentStatus,
+        cmd: SubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
         log::debug!("Subscribe instrument status: {cmd:?}");
 
@@ -641,24 +643,23 @@ impl DataClient for DatabentoDataClient {
             !channels.contains_key(&dataset)
         };
 
-        self.get_or_create_feed_handler(&dataset)?;
+        self.get_or_create_feed_handler(&dataset);
 
         // Start the feed handler if it was newly created
         if was_new_handler {
-            self.send_command_to_dataset(&dataset, LiveCommand::Start)?;
+            self.send_command_to_dataset(&dataset, HandlerCommand::Start)?;
         }
 
-        let symbol = instrument_id_to_symbol_string(
-            cmd.instrument_id,
-            &mut self.symbol_venue_map.write().unwrap(),
-        );
+        self.symbol_venue_map
+            .insert(cmd.instrument_id.symbol, cmd.instrument_id.venue);
+        let symbol = cmd.instrument_id.symbol.to_string();
 
         let subscription = Subscription::builder()
             .schema(databento::dbn::Schema::Status)
             .symbols(symbol)
             .build();
 
-        self.send_command_to_dataset(&dataset, LiveCommand::Subscribe(subscription))?;
+        self.send_command_to_dataset(&dataset, HandlerCommand::Subscribe(subscription))?;
 
         Ok(())
     }
@@ -728,36 +729,100 @@ impl DataClient for DatabentoDataClient {
 
         let historical_client = self.historical.clone();
         let data_sender = self.data_sender.clone();
+        let dataset = request
+            .venue
+            .map(|venue| self.get_dataset_for_venue(venue))
+            .transpose()?
+            .unwrap_or_else(|| "GLBX.MDP3".to_string());
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let venue = request.venue.unwrap_or(*DATABENTO_VENUE);
+        let start_nanos = request
+            .start
+            .map(|dt| UnixNanos::from(dt.timestamp_nanos_opt().unwrap_or(0) as u64));
+        let end_nanos = request
+            .end
+            .map(|dt| UnixNanos::from(dt.timestamp_nanos_opt().unwrap_or(0) as u64));
+        let request_params = request.params;
 
         get_runtime().spawn(async move {
-            let symbols = vec!["ALL_SYMBOLS".to_string()]; // TODO: Improve symbol handling
+            let query_params = instruments_query_params(dataset, start_nanos, end_nanos);
 
-            let params = RangeQueryParams {
-                dataset: "GLBX.MDP3".to_string(), // TODO: Make configurable
-                symbols,
-                start: request
-                    .start
-                    .map_or(0, |dt| dt.timestamp_nanos_opt().unwrap_or(0) as u64)
-                    .into(),
-                end: request
-                    .end
-                    .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0) as u64)
-                    .map(Into::into),
-                limit: None,
-                price_precision: None,
-            };
-
-            match historical_client.get_range_instruments(params).await {
+            match historical_client.get_range_instruments(query_params).await {
                 Ok(instruments) => {
                     log::info!("Retrieved {} instruments", instruments.len());
-                    for instrument in instruments {
-                        if let Err(e) = data_sender.send(DataEvent::Instrument(instrument)) {
-                            log::error!("Failed to send instrument: {e}");
-                        }
+
+                    let response = DataResponse::Instruments(InstrumentsResponse::new(
+                        request_id,
+                        client_id,
+                        venue,
+                        instruments,
+                        start_nanos,
+                        end_nanos,
+                        get_atomic_clock_realtime().get_time_ns(),
+                        request_params,
+                    ));
+
+                    if let Err(e) = data_sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send instruments response: {e}");
                     }
                 }
                 Err(e) => {
                     log::error!("Failed to request instruments: {e}");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
+        log::debug!("Request instrument: {request:?}");
+
+        let dataset = self.get_dataset_for_venue(request.instrument_id.venue)?;
+        let historical_client = self.historical.clone();
+        let data_sender = self.data_sender.clone();
+        let instrument_id = request.instrument_id;
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let start_nanos = request
+            .start
+            .map(|dt| UnixNanos::from(dt.timestamp_nanos_opt().unwrap_or(0) as u64));
+        let end_nanos = request
+            .end
+            .map(|dt| UnixNanos::from(dt.timestamp_nanos_opt().unwrap_or(0) as u64));
+        let request_params = request.params;
+
+        get_runtime().spawn(async move {
+            let query_params =
+                instrument_query_params(dataset, instrument_id, start_nanos, end_nanos);
+
+            match historical_client.get_range_instruments(query_params).await {
+                Ok(instruments) => {
+                    let instrument = requested_instrument(instruments, instrument_id);
+
+                    let Some(instrument) = instrument else {
+                        log::error!("Instrument not found: {instrument_id}");
+                        return;
+                    };
+
+                    let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
+                        request_id,
+                        client_id,
+                        instrument.id(),
+                        instrument,
+                        start_nanos,
+                        end_nanos,
+                        get_atomic_clock_realtime().get_time_ns(),
+                        request_params,
+                    )));
+
+                    if let Err(e) = data_sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send instrument response: {e}");
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to request instrument {instrument_id}: {e}");
                 }
             }
         });
@@ -901,5 +966,196 @@ impl DataClient for DatabentoDataClient {
         });
 
         Ok(())
+    }
+}
+
+fn instruments_query_params(
+    dataset: String,
+    start_nanos: Option<UnixNanos>,
+    end_nanos: Option<UnixNanos>,
+) -> RangeQueryParams {
+    RangeQueryParams {
+        dataset,
+        symbols: vec!["ALL_SYMBOLS".to_string()],
+        start: start_nanos.unwrap_or_default(),
+        end: end_nanos,
+        limit: None,
+        price_precision: None,
+    }
+}
+
+fn instrument_query_params(
+    dataset: String,
+    instrument_id: InstrumentId,
+    start_nanos: Option<UnixNanos>,
+    end_nanos: Option<UnixNanos>,
+) -> RangeQueryParams {
+    RangeQueryParams {
+        dataset,
+        symbols: vec![instrument_id_to_symbol_string(
+            instrument_id,
+            &mut AHashMap::new(), // TODO: Use proper symbol map
+        )],
+        start: start_nanos.unwrap_or_default(),
+        end: end_nanos,
+        limit: None,
+        price_precision: None,
+    }
+}
+
+fn requested_instrument(
+    instruments: Vec<InstrumentAny>,
+    instrument_id: InstrumentId,
+) -> Option<InstrumentAny> {
+    instruments
+        .into_iter()
+        .rev()
+        .find(|instrument| instrument.id() == instrument_id)
+}
+
+fn price_precision_from_params(params: Option<&Params>) -> anyhow::Result<Option<u8>> {
+    let Some(price_precision) = params.and_then(|params| params.get_u64(PRICE_PRECISION_PARAM))
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(u8::try_from(price_precision).map_err(|_| {
+        anyhow::anyhow!(
+            "`{PRICE_PRECISION_PARAM}` must be less than or equal to {}",
+            u8::MAX
+        )
+    })?))
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_model::{
+        identifiers::InstrumentId,
+        instruments::{CurrencyPair, InstrumentAny},
+        types::{Currency, Price, Quantity},
+    };
+    use rstest::rstest;
+    use serde_json::json;
+
+    use super::*;
+
+    fn currency_pair(instrument_id: &str) -> InstrumentAny {
+        currency_pair_with_ts_init(instrument_id, UnixNanos::default())
+    }
+
+    fn currency_pair_with_ts_init(instrument_id: &str, ts_init: UnixNanos) -> InstrumentAny {
+        let instrument_id = InstrumentId::from(instrument_id);
+        InstrumentAny::CurrencyPair(CurrencyPair::new(
+            instrument_id,
+            instrument_id.symbol,
+            Currency::from("BTC"),
+            Currency::from("USDT"),
+            2,
+            6,
+            Price::from("0.01"),
+            Quantity::from("0.000001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            ts_init,
+        ))
+    }
+
+    #[rstest]
+    fn test_instruments_query_params_requests_all_symbols() {
+        let start = UnixNanos::from(1_000_000_000);
+        let end = UnixNanos::from(2_000_000_000);
+
+        let params = instruments_query_params("GLBX.MDP3".to_string(), Some(start), Some(end));
+
+        assert_eq!(params.dataset, "GLBX.MDP3");
+        assert_eq!(params.symbols, vec!["ALL_SYMBOLS"]);
+        assert_eq!(params.start, start);
+        assert_eq!(params.end, Some(end));
+        assert_eq!(params.limit, None);
+        assert_eq!(params.price_precision, None);
+    }
+
+    #[rstest]
+    fn test_instrument_query_params_requests_single_symbol() {
+        let instrument_id = InstrumentId::from("ESM4.GLBX");
+
+        let params = instrument_query_params("GLBX.MDP3".to_string(), instrument_id, None, None);
+
+        assert_eq!(params.dataset, "GLBX.MDP3");
+        assert_eq!(params.symbols, vec!["ESM4"]);
+        assert_eq!(params.start, UnixNanos::default());
+        assert_eq!(params.end, None);
+        assert_eq!(params.limit, None);
+        assert_eq!(params.price_precision, None);
+    }
+
+    #[rstest]
+    fn test_requested_instrument_filters_exact_id() {
+        let requested_id = InstrumentId::from("BTCUSDT.BINANCE");
+        let instruments = vec![
+            currency_pair("ETHUSDT.BINANCE"),
+            currency_pair("BTCUSDT.BINANCE"),
+        ];
+
+        let instrument = requested_instrument(instruments, requested_id).expect("instrument");
+
+        assert_eq!(instrument.id(), requested_id);
+    }
+
+    #[rstest]
+    fn test_requested_instrument_returns_latest_matching_id() {
+        let requested_id = InstrumentId::from("BTCUSDT.BINANCE");
+        let instruments = vec![
+            currency_pair_with_ts_init("BTCUSDT.BINANCE", UnixNanos::from(1)),
+            currency_pair_with_ts_init("BTCUSDT.BINANCE", UnixNanos::from(2)),
+        ];
+
+        let instrument = requested_instrument(instruments, requested_id).expect("instrument");
+
+        assert_eq!(instrument.ts_init(), UnixNanos::from(2));
+    }
+
+    #[rstest]
+    fn test_requested_instrument_returns_none_on_miss() {
+        let instruments = vec![currency_pair("ETHUSDT.BINANCE")];
+
+        let instrument = requested_instrument(instruments, InstrumentId::from("BTCUSDT.BINANCE"));
+
+        assert!(instrument.is_none());
+    }
+
+    #[rstest]
+    fn test_price_precision_from_params() {
+        let mut params = Params::new();
+        params.insert(PRICE_PRECISION_PARAM.to_string(), json!(5));
+
+        let price_precision = price_precision_from_params(Some(&params)).unwrap();
+
+        assert_eq!(price_precision, Some(5));
+    }
+
+    #[rstest]
+    fn test_price_precision_from_params_rejects_out_of_range_value() {
+        let mut params = Params::new();
+        params.insert(
+            PRICE_PRECISION_PARAM.to_string(),
+            json!(u64::from(u8::MAX) + 1),
+        );
+
+        let result = price_precision_from_params(Some(&params));
+
+        assert!(result.is_err());
     }
 }

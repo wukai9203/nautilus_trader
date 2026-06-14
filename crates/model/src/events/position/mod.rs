@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     events::{PositionAdjusted, PositionChanged, PositionClosed, PositionOpened},
     identifiers::{AccountId, InstrumentId},
@@ -23,7 +25,7 @@ pub mod closed;
 pub mod opened;
 pub mod snapshot;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PositionEvent {
     PositionOpened(PositionOpened),
     PositionChanged(PositionChanged),
@@ -32,6 +34,7 @@ pub enum PositionEvent {
 }
 
 impl PositionEvent {
+    #[must_use]
     pub fn instrument_id(&self) -> InstrumentId {
         match self {
             Self::PositionOpened(position) => position.instrument_id,
@@ -41,6 +44,7 @@ impl PositionEvent {
         }
     }
 
+    #[must_use]
     pub fn account_id(&self) -> AccountId {
         match self {
             Self::PositionOpened(position) => position.account_id,
@@ -53,7 +57,7 @@ impl PositionEvent {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_core::UnixNanos;
+    use nautilus_core::{UUID4, UnixNanos};
     use rstest::*;
 
     use super::*;
@@ -80,7 +84,7 @@ mod tests {
             last_px: Price::from("1.0500"),
             currency: Currency::USD(),
             avg_px_open: 1.0500,
-            event_id: Default::default(),
+            event_id: UUID4::default(),
             ts_event: UnixNanos::from(1_000_000_000),
             ts_init: UnixNanos::from(2_000_000_000),
         }
@@ -107,7 +111,7 @@ mod tests {
             realized_return: 0.0,
             realized_pnl: None,
             unrealized_pnl: Money::new(75.0, Currency::USD()),
-            event_id: Default::default(),
+            event_id: UUID4::default(),
             ts_opened: UnixNanos::from(1_000_000_000),
             ts_event: UnixNanos::from(1_500_000_000),
             ts_init: UnixNanos::from(2_500_000_000),
@@ -137,7 +141,7 @@ mod tests {
             realized_pnl: Some(Money::new(112.50, Currency::USD())),
             unrealized_pnl: Money::new(0.0, Currency::USD()),
             duration: 3_600_000_000_000, // 1 hour in nanoseconds
-            event_id: Default::default(),
+            event_id: UUID4::default(),
             ts_opened: UnixNanos::from(1_000_000_000),
             ts_closed: Some(UnixNanos::from(4_600_000_000)),
             ts_event: UnixNanos::from(4_600_000_000),
@@ -191,17 +195,6 @@ mod tests {
         let event = PositionEvent::PositionClosed(closed);
 
         assert_eq!(event.account_id(), AccountId::from("SIM-001"));
-    }
-
-    #[rstest]
-    fn test_position_event_debug_formatting() {
-        let opened = create_test_position_opened();
-        let event = PositionEvent::PositionOpened(opened);
-
-        let debug_str = format!("{event:?}");
-        assert!(debug_str.contains("PositionOpened"));
-        assert!(debug_str.contains("EURUSD.SIM"));
-        assert!(debug_str.contains("SIM-001"));
     }
 
     #[rstest]

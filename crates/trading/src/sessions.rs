@@ -34,7 +34,17 @@ use strum::{Display, EnumIter, EnumString, FromRepr};
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.common.enums")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.common.enums",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE"
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.trading")
 )]
 pub enum ForexSession {
     Sydney,
@@ -45,7 +55,7 @@ pub enum ForexSession {
 
 impl ForexSession {
     /// Returns the timezone associated with the session.
-    const fn timezone(&self) -> Tz {
+    const fn timezone(self) -> Tz {
         match self {
             Self::Sydney => Sydney,
             Self::Tokyo => Tokyo,
@@ -55,7 +65,7 @@ impl ForexSession {
     }
 
     /// Returns the start and end times for the session in local time.
-    const fn session_times(&self) -> (NaiveTime, NaiveTime) {
+    const fn session_times(self) -> (NaiveTime, NaiveTime) {
         match self {
             Self::Sydney => (
                 NaiveTime::from_hms_opt(7, 0, 0).unwrap(),

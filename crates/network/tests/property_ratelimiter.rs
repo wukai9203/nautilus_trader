@@ -13,6 +13,11 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+#![allow(
+    clippy::cast_possible_truncation,
+    reason = "test arithmetic with known-safe values"
+)]
+
 //! Property-based tests for rate limiting components.
 //!
 //! These tests verify fundamental properties that should hold regardless of specific input values:
@@ -23,11 +28,219 @@
 
 use std::{num::NonZeroU32, time::Duration};
 
-use nautilus_network::ratelimiter::{RateLimiter, quota::Quota};
+use nautilus_network::ratelimiter::{RateLimiter, clock::FakeRelativeClock, quota::Quota};
 use proptest::prelude::*;
 use rstest::rstest;
 
+#[derive(Debug, Clone)]
+enum RateLimitOp {
+    Check(usize),
+    Advance(u64),
+}
+
+#[derive(Debug, Clone)]
+struct GcraReference {
+    now_ns: u128,
+    cell_ns: u128,
+    burst_ns: u128,
+    tat_by_key: Vec<Option<u128>>,
+}
+
+impl GcraReference {
+    fn new(quota: Quota, keys: usize) -> Self {
+        let cell_ns = quota.replenish_interval().as_nanos();
+        let burst_ns = cell_ns * u128::from(quota.burst_size().get());
+        Self {
+            now_ns: 0,
+            cell_ns,
+            burst_ns,
+            tat_by_key: vec![None; keys],
+        }
+    }
+
+    fn advance(&mut self, millis: u64) {
+        self.now_ns += Duration::from_millis(millis).as_nanos();
+    }
+
+    fn check(&mut self, key_index: usize) -> bool {
+        let tat = self.tat_by_key[key_index].unwrap_or(self.now_ns + self.cell_ns);
+        let earliest_time = tat.saturating_sub(self.burst_ns);
+
+        if self.now_ns < earliest_time {
+            false
+        } else {
+            self.tat_by_key[key_index] = Some(tat.max(self.now_ns) + self.cell_ns);
+            true
+        }
+    }
+}
+
+fn rate_limit_op_strategy() -> impl Strategy<Value = RateLimitOp> {
+    prop_oneof![
+        (0usize..5).prop_map(RateLimitOp::Check),
+        (0u64..=2_000).prop_map(RateLimitOp::Advance),
+    ]
+}
+
 proptest! {
+    // Pin regression files to the crate directory: the default source-parallel
+    // resolution has no `src` component for integration tests and lands at the
+    // workspace root instead
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::Direct(
+                concat!(env!("CARGO_MANIFEST_DIR"), "/proptest-regressions/ratelimiter.txt")
+            )
+        )),
+        ..ProptestConfig::default()
+    })]
+
+    /// Property: exact GCRA decisions match a reference model under deterministic time.
+    #[rstest]
+    fn rate_limiter_matches_reference_trace(
+        rate in 1u32..=20u32,
+        key_count in 1usize..=5,
+        ops in proptest::collection::vec(rate_limit_op_strategy(), 1..120)
+    ) {
+        let quota = Quota::per_second(NonZeroU32::new(rate).unwrap()).unwrap();
+        let clock = FakeRelativeClock::default();
+        let rate_limiter = RateLimiter::new_with_clock(Some(quota), vec![], clock);
+        let keys = (0..key_count)
+            .map(|index| format!("key-{index}"))
+            .collect::<Vec<_>>();
+        let mut reference = GcraReference::new(quota, key_count);
+
+        for (step, op) in ops.iter().enumerate() {
+            match *op {
+                RateLimitOp::Check(raw_key_index) => {
+                    let key_index = raw_key_index % key_count;
+                    let actual = rate_limiter.check_key(&keys[key_index]).is_ok();
+                    let expected = reference.check(key_index);
+                    prop_assert_eq!(
+                        actual,
+                        expected,
+                        "GCRA decision mismatch at step {}, op {:?}, rate={}, key_count={}",
+                        step,
+                        op,
+                        rate,
+                        key_count
+                    );
+                }
+                RateLimitOp::Advance(millis) => {
+                    rate_limiter.advance_clock(Duration::from_millis(millis));
+                    reference.advance(millis);
+                }
+            }
+        }
+    }
+
+    /// Property: admissions are bounded in every time window, under deterministic
+    /// time and the production quota shape (`with_period` + `allow_burst`).
+    ///
+    /// Implementation-independent: in any window of length m*t (t = replenish
+    /// interval) GCRA admits at most burst + m + 1 cells. Unlike the reference-
+    /// trace property this cannot be fooled by a misconception shared between
+    /// the implementation and a mirrored model.
+    #[rstest]
+    fn rate_limiter_never_exceeds_window_budget(
+        period_ms in 1u64..=1_000,
+        burst in 1u32..=10,
+        ops in proptest::collection::vec(rate_limit_op_strategy(), 1..200)
+    ) {
+        let quota = Quota::with_period(Duration::from_millis(period_ms))
+            .unwrap()
+            .allow_burst(NonZeroU32::new(burst).unwrap());
+        let clock = FakeRelativeClock::default();
+        let rate_limiter = RateLimiter::new_with_clock(Some(quota), vec![], clock);
+
+        let key = "window".to_string();
+        let mut now_ns: u128 = 0;
+        let mut admitted_ns: Vec<u128> = Vec::new();
+
+        for op in &ops {
+            match *op {
+                RateLimitOp::Check(_) => {
+                    if rate_limiter.check_key(&key).is_ok() {
+                        admitted_ns.push(now_ns);
+                    }
+                }
+                RateLimitOp::Advance(millis) => {
+                    rate_limiter.advance_clock(Duration::from_millis(millis));
+                    now_ns += Duration::from_millis(millis).as_nanos();
+                }
+            }
+        }
+
+        let t_ns = u128::from(period_ms) * 1_000_000;
+        for window_cells in [1u128, u128::from(burst)] {
+            let window_ns = window_cells * t_ns;
+            let budget = usize::try_from(u128::from(burst) + window_cells + 1).unwrap();
+
+            for (i, start) in admitted_ns.iter().enumerate() {
+                let end = start + window_ns;
+                let in_window = admitted_ns[i..].iter().take_while(|&&ts| ts < end).count();
+                prop_assert!(
+                    in_window <= budget,
+                    "{} admissions within a {}-cell window (budget {}), period_ms={}, burst={}",
+                    in_window,
+                    window_cells,
+                    budget,
+                    period_ms,
+                    burst
+                );
+            }
+        }
+    }
+
+    /// Property: keyed quotas override the default quota under deterministic time.
+    #[rstest]
+    fn rate_limiter_keyed_quota_overrides_default_trace(
+        default_rate in 1u32..=20u32,
+        keyed_rate_offset in 1u32..20u32,
+        ops in proptest::collection::vec(rate_limit_op_strategy(), 1..120)
+    ) {
+        let keyed_rate = 1 + ((default_rate + keyed_rate_offset - 1) % 20);
+        let default_quota = Quota::per_second(NonZeroU32::new(default_rate).unwrap()).unwrap();
+        let keyed_quota = Quota::per_second(NonZeroU32::new(keyed_rate).unwrap()).unwrap();
+        let clock = FakeRelativeClock::default();
+        let default_key = "default-key".to_string();
+        let keyed_key = "keyed-key".to_string();
+        let rate_limiter = RateLimiter::new_with_clock(
+            Some(default_quota),
+            vec![(keyed_key.clone(), keyed_quota)],
+            clock,
+        );
+        let mut default_reference = GcraReference::new(default_quota, 1);
+        let mut keyed_reference = GcraReference::new(keyed_quota, 1);
+
+        for (step, op) in ops.iter().enumerate() {
+            match *op {
+                RateLimitOp::Check(raw_key_index) => {
+                    let (key, reference, rate) = if raw_key_index % 2 == 0 {
+                        (&keyed_key, &mut keyed_reference, keyed_rate)
+                    } else {
+                        (&default_key, &mut default_reference, default_rate)
+                    };
+                    let actual = rate_limiter.check_key(key).is_ok();
+                    let expected = reference.check(0);
+                    prop_assert_eq!(
+                        actual,
+                        expected,
+                        "GCRA override mismatch at step {}, op {:?}, rate={}",
+                        step,
+                        op,
+                        rate
+                    );
+                }
+                RateLimitOp::Advance(millis) => {
+                    rate_limiter.advance_clock(Duration::from_millis(millis));
+                    default_reference.advance(millis);
+                    keyed_reference.advance(millis);
+                }
+            }
+        }
+    }
+
     /// Property: Rate limiter should never allow more requests than quota permits initially.
     #[rstest]
     fn rate_limiter_respects_quota_bounds(
@@ -36,7 +249,7 @@ proptest! {
         request_count in 1usize..=200
     ) {
         let rate_nonzero = NonZeroU32::new(rate).unwrap();
-        let quota = Quota::per_second(rate_nonzero);
+        let quota = Quota::per_second(rate_nonzero).unwrap();
         let rate_limiter = RateLimiter::new_with_quota(
             None,
             vec![(key.clone(), quota)]
@@ -90,7 +303,7 @@ proptest! {
         rate in 1u32..=20u32
     ) {
         let rate_nonzero = NonZeroU32::new(rate).unwrap();
-        let quota = Quota::per_second(rate_nonzero);
+        let quota = Quota::per_second(rate_nonzero).unwrap();
 
         let keyed_quotas: Vec<(String, Quota)> = keys.iter()
             .map(|k| (k.clone(), quota))
@@ -139,7 +352,7 @@ proptest! {
         let rate_nonzero = NonZeroU32::new(rate).unwrap();
 
         // Should not panic on quota creation for different periods
-        let quota_second = Quota::per_second(rate_nonzero);
+        let quota_second = Quota::per_second(rate_nonzero).unwrap();
         let quota_minute = Quota::per_minute(rate_nonzero);
         let quota_hour = Quota::per_hour(rate_nonzero);
 
@@ -208,7 +421,7 @@ proptest! {
         request_count in 1usize..=150
     ) {
         let rate_nonzero = NonZeroU32::new(rate).unwrap();
-        let quota = Quota::per_second(rate_nonzero);
+        let quota = Quota::per_second(rate_nonzero).unwrap();
         let rate_limiter = RateLimiter::<String, _>::new_with_quota(
             Some(quota),
             vec![]
@@ -220,6 +433,7 @@ proptest! {
 
         // Make rapid sequential requests
         let start = std::time::Instant::now();
+
         for _ in 0..request_count {
             if rate_limiter.check_key(&key).is_ok() {
                 allowed_count += 1;
@@ -256,8 +470,8 @@ proptest! {
         key_rate in 1u32..=20u32,
         key in "[a-z]{1,8}"
     ) {
-        let default_quota = Quota::per_second(NonZeroU32::new(default_rate).unwrap());
-        let key_quota = Quota::per_second(NonZeroU32::new(key_rate).unwrap());
+        let default_quota = Quota::per_second(NonZeroU32::new(default_rate).unwrap()).unwrap();
+        let key_quota = Quota::per_second(NonZeroU32::new(key_rate).unwrap()).unwrap();
 
         let rate_limiter = RateLimiter::new_with_quota(
             Some(default_quota),
@@ -268,6 +482,7 @@ proptest! {
         let mut specific_allowed = 0usize;
         let specific_attempts = key_rate as usize + 1; // inclusive in original test
         let start_specific = std::time::Instant::now();
+
         for _ in 0..specific_attempts {
             if rate_limiter.check_key(&key).is_ok() {
                 specific_allowed += 1;
@@ -289,6 +504,7 @@ proptest! {
         let mut default_allowed = 0usize;
         let default_attempts = default_rate as usize + 1; // inclusive in original test
         let start_default = std::time::Instant::now();
+
         for _ in 0..default_attempts {
             if rate_limiter.check_key(&unknown_key).is_ok() {
                 default_allowed += 1;
@@ -330,6 +546,7 @@ proptest! {
             let mut allowed = 0usize;
             let attempts = (burst_size * 2) as usize;
             let start = std::time::Instant::now();
+
             for _ in 0..attempts {
                 if rate_limiter.check_key(&key).is_ok() {
                     allowed += 1;
@@ -362,13 +579,54 @@ proptest! {
         }
     }
 
+    /// Property: per_second succeeds for all max_burst <= 1_000_000_000
+    /// and always produces a positive replenish interval.
+    #[rstest]
+    fn per_second_valid_range_invariants(
+        max_burst in 1u32..=1_000_000_000u32,
+    ) {
+        let quota = Quota::per_second(NonZeroU32::new(max_burst).unwrap())
+            .expect("max_burst <= 1_000_000_000 should always succeed");
+        prop_assert!(
+            quota.replenish_interval().as_nanos() > 0,
+            "replenish_interval must be positive for max_burst={}",
+            max_burst
+        );
+    }
+
+    /// Property: per_minute never panics for any NonZeroU32 value.
+    #[rstest]
+    fn per_minute_full_range_never_panics(
+        max_burst in 1u32..=u32::MAX,
+    ) {
+        let quota = Quota::per_minute(NonZeroU32::new(max_burst).unwrap());
+        prop_assert!(
+            quota.replenish_interval().as_nanos() > 0,
+            "per_minute replenish_interval must be positive for max_burst={}",
+            max_burst
+        );
+    }
+
+    /// Property: per_hour never panics for any NonZeroU32 value.
+    #[rstest]
+    fn per_hour_full_range_never_panics(
+        max_burst in 1u32..=u32::MAX,
+    ) {
+        let quota = Quota::per_hour(NonZeroU32::new(max_burst).unwrap());
+        prop_assert!(
+            quota.replenish_interval().as_nanos() > 0,
+            "per_hour replenish_interval must be positive for max_burst={}",
+            max_burst
+        );
+    }
+
     /// Property: GCRA boundary edge case where t0 equals earliest_time exactly.
     #[rstest]
     fn gcra_boundary_exact_replenishment(
         rate in 1u32..=20u32
     ) {
         let rate_nonzero = NonZeroU32::new(rate).unwrap();
-        let quota = Quota::per_second(rate_nonzero);
+        let quota = Quota::per_second(rate_nonzero).unwrap();
         let rate_limiter = RateLimiter::<String, _>::new_with_quota(Some(quota), vec![]);
 
         let key = "boundary_test".to_string();

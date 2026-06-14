@@ -34,9 +34,10 @@ use axum::{
     routing::get,
 };
 use futures_util::StreamExt;
-use nautilus_bitmex::websocket::{client::BitmexWebSocketClient, messages::NautilusWsMessage};
+use nautilus_bitmex::websocket::{client::BitmexWebSocketClient, messages::BitmexWsMessage};
 use nautilus_common::testing::wait_until_async;
 use nautilus_model::identifiers::{AccountId, InstrumentId};
+use nautilus_network::websocket::TransportBackend;
 use rstest::rstest;
 use serde_json::json;
 
@@ -323,6 +324,7 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                                             .lock()
                                             .await
                                             .push((topic.to_string(), false));
+
                                         if socket
                                             .send(Message::Text(
                                                 serde_json::to_string(&response).unwrap().into(),
@@ -538,6 +540,7 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                     // Handle ping
                     else if data.get("op") == Some(&json!("ping")) {
                         let pong = json!({"op": "pong"});
+
                         if socket
                             .send(Message::Text(serde_json::to_string(&pong).unwrap().into()))
                             .await
@@ -603,6 +606,13 @@ where
     }
 }
 
+async fn trigger_server_disconnect(state: &TestServerState) {
+    state.drop_next_connection.store(true, Ordering::Relaxed);
+    // Server checks drop_next_connection every ~50ms in its recv loop.
+    // Wait long enough for it to notice without going through the handler.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
 async fn start_test_server()
 -> Result<(SocketAddr, TestServerState), Box<dyn std::error::Error + Send + Sync>> {
     // Bind to port 0 to let the OS assign an available port
@@ -631,7 +641,9 @@ async fn test_bitmex_websocket_client_creation() {
         Some("test_key".to_string()),    // api_key
         Some("test_secret".to_string()), // api_secret
         Some(get_test_account_id()),     // account_id
-        None,                            // heartbeat
+        5,                               // heartbeat,
+        TransportBackend::default(),
+        None,
     )
     .unwrap();
 
@@ -649,6 +661,8 @@ async fn test_websocket_connection() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -656,22 +670,83 @@ async fn test_websocket_connection() {
     // Connect to the mock server
     client.connect().await.unwrap();
 
-    // Wait a bit for the connection to be established
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Check connection count
-    let count = *state.connection_count.lock().await;
-    assert_eq!(count, 1);
+    let state_clone = state.clone();
+    wait_until_async(
+        || {
+            let state = state_clone.clone();
+            async move { *state.connection_count.lock().await == 1 }
+        },
+        Duration::from_secs(2),
+    )
+    .await;
+    assert_eq!(*state.connection_count.lock().await, 1);
 
     // Close the connection
     client.close().await.unwrap();
 
-    // Wait a bit for disconnection to complete
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let state_clone = state.clone();
+    wait_until_async(
+        || {
+            let state = state_clone.clone();
+            async move { *state.connection_count.lock().await == 0 }
+        },
+        Duration::from_secs(2),
+    )
+    .await;
+    assert_eq!(*state.connection_count.lock().await, 0);
+}
 
-    // Check connection count after disconnect
-    let count = *state.connection_count.lock().await;
-    assert_eq!(count, 0);
+#[rstest]
+#[tokio::test]
+async fn test_initial_authenticated_connect_subscribes_instrument_once() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let ws_url = format!("ws://{addr}/realtime");
+
+    let mut client = BitmexWebSocketClient::new(
+        Some(ws_url),
+        Some("test_api_key".to_string()),
+        Some("test_api_secret".to_string()),
+        Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
+        None,
+    )
+    .unwrap();
+
+    client.connect().await.unwrap();
+
+    wait_for_subscription_events(&state, Duration::from_secs(5), |events| {
+        events
+            .iter()
+            .filter(|(topic, ok)| topic == "instrument" && *ok)
+            .count()
+            == 1
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let events = state.subscription_events().await;
+    let instrument_event_count = events
+        .iter()
+        .filter(|(topic, ok)| topic == "instrument" && *ok)
+        .count();
+
+    assert_eq!(
+        instrument_event_count, 1,
+        "expected one initial instrument subscription, was {events:?}"
+    );
+    assert!(
+        state.authenticated.load(Ordering::Relaxed),
+        "client should authenticate before private subscriptions"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(topic, ok)| topic == "instrument" && *ok),
+        "instrument subscription should be confirmed"
+    );
+
+    client.close().await.unwrap();
 }
 
 #[rstest]
@@ -686,6 +761,8 @@ async fn test_client_replies_to_server_ping() {
         None,
         None,
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -720,6 +797,8 @@ async fn test_subscribe_to_public_data() {
         None, // No API key for public data
         None, // No API secret for public data
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -766,6 +845,8 @@ async fn test_subscribe_to_orderbook() {
         None,
         None,
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -814,6 +895,8 @@ async fn test_subscribe_to_private_data() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -872,6 +955,8 @@ async fn test_reconnection_scenario() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -912,12 +997,10 @@ async fn test_reconnection_scenario() {
     let auth_calls_before = *state.auth_calls.lock().await;
     let state_for_auth = state.clone();
 
-    // Trigger disconnect using one-shot flag (auto-resets after dropping one connection)
-    state.drop_next_connection.store(true, Ordering::Relaxed);
+    state.clear_subscription_events().await;
 
-    // Send a message to trigger the server loop to process the drop flag
-    let eth_id = InstrumentId::from("ETHUSD.BITMEX");
-    let _ = client.subscribe_trades(eth_id).await;
+    // Trigger disconnect using one-shot flag (auto-resets after dropping one connection)
+    trigger_server_disconnect(&state).await;
 
     // Wait for auth request to be sent (indicates reconnection happened)
     let expected_calls = auth_calls_before + 1;
@@ -929,9 +1012,6 @@ async fn test_reconnection_scenario() {
         Duration::from_secs(10),
     )
     .await;
-
-    // Clear events now that reconnection has happened
-    state.clear_subscription_events().await;
 
     // Wait for automatic reconnection to complete
     client.wait_until_active(10.0).await.unwrap();
@@ -985,6 +1065,8 @@ async fn test_reconnection_emits_reconnected_message() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1001,12 +1083,7 @@ async fn test_reconnection_emits_reconnected_message() {
 
     let auth_calls_before = *state.auth_calls.lock().await;
     let state_for_auth = state.clone();
-    state.drop_next_connection.store(true, Ordering::Relaxed);
-
-    // Trigger server loop after setting one-shot drop.
-    let _ = client
-        .subscribe_trades(InstrumentId::from("ETHUSD.BITMEX"))
-        .await;
+    trigger_server_disconnect(&state).await;
 
     wait_until_async(
         || {
@@ -1023,7 +1100,7 @@ async fn test_reconnection_emits_reconnected_message() {
                 return false;
             };
 
-            if matches!(message, NautilusWsMessage::Reconnected) {
+            if matches!(message, BitmexWsMessage::Reconnected) {
                 return true;
             }
         }
@@ -1033,7 +1110,7 @@ async fn test_reconnection_emits_reconnected_message() {
 
     assert!(
         saw_reconnected,
-        "Expected NautilusWsMessage::Reconnected after server-triggered reconnect"
+        "Expected BitmexWsMessage::Reconnected after server-triggered reconnect"
     );
 
     client.close().await.unwrap();
@@ -1050,6 +1127,8 @@ async fn test_unsubscribe() {
         None,
         None,
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1114,6 +1193,8 @@ async fn test_wait_until_active_timeout() {
         Some("test_key".to_string()),
         Some("test_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1136,6 +1217,8 @@ async fn test_multiple_symbols_subscription() {
         None,
         None,
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1195,6 +1278,8 @@ async fn test_true_auto_reconnect_with_verification() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1253,11 +1338,7 @@ async fn test_true_auto_reconnect_with_verification() {
 
     // Trigger server-side drop using one-shot flag (graceful close)
     println!("Triggering server-side drop...");
-    state.drop_next_connection.store(true, Ordering::Relaxed);
-
-    // Send a message to trigger the server loop to process the drop flag
-    let sol_id = InstrumentId::from("SOLUSD.BITMEX");
-    let _ = client.subscribe_trades(sol_id).await;
+    trigger_server_disconnect(&state).await;
 
     // Wait for auth call increment to detect reconnection
     let state_for_auth = state.clone();
@@ -1279,10 +1360,17 @@ async fn test_true_auto_reconnect_with_verification() {
     if reconnect_result.is_ok() {
         println!("Client is active after potential reconnection");
 
-        // Give time for re-authentication and subscription restoration to stabilize
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let state_clone = state.clone();
+        let expected_auth = initial_auth_calls + 1;
+        wait_until_async(
+            || {
+                let state = state_clone.clone();
+                async move { *state.auth_calls.lock().await >= expected_auth }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
 
-        // Check if reconnection actually happened
         let final_connection_count = *state.connection_count.lock().await;
         let final_auth_calls = *state.auth_calls.lock().await;
         let final_subs = {
@@ -1342,6 +1430,8 @@ async fn test_auth_and_subscription_restoration_order() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1353,16 +1443,27 @@ async fn test_auth_and_subscription_restoration_order() {
     client.subscribe_orders().await.unwrap();
     client.subscribe_executions().await.unwrap();
 
-    // Wait for authentication and subscriptions
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let state_clone = state.clone();
+    wait_until_async(
+        || {
+            let state = state_clone.clone();
+            async move {
+                let subs = state.subscriptions.lock().await;
+                state.authenticated.load(Ordering::Relaxed)
+                    && subs.contains(&"position".to_string())
+                    && subs.contains(&"order".to_string())
+                    && subs.contains(&"execution".to_string())
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
 
-    // Verify authentication happened
     assert!(
         state.authenticated.load(Ordering::Relaxed),
         "Should be authenticated after private channel subscriptions"
     );
 
-    // Verify private subscriptions were accepted
     let subs = {
         let subs = state.subscriptions.lock().await;
         subs.clone()
@@ -1387,6 +1488,8 @@ async fn test_subscription_restoration_tracking() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1469,6 +1572,8 @@ async fn test_reconnection_retries_failed_subscriptions() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1500,11 +1605,7 @@ async fn test_reconnection_retries_failed_subscriptions() {
     state.fail_next_subscription("position").await;
 
     // Trigger disconnect using one-shot flag
-    state.drop_next_connection.store(true, Ordering::Relaxed);
-
-    // Send a message to trigger the server loop to process the drop flag
-    let sol_id = InstrumentId::from("SOLUSD.BITMEX");
-    let _ = client.subscribe_trades(sol_id).await;
+    trigger_server_disconnect(&state).await;
 
     client.wait_until_active(10.0).await.unwrap();
 
@@ -1556,11 +1657,7 @@ async fn test_reconnection_retries_failed_subscriptions() {
     .await;
 
     // Trigger second disconnect using one-shot flag
-    state.drop_next_connection.store(true, Ordering::Relaxed);
-
-    // Send a message to trigger the server loop to process the drop flag
-    let doge_id = InstrumentId::from("DOGEUSD.BITMEX");
-    let _ = client.subscribe_trades(doge_id).await;
+    trigger_server_disconnect(&state).await;
 
     client.wait_until_active(10.0).await.unwrap();
 
@@ -1589,6 +1686,8 @@ async fn test_reconnection_waits_for_delayed_auth_ack() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1600,9 +1699,11 @@ async fn test_reconnection_waits_for_delayed_auth_ack() {
     client.subscribe_positions().await.unwrap();
 
     client.wait_until_active(5.0).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(400)).await;
 
-    let initial_events = state.subscription_events().await;
+    let initial_events = wait_for_subscription_events(&state, Duration::from_secs(5), |events| {
+        events.iter().any(|(topic, ok)| topic == "position" && *ok)
+    })
+    .await;
     assert!(
         initial_events
             .iter()
@@ -1626,11 +1727,7 @@ async fn test_reconnection_waits_for_delayed_auth_ack() {
     state.set_auth_response_delay_ms(Some(3000)).await;
 
     // Trigger disconnect using one-shot flag
-    state.drop_next_connection.store(true, Ordering::Relaxed);
-
-    // Send a message to trigger the server loop to process the drop flag
-    let eth_id = InstrumentId::from("ETHUSD.BITMEX");
-    let _ = client.subscribe_trades(eth_id).await;
+    trigger_server_disconnect(&state).await;
 
     // Wait for auth request to be sent (indicates reconnection happened)
     // The response is delayed by 3s, so auth is pending but not acknowledged
@@ -1704,6 +1801,8 @@ async fn test_unauthenticated_private_channel_rejection() {
         None, // No credentials
         None,
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1738,7 +1837,9 @@ async fn test_heartbeat_timeout_reconnection() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
-        Some(1), // Very short heartbeat interval (1 second)
+        1, // Very short heartbeat interval (1 second),
+        TransportBackend::default(),
+        None,
     )
     .unwrap();
 
@@ -1749,10 +1850,8 @@ async fn test_heartbeat_timeout_reconnection() {
     client.subscribe_trades(instrument_id).await.unwrap();
 
     // Wait for initial connection
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(client.is_active());
+    client.wait_until_active(5.0).await.unwrap();
 
-    // SAFETY: Heartbeat configuration doesn't break connection
     // TODO: Add server flag to suppress pong responses and test actual heartbeat timeout
 
     // Wait a bit longer to see if heartbeat causes any issues
@@ -1776,6 +1875,8 @@ async fn test_rapid_consecutive_reconnections() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1805,7 +1906,6 @@ async fn test_rapid_consecutive_reconnections() {
     assert_eq!(initial_auth_calls, 1, "Should have 1 initial auth call");
 
     // Use different trigger symbols for each cycle
-    let trigger_symbols = ["SOLUSD", "DOGEUSD", "LINKUSD"];
 
     for cycle in 1..=3 {
         println!("Starting cycle {cycle}");
@@ -1814,12 +1914,11 @@ async fn test_rapid_consecutive_reconnections() {
         let auth_before = *state.auth_calls.lock().await;
         let state_for_auth = state.clone();
 
-        // Trigger disconnect using one-shot flag
-        state.drop_next_connection.store(true, Ordering::Relaxed);
+        // Clear before the disconnect so fast auth acks cannot race with the clear.
+        state.clear_subscription_events().await;
 
-        // Send a message to trigger the server loop to process the drop flag
-        let trigger_id = InstrumentId::from(format!("{}.BITMEX", trigger_symbols[cycle - 1]));
-        let _ = client.subscribe_trades(trigger_id).await;
+        // Trigger disconnect using one-shot flag
+        trigger_server_disconnect(&state).await;
 
         // Wait for auth call increment to detect reconnection
         let expected_auth = auth_before + 1;
@@ -1831,9 +1930,6 @@ async fn test_rapid_consecutive_reconnections() {
             Duration::from_secs(10),
         )
         .await;
-
-        // Clear events now that reconnection has started
-        state.clear_subscription_events().await;
 
         let reconnect_result = client.wait_until_active(15.0).await;
         assert!(
@@ -1894,6 +1990,8 @@ async fn test_multiple_partial_subscription_failures() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -1937,11 +2035,7 @@ async fn test_multiple_partial_subscription_failures() {
     state.fail_next_subscription("position").await;
 
     // Trigger disconnect using one-shot flag (auto-resets after dropping one connection)
-    state.drop_next_connection.store(true, Ordering::Relaxed);
-
-    // Send a subscribe to trigger the server loop to process the drop flag
-    let sol_id = InstrumentId::from("SOLUSD.BITMEX");
-    client.subscribe_trades(sol_id).await.unwrap();
+    trigger_server_disconnect(&state).await;
 
     // Wait for automatic reconnection and subscription retry
     // Flow: disconnect → reconnect → try position → fail
@@ -1995,6 +2089,8 @@ async fn test_reconnection_race_condition() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -2006,27 +2102,37 @@ async fn test_reconnection_race_condition() {
     client.subscribe_positions().await.unwrap();
 
     client.wait_until_active(5.0).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let state_clone = state.clone();
+    wait_until_async(
+        || {
+            let state = state_clone.clone();
+            async move {
+                state
+                    .subscriptions
+                    .lock()
+                    .await
+                    .contains(&"position".to_string())
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Clear subscription events so we can detect fresh re-subscriptions
+    state.clear_subscription_events().await;
 
     // Add significant auth delay to create a window for race condition
     state.set_auth_response_delay_ms(Some(1000)).await;
 
     // Trigger first disconnect using one-shot flag
-    state.drop_next_connection.store(true, Ordering::Relaxed);
-
-    // Send a message to trigger the server loop to process the drop flag
-    let eth_id = InstrumentId::from("ETHUSD.BITMEX");
-    let _ = client.subscribe_trades(eth_id).await;
+    trigger_server_disconnect(&state).await;
 
     // Wait a bit for reconnection to start but not complete (due to auth delay)
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Trigger another disconnect while reconnection is in progress
-    state.drop_next_connection.store(true, Ordering::Relaxed);
-
-    // Send another message to trigger the drop on the reconnecting connection
-    let sol_id = InstrumentId::from("SOLUSD.BITMEX");
-    let _ = client.subscribe_trades(sol_id).await;
+    trigger_server_disconnect(&state).await;
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -2040,16 +2146,23 @@ async fn test_reconnection_race_condition() {
         "Client should recover despite reconnection race condition"
     );
 
-    // Verify subscriptions are restored
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let subs = state.subscriptions.lock().await;
+    let events = wait_for_subscription_events(&state, Duration::from_secs(10), |events| {
+        let has_trade = events
+            .iter()
+            .any(|(topic, ok)| topic == "trade:XBTUSD" && *ok);
+        let has_position = events.iter().any(|(topic, ok)| topic == "position" && *ok);
+        has_trade && has_position
+    })
+    .await;
     assert!(
-        subs.contains(&"trade:XBTUSD".to_string()),
-        "Trade subscription should be restored"
+        events
+            .iter()
+            .any(|(topic, ok)| topic == "trade:XBTUSD" && *ok),
+        "Trade subscription should be restored: {events:?}"
     );
     assert!(
-        subs.contains(&"position".to_string()),
-        "Position subscription should be restored"
+        events.iter().any(|(topic, ok)| topic == "position" && *ok),
+        "Position subscription should be restored: {events:?}"
     );
 
     client.close().await.unwrap();
@@ -2066,7 +2179,9 @@ async fn test_subscribe_after_stream_call() {
         None,
         None,
         Some(AccountId::from("TEST-001")),
-        Some(1),
+        1,
+        TransportBackend::default(),
+        None,
     )
     .unwrap();
 
@@ -2082,9 +2197,7 @@ async fn test_subscribe_after_stream_call() {
         // Stream processing would happen here
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Now try to subscribe - should work because handler is still alive
+    // Subscribe should work because handler is still alive
     let result = client
         .subscribe(vec!["orderBookL2:XBTUSD".to_string()])
         .await;
@@ -2108,7 +2221,9 @@ async fn test_is_active_false_after_close() {
         None,
         None,
         Some(AccountId::from("TEST-001")),
-        Some(1),
+        1,
+        TransportBackend::default(),
+        None,
     )
     .unwrap();
 
@@ -2120,8 +2235,8 @@ async fn test_is_active_false_after_close() {
     );
 
     client.close().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
+    wait_until_async(|| async { !client.is_active() }, Duration::from_secs(2)).await;
     assert!(
         !client.is_active(),
         "Expected is_active() to be false after close"
@@ -2143,6 +2258,8 @@ async fn test_is_active_lifecycle() {
         Some("test_key".to_string()),
         Some("test_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -2165,9 +2282,8 @@ async fn test_is_active_lifecycle() {
 
     // Close connection
     client.close().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // After close: should not be active
+    wait_until_async(|| async { !client.is_active() }, Duration::from_secs(2)).await;
     assert!(
         !client.is_active(),
         "Client should not be active after close"
@@ -2187,6 +2303,8 @@ async fn test_is_active_false_during_reconnection() {
         Some("test_key".to_string()),
         Some("test_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -2200,14 +2318,9 @@ async fn test_is_active_false_during_reconnection() {
     state.set_auth_response_delay_ms(Some(500)).await;
 
     // Trigger server-side drop using one-shot flag
-    state.drop_next_connection.store(true, Ordering::Relaxed);
+    trigger_server_disconnect(&state).await;
 
-    // Send a message to trigger the server loop to process the drop flag
-    let eth_id = InstrumentId::from("ETHUSD.BITMEX");
-    let _ = client.subscribe_trades(eth_id).await;
-
-    // Small delay for disconnect to be processed
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_until_async(|| async { !client.is_active() }, Duration::from_secs(5)).await;
 
     // During reconnection: is_active() should return false
     // This is critical - if is_active() returns true, wait_until_active() returns immediately
@@ -2240,6 +2353,8 @@ async fn test_unsubscribed_private_channel_not_resubscribed_after_disconnect() {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -2298,11 +2413,7 @@ async fn test_unsubscribed_private_channel_not_resubscribed_after_disconnect() {
     .await;
 
     // Trigger disconnect using one-shot flag
-    state.drop_next_connection.store(true, Ordering::Relaxed);
-
-    // Send a message to trigger the server loop to process the drop flag
-    let eth_id = InstrumentId::from("ETHUSD.BITMEX");
-    let _ = client.subscribe_trades(eth_id).await;
+    trigger_server_disconnect(&state).await;
 
     // Wait for reconnection and subscription restoration
     client.wait_until_active(10.0).await.unwrap();
@@ -2353,6 +2464,8 @@ async fn test_login_failure_emits_error() {
         Some("invalid_key".to_string()),
         Some("invalid_secret".to_string()),
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();
@@ -2387,7 +2500,9 @@ async fn test_sends_pong_for_text_ping() {
         None,
         None,
         Some(AccountId::new("BITMEX-001")),
-        Some(1), // 1 second heartbeat
+        1, // 1 second heartbeat,
+        TransportBackend::default(),
+        None,
     )
     .unwrap();
 
@@ -2415,6 +2530,8 @@ async fn test_sends_pong_for_control_ping() {
         None,
         None,
         Some(AccountId::new("BITMEX-001")),
+        5,
+        TransportBackend::default(),
         None,
     )
     .unwrap();

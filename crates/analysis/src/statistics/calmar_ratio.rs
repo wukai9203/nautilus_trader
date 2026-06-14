@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 
 use nautilus_core::UnixNanos;
+use nautilus_model::position::Position;
 
 use crate::{
     statistic::PortfolioStatistic,
@@ -37,7 +38,11 @@ use crate::{
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.analysis")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.analysis", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.analysis")
 )]
 pub struct CalmarRatio {
     /// The number of periods per year for CAGR calculation (e.g., 252 for trading days).
@@ -89,6 +94,13 @@ impl PortfolioStatistic for CalmarRatio {
             Some(f64::NAN)
         }
     }
+    fn calculate_from_realized_pnls(&self, _realized_pnls: &[f64]) -> Option<Self::Item> {
+        None
+    }
+
+    fn calculate_from_positions(&self, _positions: &[Position]) -> Option<Self::Item> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -97,7 +109,7 @@ mod tests {
 
     use super::*;
 
-    fn create_returns(values: Vec<f64>) -> BTreeMap<UnixNanos, f64> {
+    fn create_returns(values: &[f64]) -> BTreeMap<UnixNanos, f64> {
         let mut returns = BTreeMap::new();
         let nanos_per_day = 86_400_000_000_000;
         let start_time = 1_600_000_000_000_000_000;
@@ -129,7 +141,7 @@ mod tests {
     fn test_no_drawdown() {
         let ratio = CalmarRatio::new(Some(252));
         // Only positive returns, no drawdown
-        let returns = create_returns(vec![0.01; 252]);
+        let returns = create_returns(&vec![0.01; 252]);
         let result = ratio.calculate_from_returns(&returns);
 
         // Should be NaN when no drawdown (undefined ratio)
@@ -146,7 +158,7 @@ mod tests {
         // Add a drawdown period
         returns_vec.extend(vec![-0.002; 52]); // Small negative returns
 
-        let returns = create_returns(returns_vec);
+        let returns = create_returns(&returns_vec);
         let result = ratio.calculate_from_returns(&returns).unwrap();
 
         // Calmar should be positive (CAGR / |Max DD|)
@@ -158,11 +170,11 @@ mod tests {
         let ratio = CalmarRatio::new(Some(252));
 
         // Strategy A: Higher return, same drawdown
-        let returns_a = create_returns(vec![0.002; 252]);
+        let returns_a = create_returns(&vec![0.002; 252]);
         let calmar_a = ratio.calculate_from_returns(&returns_a);
 
         // Strategy B: Lower return
-        let returns_b = create_returns(vec![0.001; 252]);
+        let returns_b = create_returns(&vec![0.001; 252]);
         let calmar_b = ratio.calculate_from_returns(&returns_b);
 
         // Higher CAGR should give higher Calmar (assuming same drawdown pattern)

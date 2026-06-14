@@ -15,30 +15,31 @@
 
 //! Approve the Nautilus builder fee for Hyperliquid trading.
 //!
-//! This is a ONE-TIME setup step required before trading on Hyperliquid.
+//! This is a ONE-TIME setup step for wallets that have never approved a builder
+//! fee. Hyperliquid rejects orders carrying an unapproved builder address, even
+//! at a zero fee.
 //!
 //! What you are approving:
-//! - A 1 basis point (0.01%) fee on fills, charged by Hyperliquid in addition to standard fees
-//! - Applies to perpetuals and spot sells only
+//! - 0% max fee rate: attribution only, no builder fees are ever charged
 //!
-//! This is at the low end of ecosystem norms. Hyperliquid allows builders to charge
-//! up to 10 basis points (0.1%) for perps and 100 basis points (1%) for spot.
+//! The script displays full details and prompts for confirmation before
+//! proceeding. Use --yes to skip the confirmation prompt.
 //!
-//! The script will display full details and prompt for confirmation before proceeding.
-//! Use --yes to skip the confirmation prompt.
+//! The action must be signed by the master wallet's private key; agent (API)
+//! wallets cannot sign `ApproveBuilderFee`.
 //!
 //! Prerequisites:
 //! - Set environment variable: HYPERLIQUID_PK (mainnet) or HYPERLIQUID_TESTNET_PK (testnet)
 //!
 //! Usage:
 //!     # Mainnet (interactive)
-//!     cargo run --bin hyperliquid-builder-fee-approve
+//!     cargo run -p nautilus-hyperliquid --bin hyperliquid-builder-fee-approve
 //!
 //!     # Mainnet (non-interactive)
-//!     cargo run --bin hyperliquid-builder-fee-approve -- --yes
+//!     cargo run -p nautilus-hyperliquid --bin hyperliquid-builder-fee-approve -- --yes
 //!
 //!     # Testnet
-//!     HYPERLIQUID_TESTNET=true cargo run --bin hyperliquid-builder-fee-approve
+//!     HYPERLIQUID_TESTNET=true cargo run -p nautilus-hyperliquid --bin hyperliquid-builder-fee-approve
 
 use nautilus_hyperliquid::common::builder_fee;
 

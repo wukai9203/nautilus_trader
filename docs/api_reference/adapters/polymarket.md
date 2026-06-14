@@ -1,5 +1,8 @@
 # Polymarket
 
+This page documents the Polymarket adapter modules in
+`nautilus_trader.adapters.polymarket`.
+
 ```{eval-rst}
 .. automodule:: nautilus_trader.adapters.polymarket
    :show-inheritance:

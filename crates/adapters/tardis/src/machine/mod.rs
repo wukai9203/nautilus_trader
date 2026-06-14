@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+pub mod cache;
 pub mod client;
 pub mod message;
 pub mod parse;
@@ -30,6 +31,7 @@ use async_stream::stream;
 use futures_util::{SinkExt, Stream, StreamExt, stream::SplitSink};
 use message::WsMessage;
 use nautilus_common::live::get_runtime;
+use nautilus_core::string::urlencoding;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
@@ -126,7 +128,7 @@ async fn stream_from_websocket(
 ) -> Result<impl Stream<Item = Result<WsMessage>>> {
     let (ws_stream, ws_resp) = connect_async(url).await?;
 
-    handle_connection_response(ws_resp)?;
+    handle_connection_response(&ws_resp)?;
     log::info!("Connected to {base_url}");
 
     Ok(stream! {
@@ -157,14 +159,13 @@ async fn stream_from_websocket(
                     | tungstenite::Message::Pong(_)
                     | tungstenite::Message::Ping(_) => {
                         log::trace!("Received {msg:?}");
-                        continue; // Skip and continue to the next message
                     }
                     tungstenite::Message::Close(Some(frame)) => {
                         let reason = frame.reason.to_string();
                         if frame.code == CloseCode::Normal {
                             log::debug!("Connection closed normally: {reason}");
                         } else {
-                            log::error!(
+                            log::warn!(
                                 "Connection closed abnormally with code: {:?}, reason: {reason}", frame.code
                             );
                             yield Err(Error::ConnectionClosed { reason });
@@ -172,7 +173,7 @@ async fn stream_from_websocket(
                         break;
                     }
                     tungstenite::Message::Close(None) => {
-                        log::error!("Connection closed without a frame");
+                        log::warn!("Connection closed without a frame");
                         yield Err(Error::ConnectionClosed {
                             reason: "No close frame provided".to_string()
                         });
@@ -189,12 +190,12 @@ async fn stream_from_websocket(
                     }
                 },
                 Some(Err(e)) => {
-                    log::error!("WebSocket error: {e}");
+                    log::warn!("WebSocket error: {e}");
                     yield Err(Error::ConnectFailed(e));
                     break;
                 }
                 None => {
-                    log::error!("Connection closed unexpectedly");
+                    log::warn!("Connection closed unexpectedly");
                     yield Err(Error::ConnectionClosed {
                         reason: "Unexpected connection close".to_string(),
                     });
@@ -207,8 +208,9 @@ async fn stream_from_websocket(
     })
 }
 
-#[allow(clippy::result_large_err)]
-fn handle_connection_response(ws_resp: tungstenite::http::Response<Option<Vec<u8>>>) -> Result<()> {
+fn handle_connection_response(
+    ws_resp: &tungstenite::http::Response<Option<Vec<u8>>>,
+) -> Result<()> {
     if ws_resp.status() != tungstenite::http::StatusCode::SWITCHING_PROTOCOLS {
         return match ws_resp.body() {
             Some(resp) => Err(Error::ConnectRejected {

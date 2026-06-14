@@ -24,7 +24,6 @@ from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.data import BarType
-from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.test_kit.strategies.tester_data import DataTester
@@ -50,8 +49,6 @@ config_node = TradingNodeConfig(
     ),
     data_clients={
         AX: AxDataClientConfig(
-            api_key=None,  # 'AX_API_KEY' env var
-            api_secret=None,  # 'AX_API_SECRET' env var
             environment=AxEnvironment.SANDBOX,
             instrument_provider=InstrumentProviderConfig(load_all=True),
             update_instruments_interval_mins=60,
@@ -71,18 +68,27 @@ bar_type = BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL")
 config_tester = DataTesterConfig(
     instrument_ids=[instrument_id],
     bar_types=[bar_type],
-    # subscribe_book_at_interval=True,
     subscribe_quotes=True,
     subscribe_trades=True,
+    subscribe_mark_prices=True,
     subscribe_bars=True,
     subscribe_funding_rates=True,
     request_trades=True,
     request_bars=True,
     request_funding_rates=True,
-    book_type=BookType.L2_MBP,
-    book_interval_ms=10,
     log_data=True,
 )
+
+# Alternative config for testing the order book:
+# config_tester = DataTesterConfig(
+#     instrument_ids=[instrument_id],
+#     bar_types=[bar_type],
+#     subscribe_book_at_interval=True,
+#     book_type=BookType.L2_MBP,
+#     book_interval_ms=10,
+#     log_data=True,
+# )
+
 tester = DataTester(config=config_tester)
 
 node.trader.add_actor(tester)

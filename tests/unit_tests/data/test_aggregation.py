@@ -47,6 +47,7 @@ from nautilus_trader.model.enums import AggregationSource
 from nautilus_trader.model.enums import AggressorSide
 from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.enums import BarAggregation
+from nautilus_trader.model.enums import ContinuousFutureAdjustmentType
 from nautilus_trader.model.enums import OptionKind
 from nautilus_trader.model.enums import PriceType
 from nautilus_trader.model.greeks import GreeksCalculator
@@ -214,6 +215,124 @@ class TestBarBuilder:
 
         # Assert
         assert builder.count == 5
+
+    def test_bar_builder_applies_offset_to_bar_updates(self):
+        bar_type = TestDataStubs.bartype_btcusdt_binance_100tick_last()
+        builder = BarBuilder(BTCUSDT_BINANCE, bar_type)
+        builder.set_adjustment(Decimal("10.0"), ContinuousFutureAdjustmentType.BACKWARD_SPREAD)
+
+        input_bar = Bar(
+            bar_type=bar_type,
+            open=Price.from_str("100.00000"),
+            high=Price.from_str("101.00000"),
+            low=Price.from_str("99.00000"),
+            close=Price.from_str("100.50000"),
+            volume=Quantity.from_str("2.0"),
+            ts_event=NANOSECONDS_IN_SECOND,
+            ts_init=NANOSECONDS_IN_SECOND,
+        )
+
+        builder.update_bar(input_bar, input_bar.volume, input_bar.ts_init)
+        built_bar = builder.build_now()
+
+        assert built_bar.open == Price.from_str("110.00000")
+        assert built_bar.high == Price.from_str("111.00000")
+        assert built_bar.low == Price.from_str("109.00000")
+        assert built_bar.close == Price.from_str("110.50000")
+        assert built_bar.volume == Quantity.from_str("2.0")
+
+    def test_bar_builder_applies_multiplicative_adjustment_to_bar_updates(self):
+        bar_type = TestDataStubs.bartype_btcusdt_binance_100tick_last()
+        builder = BarBuilder(BTCUSDT_BINANCE, bar_type)
+        builder.set_adjustment(Decimal("1.10"), ContinuousFutureAdjustmentType.BACKWARD_RATIO)
+
+        input_bar = Bar(
+            bar_type=bar_type,
+            open=Price.from_str("100.00000"),
+            high=Price.from_str("101.00000"),
+            low=Price.from_str("99.00000"),
+            close=Price.from_str("100.50000"),
+            volume=Quantity.from_str("2.0"),
+            ts_event=NANOSECONDS_IN_SECOND,
+            ts_init=NANOSECONDS_IN_SECOND,
+        )
+
+        builder.update_bar(input_bar, input_bar.volume, input_bar.ts_init)
+        built_bar = builder.build_now()
+
+        assert built_bar.open == Price.from_str("110.00000")
+        assert built_bar.high == Price.from_str("111.10000")
+        assert built_bar.low == Price.from_str("108.90000")
+        assert built_bar.close == Price.from_str("110.55000")
+        assert built_bar.volume == Quantity.from_str("2.0")
+
+    def test_bar_builder_mid_bar_adjustment_change_applies_to_subsequent_updates(self):
+        bar_type = TestDataStubs.bartype_btcusdt_binance_100tick_last()
+        builder = BarBuilder(BTCUSDT_BINANCE, bar_type)
+
+        builder.set_adjustment(Decimal(0), ContinuousFutureAdjustmentType.BACKWARD_SPREAD)
+        builder.update(Price.from_str("100.00000"), Quantity.from_str("1"), 1)
+        builder.update(Price.from_str("101.00000"), Quantity.from_str("2"), 2)
+
+        # Change mid-bar: subsequent prices are adjusted, the already-aggregated OHLC is not rewritten
+        builder.set_adjustment(Decimal(10), ContinuousFutureAdjustmentType.BACKWARD_SPREAD)
+        builder.update(Price.from_str("95.00000"), Quantity.from_str("3"), 3)
+        builder.update(Price.from_str("96.00000"), Quantity.from_str("4"), 4)
+        built_bar = builder.build_now()
+
+        assert built_bar.open == Price.from_str("100.00000")
+        assert built_bar.high == Price.from_str("106.00000")
+        assert built_bar.low == Price.from_str("100.00000")
+        assert built_bar.close == Price.from_str("106.00000")
+        assert built_bar.volume == Quantity.from_str("10")
+
+    def test_bar_builder_mid_bar_ratio_adjustment_change_applies_to_subsequent_updates(self):
+        bar_type = TestDataStubs.bartype_btcusdt_binance_100tick_last()
+        builder = BarBuilder(BTCUSDT_BINANCE, bar_type)
+
+        builder.set_adjustment(Decimal(1), ContinuousFutureAdjustmentType.BACKWARD_RATIO)
+        builder.update(Price.from_str("100.00000"), Quantity.from_str("1"), 1)
+        builder.update(Price.from_str("101.00000"), Quantity.from_str("2"), 2)
+
+        # Change mid-bar to 1.10x: subsequent prices multiplied, previous OHLC stays
+        builder.set_adjustment(Decimal("1.10"), ContinuousFutureAdjustmentType.BACKWARD_RATIO)
+        builder.update(Price.from_str("95.00000"), Quantity.from_str("3"), 3)
+        builder.update(Price.from_str("96.00000"), Quantity.from_str("4"), 4)
+        built_bar = builder.build_now()
+
+        assert built_bar.open == Price.from_str("100.00000")
+        assert built_bar.high == Price.from_str("105.60000")
+        assert built_bar.low == Price.from_str("100.00000")
+        assert built_bar.close == Price.from_str("105.60000")
+        assert built_bar.volume == Quantity.from_str("10")
+
+    def test_bar_builder_spread_zero_adjustment_is_noop(self):
+        bar_type = TestDataStubs.bartype_btcusdt_binance_100tick_last()
+        builder = BarBuilder(BTCUSDT_BINANCE, bar_type)
+        builder.set_adjustment(Decimal(0), ContinuousFutureAdjustmentType.BACKWARD_SPREAD)
+
+        builder.update(Price.from_str("100.00000"), Quantity.from_str("1"), 1)
+        builder.update(Price.from_str("101.00000"), Quantity.from_str("2"), 2)
+        built_bar = builder.build_now()
+
+        assert built_bar.open == Price.from_str("100.00000")
+        assert built_bar.high == Price.from_str("101.00000")
+        assert built_bar.low == Price.from_str("100.00000")
+        assert built_bar.close == Price.from_str("101.00000")
+
+    def test_bar_builder_ratio_one_adjustment_is_noop(self):
+        bar_type = TestDataStubs.bartype_btcusdt_binance_100tick_last()
+        builder = BarBuilder(BTCUSDT_BINANCE, bar_type)
+        builder.set_adjustment(Decimal(1), ContinuousFutureAdjustmentType.BACKWARD_RATIO)
+
+        builder.update(Price.from_str("100.00000"), Quantity.from_str("1"), 1)
+        builder.update(Price.from_str("101.00000"), Quantity.from_str("2"), 2)
+        built_bar = builder.build_now()
+
+        assert built_bar.open == Price.from_str("100.00000")
+        assert built_bar.high == Price.from_str("101.00000")
+        assert built_bar.low == Price.from_str("100.00000")
+        assert built_bar.close == Price.from_str("101.00000")
 
     def test_multiple_bar_updates_correctly_increments_count(self):
         # Arrange
@@ -1857,6 +1976,72 @@ class TestVolumeImbalanceBarAggregator:
         assert len(handler) == 1
         assert handler[0].volume == Quantity.from_int(16)
 
+    @pytest.mark.parametrize("step", [1000, 1500])
+    def test_large_step_no_overflow(self, step):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(step, BarAggregation.VOLUME_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = VolumeImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        # Act
+        total_volume = step * 2
+        for i in range(total_volume):
+            tick = TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00001"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId(f"overflow-{i}"),
+                ts_event=i,
+                ts_init=i,
+            )
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 2
+        assert handler[0].volume == Quantity.from_int(step)
+        assert handler[1].volume == Quantity.from_int(step)
+
+    def test_different_large_steps_produce_different_bar_counts(self):
+        # Arrange
+        total_volume = 3000
+        results = {}
+
+        # Act
+        for step in (1000, 1500):
+            handler = []
+            bar_spec = BarSpecification(step, BarAggregation.VOLUME_IMBALANCE, PriceType.LAST)
+            bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+            aggregator = VolumeImbalanceBarAggregator(
+                AUDUSD_SIM,
+                bar_type,
+                handler.append,
+            )
+
+            for i in range(total_volume):
+                tick = TradeTick(
+                    instrument_id=AUDUSD_SIM.id,
+                    price=Price.from_str("1.00001"),
+                    size=Quantity.from_int(1),
+                    aggressor_side=AggressorSide.BUYER,
+                    trade_id=TradeId(f"diff-{i}"),
+                    ts_event=i,
+                    ts_init=i,
+                )
+                aggregator.handle_trade_tick(tick)
+
+            results[step] = len(handler)
+
+        # Assert
+        assert results[1000] == 3
+        assert results[1500] == 2
+        assert results[1000] != results[1500]
+
 
 class TestVolumeRunsBarAggregator:
     def test_emits_after_consecutive_same_side_volume(self):
@@ -2027,6 +2212,72 @@ class TestVolumeRunsBarAggregator:
         assert len(handler) == 1
         assert handler[0].volume == Quantity.from_int(12)
         assert handler[0].high == Price.from_str("1.00005")
+
+    @pytest.mark.parametrize("step", [1000, 1500])
+    def test_large_step_no_overflow(self, step):
+        # Arrange
+        handler = []
+        bar_spec = BarSpecification(step, BarAggregation.VOLUME_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = VolumeRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        # Act
+        total_volume = step * 2
+        for i in range(total_volume):
+            tick = TradeTick(
+                instrument_id=AUDUSD_SIM.id,
+                price=Price.from_str("1.00001"),
+                size=Quantity.from_int(1),
+                aggressor_side=AggressorSide.BUYER,
+                trade_id=TradeId(f"overflow-{i}"),
+                ts_event=i,
+                ts_init=i,
+            )
+            aggregator.handle_trade_tick(tick)
+
+        # Assert
+        assert len(handler) == 2
+        assert handler[0].volume == Quantity.from_int(step)
+        assert handler[1].volume == Quantity.from_int(step)
+
+    def test_different_large_steps_produce_different_bar_counts(self):
+        # Arrange
+        total_volume = 3000
+        results = {}
+
+        # Act
+        for step in (1000, 1500):
+            handler = []
+            bar_spec = BarSpecification(step, BarAggregation.VOLUME_RUNS, PriceType.LAST)
+            bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+            aggregator = VolumeRunsBarAggregator(
+                AUDUSD_SIM,
+                bar_type,
+                handler.append,
+            )
+
+            for i in range(total_volume):
+                tick = TradeTick(
+                    instrument_id=AUDUSD_SIM.id,
+                    price=Price.from_str("1.00001"),
+                    size=Quantity.from_int(1),
+                    aggressor_side=AggressorSide.BUYER,
+                    trade_id=TradeId(f"diff-{i}"),
+                    ts_event=i,
+                    ts_init=i,
+                )
+                aggregator.handle_trade_tick(tick)
+
+            results[step] = len(handler)
+
+        # Assert
+        assert results[1000] == 3
+        assert results[1500] == 2
+        assert results[1000] != results[1500]
 
 
 class TestTestValueBarAggregator:
@@ -2419,6 +2670,35 @@ class TestTestValueBarAggregator:
         assert last_bar.close == Price.from_str("102.50")
         assert last_bar.volume == Quantity.from_str("30")
 
+    def test_high_price_low_step_does_not_emit_zero_volume_bars(self):
+        # Arrange: price * min_size >> step causes size_chunk to round to zero
+        handler = []
+        bar_spec = BarSpecification(100, BarAggregation.VALUE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = ValueBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        tick = TradeTick(
+            instrument_id=AUDUSD_SIM.id,
+            price=Price.from_str("1000.00000"),
+            size=Quantity.from_int(3),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId("value-precision-1"),
+            ts_event=0,
+            ts_init=0,
+        )
+
+        # Act
+        aggregator.handle_trade_tick(tick)
+
+        # Assert: 3 bars (one per min-size unit), not 30 zero-volume bars
+        assert len(handler) == 3
+        for bar in handler:
+            assert bar.volume == Quantity.from_int(1)
+
 
 class TestValueImbalanceBarAggregator:
     def test_emits_when_value_imbalance_reaches_threshold(self):
@@ -2581,6 +2861,77 @@ class TestValueImbalanceBarAggregator:
 
         # Assert
         assert len(handler) == 1
+
+    def test_high_price_low_step_does_not_emit_zero_volume_bars(self):
+        # Arrange: price * min_size >> step causes size_chunk to round to zero
+        handler = []
+        bar_spec = BarSpecification(100, BarAggregation.VALUE_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = ValueImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        tick = TradeTick(
+            instrument_id=AUDUSD_SIM.id,
+            price=Price.from_str("1000.00000"),
+            size=Quantity.from_int(3),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId("value-imbalance-precision-1"),
+            ts_event=0,
+            ts_init=0,
+        )
+
+        # Act
+        aggregator.handle_trade_tick(tick)
+
+        # Assert: 3 bars (one per min-size unit), not 30 zero-volume bars
+        assert len(handler) == 3
+        for bar in handler:
+            assert bar.volume == Quantity.from_int(1)
+
+    def test_opposite_side_min_size_overshoot_emits_bar(self):
+        # Arrange: opposite-side flatten amount < min_size, clamp overshoots threshold
+        handler = []
+        bar_spec = BarSpecification(100, BarAggregation.VALUE_IMBALANCE, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = ValueImbalanceBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        # Build seller imbalance of -50 (below step=100, no bar yet)
+        tick1 = TradeTick(
+            instrument_id=AUDUSD_SIM.id,
+            price=Price.from_str("10.00000"),
+            size=Quantity.from_int(5),
+            aggressor_side=AggressorSide.SELLER,
+            trade_id=TradeId("imbalance-opp-1"),
+            ts_event=0,
+            ts_init=0,
+        )
+
+        # Opposite-side buyer tick: flatten amount 50/1000=0.05 < min_size (1),
+        # clamp overshoots imbalance from -50 to +950, crossing threshold
+        tick2 = TradeTick(
+            instrument_id=AUDUSD_SIM.id,
+            price=Price.from_str("1000.00000"),
+            size=Quantity.from_int(1),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId("imbalance-opp-2"),
+            ts_event=1,
+            ts_init=1,
+        )
+
+        # Act
+        aggregator.handle_trade_tick(tick1)
+        aggregator.handle_trade_tick(tick2)
+
+        # Assert
+        assert len(handler) == 1
+        assert handler[0].volume == Quantity.from_int(6)
 
 
 class TestValueRunsBarAggregator:
@@ -2749,6 +3100,35 @@ class TestValueRunsBarAggregator:
         # Assert
         assert len(handler) == 1
         assert handler[0].high == Price.from_str("10.00000")
+
+    def test_high_price_low_step_does_not_emit_zero_volume_bars(self):
+        # Arrange: price * min_size >> step causes size_chunk to round to zero
+        handler = []
+        bar_spec = BarSpecification(100, BarAggregation.VALUE_RUNS, PriceType.LAST)
+        bar_type = BarType(AUDUSD_SIM.id, bar_spec)
+        aggregator = ValueRunsBarAggregator(
+            AUDUSD_SIM,
+            bar_type,
+            handler.append,
+        )
+
+        tick = TradeTick(
+            instrument_id=AUDUSD_SIM.id,
+            price=Price.from_str("1000.00000"),
+            size=Quantity.from_int(3),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId("value-runs-precision-1"),
+            ts_event=0,
+            ts_init=0,
+        )
+
+        # Act
+        aggregator.handle_trade_tick(tick)
+
+        # Assert: 3 bars (one per min-size unit), not 30 zero-volume bars
+        assert len(handler) == 3
+        for bar in handler:
+            assert bar.volume == Quantity.from_int(1)
 
 
 class TestRenkoBarAggregator:
@@ -3225,6 +3605,32 @@ class TestTimeBarAggregator:
 
         # Assert
         assert aggregator.next_close_ns == expected
+
+    def test_stop_timer_cancels_registered_timer_and_allows_restart(self):
+        # Arrange
+        clock = TestClock()
+        clock.set_time(1)
+        handler = []
+        bar_type = BarType(
+            TestIdStubs.audusd_id(),
+            BarSpecification(1, BarAggregation.MINUTE, PriceType.MID),
+        )
+        aggregator = TimeBarAggregator(
+            AUDUSD_SIM,
+            bar_type.standard(),
+            handler.append,
+            clock,
+        )
+        timer_name = f"TIME_BAR_{bar_type.standard()}"
+
+        # Act
+        aggregator.start_timer()
+        aggregator.stop_timer()
+        assert timer_name not in clock.timer_names
+        aggregator.start_timer()
+
+        # Assert
+        assert timer_name in clock.timer_names
 
     def test_update_timer_with_test_clock_sends_single_bar_to_handler(self):
         # Arrange
@@ -4038,7 +4444,7 @@ class TestTimeBarAggregator:
             clock,
         )
         aggregator.start_timer()
-        timer_name = f"time_bar_{bar_type.standard()}"
+        timer_name = f"TIME_BAR_{bar_type.standard()}"
         composite_bar_type = bar_type.composite()
 
         bar1 = Bar(
@@ -4312,7 +4718,6 @@ class TestSpreadQuoteAggregator:
         )
         self.cache = Cache()
         self.greeks_calculator = GreeksCalculator(
-            msgbus=self.msgbus,
             cache=self.cache,
             clock=self.clock,
         )
@@ -4894,7 +5299,6 @@ class TestSpreadQuoteAggregator:
         from nautilus_trader.model.instruments import CryptoFuture
 
         greeks_calculator = GreeksCalculator(
-            msgbus=self.msgbus,
             cache=self.cache,
             clock=self.clock,
         )
@@ -5701,7 +6105,6 @@ class TestSpreadQuoteAggregator:
         # Note: Not adding underlying trade tick, so greeks will be missing
 
         greeks_calculator = GreeksCalculator(
-            msgbus=self.msgbus,
             cache=cache,
             clock=self.clock,
         )
@@ -5779,7 +6182,6 @@ class TestSpreadQuoteAggregatorHistoricalMode:
         )
         self.cache = Cache()
         self.greeks_calculator = GreeksCalculator(
-            msgbus=self.msgbus,
             cache=self.cache,
             clock=self.clock,
         )

@@ -15,15 +15,33 @@
 
 from datetime import UTC
 from datetime import datetime
+from types import SimpleNamespace
 
+import pandas as pd
+import pytest
+
+from nautilus_trader.accounting.accounts.cash import CashAccount
+from nautilus_trader.analysis import CAGR
+from nautilus_trader.analysis import BetaRatio
+from nautilus_trader.analysis import CalmarRatio
+from nautilus_trader.analysis import InformationRatio
+from nautilus_trader.analysis import MaxDrawdown
+from nautilus_trader.analysis import ReturnsAverage
 from nautilus_trader.analysis import SharpeRatio
 from nautilus_trader.analysis.analyzer import PortfolioAnalyzer
+from nautilus_trader.analysis.analyzer import _is_pyo3_statistic
 from nautilus_trader.common.component import TestClock
 from nautilus_trader.common.factories import OrderFactory
+from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.currencies import AUD
+from nautilus_trader.model.currencies import EUR
 from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.events import AccountState
 from nautilus_trader.model.identifiers import PositionId
+from nautilus_trader.model.objects import AccountBalance
+from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.position import Position
@@ -94,7 +112,108 @@ class TestPortfolioAnalyzer:
         # Assert
         assert result is None
 
-    def test_analyzer_tracks_returns(self):
+    def test_get_realized_pnls_without_currency_when_currency_ambiguous_returns_none(self):
+        # Arrange
+        self.analyzer.add_trade(PositionId("P-1"), Money(10.0, USD))
+        self.analyzer.add_trade(PositionId("P-2"), Money(20.0, EUR))
+
+        # Act
+        result = self.analyzer.realized_pnls()
+
+        # Assert
+        assert result is None
+
+    def test_is_pyo3_statistic_matches_exact_module(self):
+        # Arrange
+        stat = _FakePyo3Statistic()
+
+        # Act, Assert
+        assert _is_pyo3_statistic(stat)
+
+    def test_is_pyo3_statistic_matches_pyo3_submodule(self):
+        # Arrange
+        stat = _FakePyo3SubmoduleStatistic()
+
+        # Act, Assert
+        assert _is_pyo3_statistic(stat)
+
+    def test_is_pyo3_statistic_rejects_lookalike_module(self):
+        # Arrange
+        stat = _FakeLookalikePyo3Statistic()
+
+        # Act, Assert
+        assert not _is_pyo3_statistic(stat)
+
+    def test_get_performance_stats_pnls_converts_pyo3_statistics_input(self):
+        # Arrange
+        stat = _RecordingPyo3Statistic()
+        self.analyzer.register_statistic(stat)
+        self.analyzer.add_trade(PositionId("P-1"), Money(10, USD))
+
+        # Act
+        stats = self.analyzer.get_performance_stats_pnls(currency=USD)
+
+        # Assert
+        assert stats[stat.name] == 1.0
+        assert stat.last_realized_pnls_input == [10.0]
+
+    def test_calculate_statistics_preserves_recorded_realized_pnls(self):
+        # Arrange
+        stat = _RecordingPyo3Statistic()
+        account = _create_cash_account([("2024-01-01", 1_000.0)], currency=EUR)
+        positions = [
+            _create_closed_position(
+                position_id="P-1",
+                realized_pnl=100.0,
+                realized_return=0.10,
+                ts_closed="2024-01-31",
+            ),
+        ]
+        self.analyzer.register_statistic(stat)
+        self.analyzer.record_trade(PositionId("P-1"), Money(90, EUR))
+
+        # Act
+        self.analyzer.calculate_statistics(account, positions)
+        native_pnls = self.analyzer.realized_pnls(USD)
+        recorded_pnls = self.analyzer.realized_pnls(EUR)
+        stats = self.analyzer.get_performance_stats_pnls(currency=EUR)
+
+        # Assert
+        assert native_pnls["P-1"] == 100.0
+        assert recorded_pnls["P-1"] == 90.0
+        assert stats[stat.name] == 1.0
+        assert stat.last_realized_pnls_input == [90.0]
+
+    def test_get_performance_stats_returns_converts_pyo3_statistics_input(self):
+        # Arrange
+        stat = _RecordingPyo3Statistic()
+        self.analyzer.register_statistic(stat)
+        self.analyzer.add_position_return(datetime(year=2010, month=1, day=1, tzinfo=UTC), 0.05)
+
+        # Act
+        stats = self.analyzer.get_performance_stats_returns()
+
+        # Assert
+        assert stats[stat.name] == 1.0
+        assert stat.last_returns_input is not None
+        assert isinstance(stat.last_returns_input, dict)
+        assert list(stat.last_returns_input.values()) == [0.05]
+
+    @pytest.mark.parametrize("cls", [MaxDrawdown, CAGR, CalmarRatio])
+    def test_returns_based_pyo3_statistics_skip_pnl_and_position_calls(self, cls):
+        # Returns-based pyo3 statistics must implement the full PortfolioStatistic
+        # surface (returning None for non-applicable inputs) so registering them
+        # does not raise AttributeError during backtest end.
+        self.analyzer.register_statistic(cls())
+        self.analyzer.add_trade(PositionId("P-1"), Money(10, USD))
+
+        pnl_stats = self.analyzer.get_performance_stats_pnls(currency=USD)
+        general_stats = self.analyzer.get_performance_stats_general()
+
+        assert cls().name not in pnl_stats
+        assert cls().name not in general_stats
+
+    def test_analyzer_tracks_position_returns(self):
         # Arrange
         t1 = datetime(year=2010, month=1, day=1, tzinfo=UTC)
         t2 = datetime(year=2010, month=1, day=2, tzinfo=UTC)
@@ -108,21 +227,23 @@ class TestPortfolioAnalyzer:
         t10 = datetime(year=2010, month=1, day=10, tzinfo=UTC)
 
         # Act
-        self.analyzer.add_return(t1, 0.05)
-        self.analyzer.add_return(t2, -0.10)
-        self.analyzer.add_return(t3, 0.10)
-        self.analyzer.add_return(t4, -0.21)
-        self.analyzer.add_return(t5, 0.22)
-        self.analyzer.add_return(t6, -0.23)
-        self.analyzer.add_return(t7, 0.24)
-        self.analyzer.add_return(t8, -0.25)
-        self.analyzer.add_return(t9, 0.26)
-        self.analyzer.add_return(t10, -0.10)
-        self.analyzer.add_return(t10, -0.10)
-        result = self.analyzer.returns()
+        self.analyzer.add_position_return(t1, 0.05)
+        self.analyzer.add_position_return(t2, -0.10)
+        self.analyzer.add_position_return(t3, 0.10)
+        self.analyzer.add_position_return(t4, -0.21)
+        self.analyzer.add_position_return(t5, 0.22)
+        self.analyzer.add_position_return(t6, -0.23)
+        self.analyzer.add_position_return(t7, 0.24)
+        self.analyzer.add_position_return(t8, -0.25)
+        self.analyzer.add_position_return(t9, 0.26)
+        self.analyzer.add_position_return(t10, -0.10)
+        self.analyzer.add_position_return(t10, -0.10)
+        result = self.analyzer.position_returns()
 
         # Assert
         assert len(result) == 10
+        assert self.analyzer.portfolio_returns().empty
+        pd.testing.assert_series_equal(self.analyzer.returns(), result)
 
     def test_get_realized_pnls_when_all_flat_positions_returns_expected_series(self):
         # Arrange
@@ -226,3 +347,334 @@ class TestPortfolioAnalyzer:
 
         # Assert: no returns should be added for empty shell position
         assert len(returns) == 0
+
+    def test_calculate_statistics_separates_position_and_portfolio_returns(self):
+        # Arrange
+        account = _create_cash_account(
+            [
+                ("2024-01-01", 1_000.0),
+                ("2024-01-10", 1_050.0),
+                ("2024-01-31", 1_100.0),
+            ],
+        )
+        positions = [
+            _create_closed_position(
+                position_id="P-1",
+                realized_pnl=100.0,
+                realized_return=0.30,
+                ts_closed="2024-01-31",
+            ),
+        ]
+
+        # Act
+        self.analyzer.calculate_statistics(account, positions)
+        position_returns = self.analyzer.position_returns()
+        portfolio_returns = self.analyzer.portfolio_returns()
+
+        # Assert
+        assert position_returns.loc[pd.Timestamp("2024-01-31", tz="UTC")] == pytest.approx(0.30)
+        assert portfolio_returns.loc[pd.Timestamp("2024-01-10", tz="UTC")] == pytest.approx(0.05)
+        assert portfolio_returns.loc[pd.Timestamp("2024-01-11", tz="UTC")] == pytest.approx(0.0)
+        pd.testing.assert_series_equal(self.analyzer.returns(), portfolio_returns)
+
+    def test_calculate_statistics_uses_recorded_account_currency_realized_pnls(self):
+        # Arrange
+        stat = _RecordingPyo3Statistic()
+        self.analyzer.register_statistic(stat)
+        account = _create_cash_account(
+            [
+                ("2024-01-01", 1_000.0),
+                ("2024-01-31", 1_090.0),
+                ("2024-02-01", 1_045.0),
+            ],
+            currency=EUR,
+        )
+        positions = [
+            _create_closed_position(
+                position_id="P-1",
+                realized_pnl=100.0,
+                realized_return=0.10,
+                ts_closed="2024-01-31",
+                currency=USD,
+            ),
+            _create_closed_position(
+                position_id="P-2",
+                realized_pnl=-50.0,
+                realized_return=-0.05,
+                ts_closed="2024-02-01",
+                currency=USD,
+            ),
+        ]
+        self.analyzer.record_trade(PositionId("P-1"), Money(90.0, EUR))
+        self.analyzer.record_trade(PositionId("P-2"), Money(-45.0, EUR))
+
+        # Act
+        self.analyzer.calculate_statistics(account, positions)
+        native_pnls = self.analyzer.realized_pnls(USD)
+        recorded_pnls = self.analyzer.realized_pnls(EUR)
+        stats = self.analyzer.get_performance_stats_pnls(currency=EUR)
+
+        # Assert
+        assert native_pnls["P-1"] == 100.0
+        assert native_pnls["P-2"] == -50.0
+        assert recorded_pnls["P-1"] == 90.0
+        assert recorded_pnls["P-2"] == -45.0
+        assert stats["PnL (total)"] == 45.0
+        assert stat.last_realized_pnls_input == [90.0, -45.0]
+
+    def test_get_performance_stats_returns_prefers_portfolio_returns(self):
+        # Arrange
+        self.analyzer.register_statistic(ReturnsAverage())
+        account = _create_cash_account(
+            [
+                ("2024-01-01", 1_000.0),
+                ("2024-01-10", 1_050.0),
+                ("2024-01-31", 1_100.0),
+            ],
+        )
+        positions = [
+            _create_closed_position(
+                position_id="P-1",
+                realized_pnl=100.0,
+                realized_return=0.30,
+                ts_closed="2024-01-31",
+            ),
+        ]
+
+        # Act
+        self.analyzer.calculate_statistics(account, positions)
+        position_stats = self.analyzer.get_performance_stats_position_returns()
+        portfolio_stats = self.analyzer.get_performance_stats_portfolio_returns()
+        returns_stats = self.analyzer.get_performance_stats_returns()
+
+        # Assert
+        assert position_stats["Average (Return)"] == pytest.approx(0.30)
+        assert portfolio_stats["Average (Return)"] == pytest.approx(
+            self.analyzer.portfolio_returns().mean(),
+        )
+        assert returns_stats == portfolio_stats
+
+    def test_get_performance_stats_returns_falls_back_to_position_returns(self):
+        # Arrange
+        self.analyzer.register_statistic(ReturnsAverage())
+        account = _create_cash_account([("2024-01-31", 1_000.0)])
+        positions = [
+            _create_closed_position(
+                position_id="P-1",
+                realized_pnl=100.0,
+                realized_return=0.30,
+                ts_closed="2024-01-31",
+            ),
+        ]
+
+        # Act
+        self.analyzer.calculate_statistics(account, positions)
+        position_stats = self.analyzer.get_performance_stats_position_returns()
+        returns_stats = self.analyzer.get_performance_stats_returns()
+
+        # Assert
+        assert self.analyzer.portfolio_returns().empty
+        assert position_stats["Average (Return)"] == pytest.approx(0.30)
+        assert returns_stats == position_stats
+
+    def test_get_performance_stats_returns_vs_benchmark(self):
+        # Arrange
+        self.analyzer.register_statistic(BetaRatio())
+        self.analyzer.register_statistic(InformationRatio())
+        self.analyzer.register_statistic(ReturnsAverage())  # Not benchmark-relative
+
+        timestamps = [datetime(year=2024, month=1, day=day, tzinfo=UTC) for day in (1, 2, 3, 4)]
+        for timestamp, value in zip(timestamps, [0.03, -0.01, 0.02, 0.04], strict=True):
+            self.analyzer.add_position_return(timestamp, value)
+
+        benchmark_returns = pd.Series(
+            [0.01, 0.005, 0.005, 0.01],
+            index=[pd.Timestamp(t) for t in timestamps],
+        )
+
+        # Act
+        stats = self.analyzer.get_performance_stats_returns_vs_benchmark(benchmark_returns)
+
+        # Assert: only the benchmark-relative statistics contribute
+        assert "Average (Return)" not in stats
+        assert stats == {
+            "Beta": pytest.approx(6.0),
+            "Information Ratio (252 days)": pytest.approx(10.246950765959598),
+        }
+
+    def test_get_performance_stats_returns_vs_benchmark_with_explicit_returns(self):
+        # Arrange
+        self.analyzer.register_statistic(BetaRatio())
+
+        timestamps = [pd.Timestamp(f"2024-01-0{day}", tz="UTC") for day in (1, 2, 3, 4)]
+        benchmark_returns = pd.Series([0.01, 0.005, 0.005, 0.01], index=timestamps)
+
+        # Act: the benchmark evaluated against itself must have unit beta
+        stats = self.analyzer.get_performance_stats_returns_vs_benchmark(
+            benchmark_returns,
+            returns=benchmark_returns,
+        )
+
+        # Assert
+        assert stats["Beta"] == pytest.approx(1.0)
+
+    def test_portfolio_returns_skips_empty_balance_snapshots(self):
+        # Arrange
+        account_id = TestIdStubs.account_id()
+        account = CashAccount(
+            _create_cash_account_state(
+                account_id=account_id,
+                total=1_000.0,
+                ts_event=pd.Timestamp("2024-01-01", tz="UTC").value,
+            ),
+            calculate_account_state=False,
+        )
+        account.apply(
+            AccountState(
+                account_id=account_id,
+                account_type=AccountType.CASH,
+                base_currency=USD,
+                reported=True,
+                balances=[],
+                margins=[],
+                info={},
+                event_id=UUID4(),
+                ts_event=pd.Timestamp("2024-01-15", tz="UTC").value,
+                ts_init=pd.Timestamp("2024-01-15", tz="UTC").value,
+            ),
+        )
+        account.apply(
+            _create_cash_account_state(
+                account_id=account_id,
+                total=1_050.0,
+                ts_event=pd.Timestamp("2024-01-31", tz="UTC").value,
+            ),
+        )
+
+        # Act
+        self.analyzer.calculate_statistics(account, [])
+        portfolio_returns = self.analyzer.portfolio_returns()
+
+        # Assert
+        assert not portfolio_returns.empty
+        assert portfolio_returns.loc[pd.Timestamp("2024-01-31", tz="UTC")] == pytest.approx(0.05)
+
+    def test_calculate_statistics_filters_non_finite_portfolio_returns(self):
+        # Arrange
+        account = _create_cash_account(
+            [
+                ("2024-01-01", 0.0),
+                ("2024-01-10", 1_000.0),
+                ("2024-01-31", 1_050.0),
+            ],
+        )
+
+        # Act
+        self.analyzer.calculate_statistics(account, [])
+        portfolio_returns = self.analyzer.portfolio_returns()
+
+        # Assert
+        assert portfolio_returns.notna().all()
+        assert portfolio_returns.loc[pd.Timestamp("2024-01-31", tz="UTC")] == pytest.approx(0.05)
+
+
+def _create_cash_account(events: list[tuple[str, float]], currency=USD) -> CashAccount:
+    account_id = TestIdStubs.account_id()
+    first_date, first_total = events[0]
+    account = CashAccount(
+        _create_cash_account_state(
+            account_id=account_id,
+            total=first_total,
+            ts_event=pd.Timestamp(first_date, tz="UTC").value,
+            currency=currency,
+        ),
+        calculate_account_state=False,
+    )
+
+    for date_str, total in events[1:]:
+        account.apply(
+            _create_cash_account_state(
+                account_id=account_id,
+                total=total,
+                ts_event=pd.Timestamp(date_str, tz="UTC").value,
+                currency=currency,
+            ),
+        )
+
+    return account
+
+
+def _create_cash_account_state(
+    account_id,
+    total: float,
+    ts_event: int,
+    currency=USD,
+) -> AccountState:
+    return AccountState(
+        account_id=account_id,
+        account_type=AccountType.CASH,
+        base_currency=currency,
+        reported=True,
+        balances=[
+            AccountBalance(
+                Money(total, currency),
+                Money(0, currency),
+                Money(total, currency),
+            ),
+        ],
+        margins=[],
+        info={},
+        event_id=UUID4(),
+        ts_event=ts_event,
+        ts_init=ts_event,
+    )
+
+
+def _create_closed_position(
+    position_id: str,
+    realized_pnl: float,
+    realized_return: float,
+    ts_closed: str,
+    currency=USD,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=PositionId(position_id),
+        realized_pnl=Money(realized_pnl, currency),
+        realized_return=realized_return,
+        ts_closed=pd.Timestamp(ts_closed, tz="UTC").value,
+    )
+
+
+class _RecordingPyo3Statistic:
+    __module__ = "nautilus_trader.core.nautilus_pyo3"
+
+    def __init__(self) -> None:
+        self.last_realized_pnls_input = None
+        self.last_returns_input = None
+
+    @property
+    def name(self) -> str:
+        return "Recording Pyo3 Statistic"
+
+    def calculate_from_realized_pnls(self, realized_pnls):
+        self.last_realized_pnls_input = realized_pnls
+        return 1.0
+
+    def calculate_from_returns(self, returns):
+        self.last_returns_input = returns
+        return 1.0
+
+    def calculate_from_positions(self, positions):
+        return None
+
+
+class _FakePyo3Statistic:
+    __module__ = "nautilus_trader.core.nautilus_pyo3"
+
+
+class _FakePyo3SubmoduleStatistic:
+    __module__ = "nautilus_trader.core.nautilus_pyo3.analysis"
+
+
+class _FakeLookalikePyo3Statistic:
+    __module__ = "nautilus_trader.core.nautilus_pyo3_fake"

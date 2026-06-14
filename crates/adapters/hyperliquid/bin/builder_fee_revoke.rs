@@ -15,21 +15,21 @@
 
 //! Revoke the Nautilus builder fee approval for Hyperliquid trading.
 //!
-//! This removes your approval of the Nautilus builder fee, disabling builder
-//! fee charges on your fills.
+//! Signs an `ApproveBuilderFee` action at a 0% max fee rate, capping any
+//! previously approved builder fee at zero so no fee can be charged.
 //!
 //! Prerequisites:
 //! - Set environment variable: HYPERLIQUID_PK (mainnet) or HYPERLIQUID_TESTNET_PK (testnet)
 //!
 //! Usage:
 //!     # Mainnet (interactive)
-//!     cargo run --bin hyperliquid-builder-fee-revoke
+//!     cargo run -p nautilus-hyperliquid --bin hyperliquid-builder-fee-revoke
 //!
 //!     # Mainnet (non-interactive)
-//!     cargo run --bin hyperliquid-builder-fee-revoke -- --yes
+//!     cargo run -p nautilus-hyperliquid --bin hyperliquid-builder-fee-revoke -- --yes
 //!
 //!     # Testnet
-//!     HYPERLIQUID_TESTNET=true cargo run --bin hyperliquid-builder-fee-revoke
+//!     HYPERLIQUID_TESTNET=true cargo run -p nautilus-hyperliquid --bin hyperliquid-builder-fee-revoke
 
 use nautilus_hyperliquid::common::builder_fee;
 

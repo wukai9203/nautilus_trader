@@ -49,12 +49,17 @@ DRY_RUN = bool(os.getenv("DRY_RUN", ""))
 
 # Precision mode configuration
 # https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode
-HIGH_PRECISION = os.getenv("HIGH_PRECISION", "true").lower() == "true"
+_HIGH_PRECISION = os.getenv("HIGH_PRECISION")
+if _HIGH_PRECISION is None or _HIGH_PRECISION.strip() == "":
+    HIGH_PRECISION = True
+else:
+    HIGH_PRECISION = _HIGH_PRECISION.strip().lower() in ("true", "1")
 if IS_WINDOWS and HIGH_PRECISION:
     print(
         "Warning: high-precision mode not supported on Windows (128-bit integers unavailable)\nForcing standard-precision (64-bit) mode",
     )
     HIGH_PRECISION = False
+os.environ["HIGH_PRECISION"] = "true" if HIGH_PRECISION else "false"
 
 if PROFILE_MODE:
     # For subsequent debugging, the C source needs to be in the same tree as
@@ -81,6 +86,7 @@ if IS_LINUX:
     os.environ["LDSHARED"] = "clang -shared"
 
 if IS_MACOS and IS_ARM64:
+    os.environ["ARCHFLAGS"] = "-arch arm64"
     os.environ["CFLAGS"] = f"{os.environ.get('CFLAGS', '')} -arch arm64"
     os.environ["LDFLAGS"] = f"{os.environ.get('LDFLAGS', '')} -arch arm64 -w"
 
@@ -102,6 +108,10 @@ if IS_WINDOWS:
     RUST_LIB_PFX = ""
     RUST_STATIC_LIB_EXT = "lib"
     RUST_DYLIB_EXT = "dll"
+    # Rust target is typically x86_64-pc-windows-msvc; C deps (ring, zstd-sys, aws-Lc-sys) need MSVC's cl.exe, not cc/g++/clang.
+    # Unset CC/CXX compilers so the build uses the default MSVC toolchain.
+    os.environ.pop("CC", None)
+    os.environ.pop("CXX", None)
 elif IS_MACOS:
     RUST_LIB_PFX = "lib"
     RUST_STATIC_LIB_EXT = "a"
@@ -117,6 +127,8 @@ CARGO_BUILD_TARGET = os.environ.get("CARGO_BUILD_TARGET", "")
 # Determine the profile directory name
 if BUILD_MODE == "release":
     profile_dir = "release"
+elif BUILD_MODE == "ci-pr":
+    profile_dir = "ci-pr-wheel"
 elif BUILD_MODE == "debug-pyo3":
     profile_dir = "debug-pyo3"
 else:
@@ -138,6 +150,7 @@ RUST_LIBS: list[str] = [str(path) for path in RUST_LIB_PATHS]
 
 def _set_feature_flags() -> list[str]:
     feature_list = [
+        "arrow",
         "cython-compat",
         "extension-module",
         "ffi",
@@ -168,7 +181,6 @@ def _build_rust_libs() -> None:
             "nautilus-backtest",
             "nautilus-common",
             "nautilus-core",
-            "nautilus-infrastructure",
             "nautilus-model",
             "nautilus-persistence",
             "nautilus-pyo3",
@@ -182,6 +194,8 @@ def _build_rust_libs() -> None:
             if IS_LINUX:
                 existing_rustflags = os.environ.get("RUSTFLAGS", "")
                 os.environ["RUSTFLAGS"] = f"{existing_rustflags} -C link-arg=-s"
+        elif BUILD_MODE == "ci-pr":
+            build_options = ["--profile", "ci-pr-wheel"]
         elif BUILD_MODE == "debug-pyo3":
             build_options = ["--profile", "debug-pyo3"]
         else:
@@ -249,6 +263,7 @@ def _build_extensions() -> list[Extension]:
     define_macros: list[tuple[str, str | None]] = [
         ("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION"),
     ]
+
     if PROFILE_MODE or ANNOTATION_MODE:
         # Profiling requires special macro directives
         define_macros.append(("CYTHON_TRACE", "1"))
@@ -259,6 +274,7 @@ def _build_extensions() -> list[Extension]:
     if not IS_WINDOWS:
         # Suppress warnings produced by Cython boilerplate
         extra_compile_args.append("-Wno-unreachable-code")
+
         if BUILD_MODE == "release":
             extra_compile_args.append("-O2")
             extra_compile_args.append("-pipe")
@@ -320,6 +336,7 @@ def _build_extensions() -> list[Extension]:
 
 def _build_distribution(extensions: list[Extension]) -> Distribution:
     nthreads = os.cpu_count() or 1
+
     if IS_WINDOWS:
         nthreads = min(nthreads, 60)
     print(f"nthreads={nthreads}")
@@ -509,6 +526,7 @@ def show_rustanalyzer_settings() -> None:
 
     # Set environment variables
     settings: dict[str, object] = {}
+
     for key in [
         "rust-analyzer.check.extraEnv",
         "rust-analyzer.runnables.extraEnv",
@@ -533,6 +551,36 @@ def show_rustanalyzer_settings() -> None:
     print(json.dumps(settings, indent=2))
 
 
+def _ensure_local_editable_pth() -> None:
+    # Make the v1 source tree (with its built `.so` files) importable from any cwd
+    # after `make build`, without requiring a follow-up `uv sync`. This closes the
+    # gap where a bare `make build` leaves the venv unable to resolve `nautilus_trader`
+    # from a tempdir (e.g. the docs tutorial subprocess tests).
+    if not COPY_TO_SOURCE:
+        return
+    if sys.prefix == sys.base_prefix:
+        return  # Not running inside a venv (e.g. PEP 517 build host)
+
+    site_packages = Path(sysconfig.get_paths()["purelib"])
+    try:
+        site_packages.relative_to(Path(sys.prefix))
+    except ValueError:
+        return  # `purelib` is outside the active venv prefix
+
+    if not site_packages.is_dir():
+        return
+
+    repo_root = Path(__file__).resolve().parent
+    pth_file = site_packages / "nautilus-trader-local.pth"
+    contents = f"{repo_root}\n"
+
+    if pth_file.is_file() and pth_file.read_text() == contents:
+        return
+
+    pth_file.write_text(contents)
+    print(f"Wrote local editable .pth: {pth_file}")
+
+
 def build() -> None:
     """
     Construct the extensions and distribution.
@@ -551,6 +599,7 @@ def build() -> None:
         # Build and run the command
         print("Compiling C extension modules...")
         cmd: build_ext = build_ext(distribution)
+
         if PARALLEL_BUILD:
             cmd.parallel = os.cpu_count()
         cmd.ensure_finalized()
@@ -563,6 +612,8 @@ def build() -> None:
     if (BUILD_MODE == "release" or FORCE_STRIP) and (IS_LINUX or IS_MACOS):
         # Strip symbols for release builds or when forced
         _strip_unneeded_symbols()
+
+    _ensure_local_editable_pth()
 
 
 def print_env_var_if_exists(key: str) -> None:

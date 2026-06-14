@@ -19,16 +19,15 @@ pub mod cache;
 pub mod msgbus;
 pub mod queries;
 
-use std::time::Duration;
+use std::{fmt::Write as _, time::Duration};
 
 use nautilus_common::{
     logging::log_task_awaiting,
     msgbus::database::{DatabaseConfig, MessageBusConfig},
 };
-use nautilus_core::UUID4;
+use nautilus_core::{UUID4, string::semver::SemVer};
 use nautilus_model::identifiers::TraderId;
 use redis::RedisError;
-use semver::Version;
 
 const REDIS_MIN_VERSION: &str = "6.2.0";
 const REDIS_DELIMITER: char = ':';
@@ -39,8 +38,8 @@ const REDIS_FLUSHDB: &str = "FLUSHDB";
 
 /// Extracts the index key from a full Redis key.
 ///
-/// Handles keys with instance_id prefix by finding the `:index:` pattern.
-/// e.g., "trader-id:uuid:index:order_position" -> "index:order_position"
+/// Handles keys with `instance_id` prefix by finding the `:index:` pattern.
+/// For example, `trader-id:uuid:index:order_position` -> `index:order_position`.
 pub(crate) fn get_index_key(key: &str) -> anyhow::Result<&str> {
     if let Some(pos) = key.find(REDIS_INDEX_PATTERN) {
         return Ok(&key[pos + 1..]);
@@ -65,7 +64,7 @@ async fn await_handle(handle: Option<tokio::task::JoinHandle<()>>, task_name: &s
                 }
             }
             Err(_) => {
-                log::error!("Timeout {timeout:?} awaiting task '{task_name}'");
+                log::warn!("Timeout {timeout:?} awaiting task '{task_name}'");
             }
         }
     }
@@ -157,6 +156,10 @@ pub async fn create_redis_connection(
     let connection_timeout = Duration::from_secs(u64::from(config.connection_timeout));
     let response_timeout = Duration::from_secs(u64::from(config.response_timeout));
     let number_of_retries = config.number_of_retries;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "redis connection manager API accepts exponent base as f32"
+    )]
     let exponent_base = config.exponent_base as f32;
 
     // Use factor as min_delay base for backoff: factor * (exponent_base ^ tries)
@@ -178,7 +181,7 @@ pub async fn create_redis_connection(
         .await?;
 
     let version = get_redis_version(&mut con).await?;
-    let min_version = Version::parse(REDIS_MIN_VERSION)?;
+    let min_version = SemVer::parse(REDIS_MIN_VERSION)?;
     let con_msg = format!("Connected to redis v{version}");
 
     if version >= min_version {
@@ -220,7 +223,7 @@ pub fn get_stream_key(
     }
 
     if config.use_instance_id {
-        stream_key.push_str(&format!("{instance_id}"));
+        write!(stream_key, "{instance_id}").expect("writing to String cannot fail");
         stream_key.push(REDIS_DELIMITER);
     }
 
@@ -228,39 +231,19 @@ pub fn get_stream_key(
     stream_key
 }
 
-/// Retrieves and parses the Redis server version via the INFO command.
-///
-/// # Errors
-///
-/// Returns an error if the INFO command fails or version parsing fails.
-pub async fn get_redis_version(
-    conn: &mut redis::aio::ConnectionManager,
-) -> anyhow::Result<Version> {
+async fn get_redis_version(conn: &mut redis::aio::ConnectionManager) -> anyhow::Result<SemVer> {
     let info: String = redis::cmd("INFO").query_async(conn).await?;
-    let version_str = match info.lines().find_map(|line| {
+    let Some(version_str) = info.lines().find_map(|line| {
         if line.starts_with("redis_version:") {
             line.split(':').nth(1).map(|s| s.trim().to_string())
         } else {
             None
         }
-    }) {
-        Some(info) => info,
-        None => {
-            anyhow::bail!("Redis version not available");
-        }
+    }) else {
+        anyhow::bail!("Redis version not available");
     };
 
-    parse_redis_version(&version_str)
-}
-
-fn parse_redis_version(version_str: &str) -> anyhow::Result<Version> {
-    let mut components = version_str.split('.').map(str::parse::<u64>);
-
-    let major = components.next().unwrap_or(Ok(0))?;
-    let minor = components.next().unwrap_or(Ok(0))?;
-    let patch = components.next().unwrap_or(Ok(0))?;
-
-    Ok(Version::new(major, minor, patch))
+    SemVer::parse(&version_str)
 }
 
 #[cfg(test)]
@@ -374,7 +357,7 @@ mod tests {
         };
 
         let key = get_stream_key(trader_id, instance_id, &config);
-        assert_eq!(key, format!("stream"));
+        assert_eq!(key, "stream".to_string());
     }
 
     #[rstest]

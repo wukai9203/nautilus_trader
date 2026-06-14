@@ -38,6 +38,7 @@ use std::{
 };
 
 use ahash::AHashMap;
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -53,7 +54,11 @@ use crate::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct CashAccount {
     pub base: BaseAccount,
@@ -65,6 +70,7 @@ pub struct CashAccount {
 
 impl CashAccount {
     /// Creates a new [`CashAccount`] instance.
+    #[must_use]
     pub fn new(event: AccountState, calculate_account_state: bool, allow_borrowing: bool) -> Self {
         Self {
             base: BaseAccount::new(event, calculate_account_state),
@@ -110,7 +116,7 @@ impl CashAccount {
     ///
     /// Returns an error if `allow_borrowing` is false and any balance has a negative total.
     ///
-    /// TODO: Force stop backtest engine on error (like Python's set_backtest_force_stop)
+    /// TODO: Force stop backtest engine on error (like Python's `set_backtest_force_stop`)
     pub fn update_balances(&mut self, balances: &[AccountBalance]) -> anyhow::Result<()> {
         if !self.allow_borrowing {
             for balance in balances {
@@ -148,16 +154,12 @@ impl CashAccount {
     /// Sums all per-instrument locked amounts for the currency and updates the balance.
     /// If the total locked exceeds the total balance, clamps to total (free = 0).
     ///
-    /// # Panics
-    ///
-    /// Panics if conversion from `Decimal` to `f64` fails during balance update.
     pub fn recalculate_balance(&mut self, currency: Currency) {
-        let current_balance = match self.balances.get(&currency) {
-            Some(balance) => *balance,
-            None => {
-                log::debug!("Cannot recalculate balance when no current balance for {currency}");
-                return;
-            }
+        let current_balance = if let Some(balance) = self.balances.get(&currency) {
+            *balance
+        } else {
+            log::debug!("Cannot recalculate balance when no current balance for {currency}");
+            return;
         };
 
         let total_locked_raw: MoneyRaw = self
@@ -209,14 +211,14 @@ impl Account for CashAccount {
     }
 
     fn calculated_account_state(&self) -> bool {
-        false // TODO (implement this logic)
+        self.calculate_account_state
     }
 
     fn balance_total(&self, currency: Option<Currency>) -> Option<Money> {
         self.base_balance_total(currency)
     }
 
-    fn balances_total(&self) -> AHashMap<Currency, Money> {
+    fn balances_total(&self) -> IndexMap<Currency, Money> {
         self.base_balances_total()
     }
 
@@ -224,7 +226,7 @@ impl Account for CashAccount {
         self.base_balance_free(currency)
     }
 
-    fn balances_free(&self) -> AHashMap<Currency, Money> {
+    fn balances_free(&self) -> IndexMap<Currency, Money> {
         self.base_balances_free()
     }
 
@@ -232,7 +234,7 @@ impl Account for CashAccount {
         self.base_balance_locked(currency)
     }
 
-    fn balances_locked(&self) -> AHashMap<Currency, Money> {
+    fn balances_locked(&self) -> IndexMap<Currency, Money> {
         self.base_balances_locked()
     }
 
@@ -256,11 +258,11 @@ impl Account for CashAccount {
         self.balances.keys().copied().collect()
     }
 
-    fn starting_balances(&self) -> AHashMap<Currency, Money> {
+    fn starting_balances(&self) -> IndexMap<Currency, Money> {
         self.balances_starting.clone()
     }
 
-    fn balances(&self) -> AHashMap<Currency, AccountBalance> {
+    fn balances(&self) -> IndexMap<Currency, AccountBalance> {
         self.balances.clone()
     }
 
@@ -279,8 +281,8 @@ impl Account for CashAccount {
             }
         }
 
-        // Only clear locks for externally reported state (venue is authoritative)
-        if event.is_reported {
+        // Only clear locks when the venue reports a fresh balance snapshot
+        if event.is_reported && !event.balances.is_empty() {
             self.balances_locked.clear();
         }
 
@@ -294,7 +296,7 @@ impl Account for CashAccount {
 
     fn calculate_balance_locked(
         &mut self,
-        instrument: InstrumentAny,
+        instrument: &InstrumentAny,
         side: OrderSide,
         quantity: Quantity,
         price: Price,
@@ -305,8 +307,8 @@ impl Account for CashAccount {
 
     fn calculate_pnls(
         &self,
-        instrument: InstrumentAny, // TODO: Make this a reference
-        fill: OrderFilled,         // TODO: Make this a reference
+        instrument: &InstrumentAny,
+        fill: &OrderFilled,
         position: Option<Position>,
     ) -> anyhow::Result<Vec<Money>> {
         self.base_calculate_pnls(instrument, fill, position)
@@ -314,7 +316,7 @@ impl Account for CashAccount {
 
     fn calculate_commission(
         &self,
-        instrument: InstrumentAny,
+        instrument: &InstrumentAny,
         last_qty: Quantity,
         last_px: Price,
         liquidity_side: LiquiditySide,
@@ -369,7 +371,8 @@ impl Display for CashAccount {
 
 #[cfg(test)]
 mod tests {
-    use ahash::{AHashMap, AHashSet};
+    use ahash::AHashSet;
+    use indexmap::IndexMap;
     use rstest::rstest;
 
     use crate::{
@@ -377,7 +380,10 @@ mod tests {
         enums::{AccountType, LiquiditySide, OrderSide, OrderType},
         events::{AccountState, account::stubs::*},
         identifiers::{AccountId, InstrumentId, position_id::PositionId, stubs::uuid4},
-        instruments::{CryptoPerpetual, CurrencyPair, Equity, Instrument, InstrumentAny, stubs::*},
+        instruments::{
+            CryptoFuture, CryptoPerpetual, CurrencyPair, Equity, Instrument, InstrumentAny,
+            stubs::*,
+        },
         orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::Position,
         types::{AccountBalance, Currency, Money, Price, Quantity},
@@ -389,6 +395,14 @@ mod tests {
             format!("{cash_account}"),
             "CashAccount(id=SIM-001, type=CASH, base=USD)"
         );
+    }
+
+    #[rstest]
+    fn test_calculated_account_state_returns_field_value(cash_account_state: AccountState) {
+        assert!(
+            CashAccount::new(cash_account_state.clone(), true, false).calculated_account_state()
+        );
+        assert!(!CashAccount::new(cash_account_state, false, false).calculated_account_state());
     }
 
     #[rstest]
@@ -414,13 +428,13 @@ mod tests {
             cash_account.balance_locked(None),
             Some(Money::from("25000 USD"))
         );
-        let mut balances_total_expected = AHashMap::new();
+        let mut balances_total_expected = IndexMap::new();
         balances_total_expected.insert(Currency::from("USD"), Money::from("1525000 USD"));
         assert_eq!(cash_account.balances_total(), balances_total_expected);
-        let mut balances_free_expected = AHashMap::new();
+        let mut balances_free_expected = IndexMap::new();
         balances_free_expected.insert(Currency::from("USD"), Money::from("1500000 USD"));
         assert_eq!(cash_account.balances_free(), balances_free_expected);
-        let mut balances_locked_expected = AHashMap::new();
+        let mut balances_locked_expected = IndexMap::new();
         balances_locked_expected.insert(Currency::from("USD"), Money::from("25000 USD"));
         assert_eq!(cash_account.balances_locked(), balances_locked_expected);
     }
@@ -463,20 +477,40 @@ mod tests {
             cash_account_multi.balance_locked(Some(Currency::ETH())),
             Some(Money::from("0 ETH"))
         );
-        let mut balances_total_expected = AHashMap::new();
+        let mut balances_total_expected = IndexMap::new();
         balances_total_expected.insert(Currency::from("BTC"), Money::from("10 BTC"));
         balances_total_expected.insert(Currency::from("ETH"), Money::from("20 ETH"));
         assert_eq!(cash_account_multi.balances_total(), balances_total_expected);
-        let mut balances_free_expected = AHashMap::new();
+        let mut balances_free_expected = IndexMap::new();
         balances_free_expected.insert(Currency::from("BTC"), Money::from("10 BTC"));
         balances_free_expected.insert(Currency::from("ETH"), Money::from("20 ETH"));
         assert_eq!(cash_account_multi.balances_free(), balances_free_expected);
-        let mut balances_locked_expected = AHashMap::new();
+        let mut balances_locked_expected = IndexMap::new();
         balances_locked_expected.insert(Currency::from("BTC"), Money::from("0 BTC"));
         balances_locked_expected.insert(Currency::from("ETH"), Money::from("0 ETH"));
         assert_eq!(
             cash_account_multi.balances_locked(),
             balances_locked_expected
+        );
+    }
+
+    #[rstest]
+    fn test_cash_account_balances_preserve_insertion_order(cash_account_multi: CashAccount) {
+        // Locks in IndexMap iteration order for BaseAccount.balances:
+        // currencies appear in the same order as the AccountState.balances
+        // Vec they were initialised from. Drives the deterministic ordering
+        // of regenerated AccountState events in portfolio::manager.
+        let keys: Vec<Currency> = cash_account_multi.balances().keys().copied().collect();
+        assert_eq!(keys, vec![Currency::from("BTC"), Currency::from("ETH")]);
+
+        let totals: Vec<(Currency, Money)> =
+            cash_account_multi.balances_total().into_iter().collect();
+        assert_eq!(
+            totals,
+            vec![
+                (Currency::from("BTC"), Money::from("10 BTC")),
+                (Currency::from("ETH"), Money::from("20 ETH")),
+            ]
         );
     }
 
@@ -535,7 +569,7 @@ mod tests {
     ) {
         let balance_locked = cash_account_million_usd
             .calculate_balance_locked(
-                audusd_sim.into_any(),
+                &audusd_sim.into_any(),
                 OrderSide::Buy,
                 Quantity::from("1000000"),
                 Price::from("0.8"),
@@ -546,13 +580,51 @@ mod tests {
     }
 
     #[rstest]
+    fn test_calculate_balance_locked_buy_quanto_uses_quote_currency(
+        mut cash_account_million_usd: CashAccount,
+        ethbtc_quanto: CryptoFuture,
+    ) {
+        let balance_locked = cash_account_million_usd
+            .calculate_balance_locked(
+                &ethbtc_quanto.into_any(),
+                OrderSide::Buy,
+                Quantity::from("5"),
+                Price::from("0.036"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(balance_locked, Money::from("0.18 BTC"));
+    }
+
+    #[rstest]
+    #[case(false, Money::from("0.002 BTC"))]
+    #[case(true, Money::from("100 USD"))]
+    fn test_calculate_balance_locked_buy_inverse_respects_quote_flag(
+        #[case] use_quote_for_inverse: bool,
+        #[case] expected: Money,
+        mut cash_account_million_usd: CashAccount,
+        xbtusd_inverse_perp: CryptoPerpetual,
+    ) {
+        let balance_locked = cash_account_million_usd
+            .calculate_balance_locked(
+                &xbtusd_inverse_perp.into_any(),
+                OrderSide::Buy,
+                Quantity::from("100"),
+                Price::from("50000"),
+                Some(use_quote_for_inverse),
+            )
+            .unwrap();
+        assert_eq!(balance_locked, expected);
+    }
+
+    #[rstest]
     fn test_calculate_balance_locked_sell(
         mut cash_account_million_usd: CashAccount,
         audusd_sim: CurrencyPair,
     ) {
         let balance_locked = cash_account_million_usd
             .calculate_balance_locked(
-                audusd_sim.into_any(),
+                &audusd_sim.into_any(),
                 OrderSide::Sell,
                 Quantity::from("1000000"),
                 Price::from("0.8"),
@@ -569,7 +641,7 @@ mod tests {
     ) {
         let balance_locked = cash_account_million_usd
             .calculate_balance_locked(
-                equity_aapl.into_any(),
+                &equity_aapl.into_any(),
                 OrderSide::Sell,
                 Quantity::from("100"),
                 Price::from("1500.0"),
@@ -603,8 +675,9 @@ mod tests {
             Some(AccountId::from("SIM-001")),
         );
         let position = Position::new(&audusd_sim, fill.clone().into());
+        let fill_owned: crate::events::OrderFilled = fill.into();
         let pnls = cash_account_million_usd
-            .calculate_pnls(audusd_sim, fill.into(), Some(position)) // TODO: Remove clone
+            .calculate_pnls(&audusd_sim, &fill_owned, Some(position))
             .unwrap();
         assert_eq!(pnls, vec![Money::from("-800000 USD")]);
     }
@@ -614,7 +687,7 @@ mod tests {
         cash_account_multi: CashAccount,
         currency_pair_btcusdt: CurrencyPair,
     ) {
-        let btcusdt = InstrumentAny::CurrencyPair(currency_pair_btcusdt);
+        let btcusdt = InstrumentAny::CurrencyPair(currency_pair_btcusdt.clone());
         let order1 = OrderTestBuilder::new(OrderType::Market)
             .instrument_id(currency_pair_btcusdt.id)
             .side(OrderSide::Sell)
@@ -633,12 +706,9 @@ mod tests {
             Some(AccountId::from("SIM-001")),
         );
         let position = Position::new(&btcusdt, fill1.clone().into());
+        let fill1_owned: crate::events::OrderFilled = fill1.into();
         let result1 = cash_account_multi
-            .calculate_pnls(
-                currency_pair_btcusdt.into_any(),
-                fill1.into(), // TODO: This doesn't need to be owned
-                Some(position.clone()),
-            )
+            .calculate_pnls(&btcusdt, &fill1_owned, Some(position.clone()))
             .unwrap();
         let order2 = OrderTestBuilder::new(OrderType::Market)
             .instrument_id(currency_pair_btcusdt.id)
@@ -657,10 +727,11 @@ mod tests {
             None,
             Some(AccountId::from("SIM-001")),
         );
+        let fill2_owned: crate::events::OrderFilled = fill2.into();
         let result2 = cash_account_multi
             .calculate_pnls(
-                currency_pair_btcusdt.into_any(),
-                fill2.into(),
+                &currency_pair_btcusdt.into_any(),
+                &fill2_owned,
                 Some(position),
             )
             .unwrap();
@@ -690,7 +761,7 @@ mod tests {
     ) {
         let result = cash_account_million_usd
             .calculate_commission(
-                xbtusd_bitmex.into_any(),
+                &xbtusd_bitmex.into_any(),
                 Quantity::from("100000"),
                 Price::from("11450.50"),
                 LiquiditySide::Maker,
@@ -707,7 +778,7 @@ mod tests {
     ) {
         let result = cash_account_million_usd
             .calculate_commission(
-                audusd_sim.into_any(),
+                &audusd_sim.into_any(),
                 Quantity::from("1500000"),
                 Price::from("0.8005"),
                 LiquiditySide::Taker,
@@ -724,7 +795,7 @@ mod tests {
     ) {
         let result = cash_account_million_usd
             .calculate_commission(
-                xbtusd_bitmex.into_any(),
+                &xbtusd_bitmex.into_any(),
                 Quantity::from("100000"),
                 Price::from("11450.50"),
                 LiquiditySide::Taker,
@@ -739,7 +810,7 @@ mod tests {
         let instrument = usdjpy_idealpro();
         let result = cash_account_million_usd
             .calculate_commission(
-                instrument.into_any(),
+                &instrument.into_any(),
                 Quantity::from("2200000"),
                 Price::from("120.310"),
                 LiquiditySide::Taker,
@@ -1019,5 +1090,50 @@ mod tests {
             account.balance_total(Some(Currency::USD())),
             Some(Money::from("8000 USD"))
         );
+    }
+
+    #[rstest]
+    fn test_apply_empty_balances_preserves_per_instrument_locks() {
+        let initial_event = AccountState::new(
+            AccountId::from("SIM-001"),
+            AccountType::Cash,
+            vec![AccountBalance::new(
+                Money::from("10000 USD"),
+                Money::from("0 USD"),
+                Money::from("10000 USD"),
+            )],
+            vec![],
+            true,
+            uuid4(),
+            0.into(),
+            0.into(),
+            Some(Currency::USD()),
+        );
+
+        let mut account = CashAccount::new(initial_event, false, false);
+        let instrument_id = InstrumentId::from("AAPL.NASDAQ");
+        account.update_balance_locked(instrument_id, Money::from("5000 USD"));
+        assert_eq!(account.balances_locked.len(), 1);
+
+        let empty_event = AccountState::new(
+            AccountId::from("SIM-001"),
+            AccountType::Cash,
+            vec![],
+            vec![],
+            true,
+            uuid4(),
+            1.into(),
+            1.into(),
+            Some(Currency::USD()),
+        );
+
+        account.apply(empty_event).unwrap();
+
+        assert_eq!(account.balances_locked.len(), 1);
+        assert_eq!(
+            account.balance_total(Some(Currency::USD())),
+            Some(Money::from("10000 USD"))
+        );
+        assert_eq!(account.event_count(), 2);
     }
 }

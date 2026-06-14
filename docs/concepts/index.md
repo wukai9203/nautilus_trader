@@ -1,112 +1,160 @@
 # Concepts
 
-Concept guides introduce and explain the foundational ideas, components, and best practices that underpin the NautilusTrader platform.
-These guides are designed to provide both conceptual and practical insights, helping you navigate the system's architecture, strategies, data management, execution flow, and more.
-Explore the following guides to deepen your understanding and make the most of NautilusTrader.
+These guides explain the core components, architecture, and design of NautilusTrader.
 
-## [Overview](overview.md)
+## Overview
 
-The **Overview** guide covers the main features and intended use cases for the platform.
+Main features and intended use cases for the platform.
 
-## [Architecture](architecture.md)
+## Architecture
 
-The **Architecture** guide dives deep into the foundational principles, structures, and designs that underpin
-the platform. It is ideal for developers, system architects, or anyone curious about the inner workings of NautilusTrader.
+The principles, structures, and designs that underpin the platform.
 
-## [Actors](actors.md)
+## Actors
 
-The `Actor` serves as the foundational component for interacting with the trading system.
-The **Actors** guide covers capabilities and implementation specifics.
+The `Actor` is the base component for interacting with the trading system.
+Covers capabilities and implementation details.
 
-## [Strategies](strategies.md)
+## Strategies
 
-The `Strategy` is at the heart of the NautilusTrader user experience when writing and working with
-trading strategies. The **Strategies** guide covers how to implement strategies for the platform.
+How to implement trading strategies using the `Strategy` component.
 
-## [Instruments](instruments.md)
+## Instruments
 
-The **Instruments** guide covers the different instrument definition specifications for tradable assets and contracts.
+Instrument definitions for tradable assets and contracts.
 
-## [Value Types](value_types.md)
+## Synthetics
 
-The **Value Types** guide covers the immutable numeric types (`Price`, `Quantity`, `Money`) used throughout
-the platform, including their arithmetic behavior, precision handling, and type-specific constraints.
+User-defined instruments whose prices are computed by evaluating a numeric expression over component instrument prices.
 
-## [Data](data.md)
+## Continuous Futures
 
-The NautilusTrader platform defines a range of built-in data types crafted specifically to represent
-a trading domain. The **Data** guide covers working with both built-in and custom data.
+Splicing consecutive futures contracts into one adjusted bar series via an explicit roll
+table, including the four adjustment modes, request and subscription flow, and the mid-bar
+roll boundary policy.
 
-## [Execution](execution.md)
+## Value Types
 
-NautilusTrader can handle trade execution and order management for multiple strategies and venues
-simultaneously (per instance). The **Execution** guide covers components involved in execution, as
-well as the flow of execution messages (commands and events).
+The immutable numeric types (`Price`, `Quantity`, `Money`) used throughout the platform,
+including their arithmetic behavior, precision handling, and type-specific constraints.
 
-## [Orders](orders.md)
+## Data
 
-The **Orders** guide provides more details about the available order types for the platform, along with
-the execution instructions supported for each. Advanced order types and emulated orders are also covered.
+Built-in data types for the trading domain, and how to work with custom data.
 
-## [Positions](positions.md)
+## Events
 
-The **Positions** guide explains how positions work in NautilusTrader, including their lifecycle,
-aggregation from order fills, profit and loss calculations, and the important concept of position
-snapshotting for netting OMS configurations.
+The event types that drive the system: order events, position events, account
+events, and time events. Covers handler dispatch, the causal chain from order
+fills to position events, and tracing orders to positions.
 
-## [Cache](cache.md)
+## Event Sourcing
 
-The `Cache` is a central in-memory data store for managing all trading-related data.
-The **Cache** guide covers capabilities and best practices of the cache.
+The durable event-store log for state-affecting messages, including capture boundaries,
+correlation headers, replay modes, recovery anchors, and verifier behavior.
 
-## [Message Bus](message_bus.md)
+## Options
 
-The `MessageBus` is the core communication system enabling decoupled messaging patterns between components,
-including point-to-point, publish/subscribe, and request/response.
-The **Message Bus** guide covers capabilities and best practices of the `MessageBus`.
+Option instrument types, venue-provided Greeks streaming, option chain subscriptions
+with strike range filtering, and snapshot aggregation.
 
-## [Portfolio](portfolio.md)
+## Greeks
 
-The `Portfolio` serves as the central hub for managing and tracking all positions across active strategies for the trading node or backtest.
-It consolidates position data from multiple instruments, providing a unified view of your holdings, risk exposure, and overall performance.
-Explore this section to understand how NautilusTrader aggregates and updates portfolio state to support effective trading and risk management.
+Option Greeks (delta, gamma, vega, theta) from two paths: venue-provided real-time
+Greeks via the Rust/PyO3 `OptionGreeks` type, and the local `GreeksCalculator` for
+Black-Scholes computation with shock scenarios, beta weighting, and portfolio aggregation.
 
-## [Reports](reports.md)
+## Custom Data
 
-The **Reports** guide covers the reporting capabilities in NautilusTrader, including execution reports,
-portfolio analysis reports, PnL accounting considerations, and how reports are used for backtest
-post-run analysis.
+How the custom data system works across Python and Rust: registration, persistence,
+Arrow encoding, and runtime routing through actors and strategies.
 
-## [Logging](logging.md)
+## Order Book
 
-The platform provides logging for both backtesting and live trading using a high-performance logger implemented in Rust.
+The high-performance order book, own order tracking, filtered views for net liquidity, and binary market support.
 
-## [Backtesting](backtesting.md)
+## Execution
 
-Backtesting with NautilusTrader is a methodical simulation process that replicates trading
-activities using a specific system implementation.
+Trade execution and order management across multiple strategies and venues simultaneously (per instance),
+including the components involved and the flow of execution messages (commands and events).
 
-## [Visualization](visualization.md)
+## Orders
 
-The **Visualization** guide covers the interactive tearsheet system for analyzing backtest
-results, including available charts, themes, customization options, and how to create
-custom visualizations using the extensible chart registry.
+Available order types, supported execution instructions, advanced order types, and emulated orders.
 
-## [Live Trading](live.md)
+## Positions
 
-Live trading in NautilusTrader enables traders to deploy their backtested strategies in real-time
-without code changes. This transition aims to maintain consistency, though there are key differences
+Position lifecycle, aggregation from order fills, PnL calculations, and position snapshotting
+for netting OMS configurations.
+
+## Cache
+
+The `Cache` is the central in-memory store for all trading-related data.
+Covers capabilities and best practices.
+
+## Message Bus
+
+The `MessageBus` enables decoupled messaging between components, supporting point-to-point,
+publish/subscribe, and request/response patterns.
+
+## Accounting
+
+Account types (cash, margin, betting), the `AccountBalance` and `MarginBalance`
+data model, the per-instrument vs account-wide margin scopes, the strategy query
+API, built-in margin models, and the adapter convention across live venues.
+
+## Portfolio
+
+The `Portfolio` tracks all positions across strategies and instruments, providing a unified view
+of holdings, risk exposure, and performance.
+
+## Reports
+
+Execution reports, portfolio analysis, PnL accounting, and backtest post-run analysis.
+
+## Logging
+
+High-performance logging for both backtesting and live trading, implemented in Rust.
+
+## Backtesting
+
+Running simulated trading on historical data using a specific system implementation.
+
+## Visualization
+
+Interactive tearsheets for analyzing backtest results, including charts, themes,
+customization options, and custom visualizations via the extensible chart registry.
+
+## Configuration
+
+How config structs work across Python and Rust: default resolution, the `T` vs `Option<T>`
+convention, builder patterns, and common fields shared across adapters and engines.
+
+## Live Trading
+
+Deploying backtested strategies in real-time without code changes, and the key differences
 between backtesting and live trading.
 
-## [Adapters](adapters.md)
+## Plugins
 
-The NautilusTrader design allows for integrating data providers and/or trading venues through adapter implementations.
-The **Adapters** guide covers requirements and best practices for developing new integration adapters for the platform.
+The Rust plug-in system loaded by a live node, covering the C-ABI boundary, manifest validation,
+plug-point surfaces (custom data, actors, strategies), host callback routing, configuration, and
+the lifecycle from `dlopen` through adapter registration.
+
+## Adapters
+
+Requirements and best practices for developing integration adapters for data providers and trading venues.
+
+## Rust
+
+Writing actors, strategies, and running backtests and live trading in pure Rust
+using the `crates/` implementation directly.
+
+## Deterministic Simulation Testing (DST)
+
+The determinism contract for seed-replayable execution, the source-level seams that implement
+it, the pre-commit hook that enforces it, and the known scope boundaries.
 
 :::note
-The [API Reference](../api_reference/index.md) documentation should be considered the source of truth
-for the platform. If there are any discrepancies between concepts described here and the API Reference,
-then the API Reference should be considered the correct information. We are working to ensure that
-concepts stay up-to-date with the API Reference and will be introducing doc tests in the near future
-to help with this.
+If there are discrepancies between these guides and the API reference, the API reference is correct.
 :::

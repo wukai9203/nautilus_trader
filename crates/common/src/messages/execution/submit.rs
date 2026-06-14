@@ -15,8 +15,7 @@
 
 use std::fmt::Display;
 
-use indexmap::IndexMap;
-use nautilus_core::{UUID4, UnixNanos, correctness::check_equal};
+use nautilus_core::{Params, UUID4, UnixNanos, correctness::check_equal};
 use nautilus_model::{
     events::OrderInitialized,
     identifiers::{
@@ -37,14 +36,17 @@ pub struct SubmitOrder {
     pub order_init: OrderInitialized,
     pub exec_algorithm_id: Option<ExecAlgorithmId>,
     pub position_id: Option<PositionId>,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
+    pub correlation_id: Option<UUID4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl SubmitOrder {
     /// Creates a new [`SubmitOrder`] instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub const fn new(
         trader_id: TraderId,
@@ -55,9 +57,10 @@ impl SubmitOrder {
         order_init: OrderInitialized,
         exec_algorithm_id: Option<ExecAlgorithmId>,
         position_id: Option<PositionId>,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
         command_id: UUID4,
         ts_init: UnixNanos,
+        correlation_id: Option<UUID4>,
     ) -> Self {
         Self {
             trader_id,
@@ -71,11 +74,12 @@ impl SubmitOrder {
             params,
             command_id,
             ts_init,
+            correlation_id,
+            causation_id: None,
         }
     }
 
     /// Creates a new [`SubmitOrder`] from an existing order.
-    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn from_order(
         order: &OrderAny,
@@ -97,6 +101,8 @@ impl SubmitOrder {
             params: None,
             command_id,
             ts_init,
+            correlation_id: None,
+            causation_id: None,
         }
     }
 }
@@ -125,9 +131,12 @@ pub struct SubmitOrderList {
     pub order_inits: Vec<OrderInitialized>,
     pub exec_algorithm_id: Option<ExecAlgorithmId>,
     pub position_id: Option<PositionId>,
-    pub params: Option<IndexMap<String, String>>,
+    pub params: Option<Params>,
     pub command_id: UUID4,
     pub ts_init: UnixNanos,
+    pub correlation_id: Option<UUID4>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl SubmitOrderList {
@@ -137,7 +146,7 @@ impl SubmitOrderList {
     ///
     /// Panics if `order_inits` length doesn't match `order_list.client_order_ids`, or if
     /// the client order IDs don't match in order.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         trader_id: TraderId,
@@ -147,9 +156,10 @@ impl SubmitOrderList {
         order_inits: Vec<OrderInitialized>,
         exec_algorithm_id: Option<ExecAlgorithmId>,
         position_id: Option<PositionId>,
-        params: Option<IndexMap<String, String>>,
+        params: Option<Params>,
         command_id: UUID4,
         ts_init: UnixNanos,
+        correlation_id: Option<UUID4>,
     ) -> Self {
         check_equal(
             &order_inits.len(),
@@ -181,6 +191,8 @@ impl SubmitOrderList {
             params,
             command_id,
             ts_init,
+            correlation_id,
+            causation_id: None,
         }
     }
 }

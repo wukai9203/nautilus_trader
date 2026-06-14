@@ -20,7 +20,11 @@
 
 use thiserror::Error;
 
-use crate::{http::error::DydxHttpError, websocket::error::DydxWsError};
+use crate::{
+    http::error::DydxHttpError,
+    proto::cosmos_sdk_proto::prost::{DecodeError, EncodeError},
+    websocket::error::DydxWsError,
+};
 
 /// Result type for dYdX operations.
 pub type DydxResult<T> = Result<T, DydxError>;
@@ -46,11 +50,11 @@ pub enum DydxError {
 
     /// Protocol buffer encoding errors.
     #[error("Encoding error: {0}")]
-    Encoding(#[from] prost::EncodeError),
+    Encoding(#[from] EncodeError),
 
     /// Protocol buffer decoding errors.
     #[error("Decoding error: {0}")]
-    Decoding(#[from] prost::DecodeError),
+    Decoding(#[from] DecodeError),
 
     /// JSON serialization/deserialization errors.
     #[error("JSON error: {message}")]
@@ -97,14 +101,30 @@ pub enum DydxError {
     Nautilus(#[from] anyhow::Error),
 }
 
-/// Cosmos SDK error code for account sequence mismatch.
-/// See: https://github.com/cosmos/cosmos-sdk/blob/main/types/errors/errors.go
+/// Cosmos SDK error code for transaction already in mempool cache (`ErrTxInMempoolCache`).
+///
+/// Returned when the exact same transaction bytes (same hash) are submitted to a node
+/// that already has the transaction in its mempool cache. For short-term dYdX orders,
+/// this is benign -- the original transaction is already queued for processing.
+pub const COSMOS_ERROR_CODE_TX_IN_MEMPOOL_CACHE: u32 = 19;
+
 const COSMOS_ERROR_CODE_SEQUENCE_MISMATCH: u32 = 32;
 
-/// dYdX AllOf authenticator error code (ErrAllOfVerification).
-/// On dYdX v4, sequence mismatches surface as code=104 when using permissioned keys:
-/// the AllOf composite authenticator wraps the inner SignatureVerification failure
-/// (code=100) which includes "please verify sequence" in its diagnostic message.
+/// dYdX CLOB error code for duplicate cancel in memclob.
+///
+/// Returned when a cancel message is submitted for an order that already has a pending
+/// cancel with a greater-than-or-equal `GoodTilBlock`. This is benign for short-term
+/// cancel operations -- the previous cancel is already queued and will be processed.
+///
+/// Common scenario: overlapping `cancel_all_orders` waves from a grid MM strategy.
+pub const DYDX_ERROR_CODE_CANCEL_ALREADY_IN_MEMCLOB: u32 = 9;
+
+/// dYdX CLOB error code for cancelling a non-existent order.
+///
+/// Returned when attempting to cancel an order that has already been filled, expired,
+/// or previously cancelled. This is benign -- the order is already gone.
+pub const DYDX_ERROR_CODE_ORDER_DOES_NOT_EXIST: u32 = 3006;
+
 const DYDX_ERROR_CODE_ALL_OF_FAILED: u32 = 104;
 
 impl DydxError {
@@ -136,12 +156,6 @@ impl DydxError {
         }
     }
 
-    /// Checks if an error message indicates a sequence mismatch.
-    ///
-    /// Matches:
-    /// - code=32 (standard Cosmos SDK sequence mismatch)
-    /// - code=104 with "sequence" (dYdX authenticator failure due to wrong sequence)
-    /// - "account sequence mismatch" text
     fn message_indicates_sequence_mismatch(msg: &str) -> bool {
         // Standard Cosmos SDK error code 32
         if msg.contains(&format!("code={COSMOS_ERROR_CODE_SEQUENCE_MISMATCH}"))
@@ -151,6 +165,67 @@ impl DydxError {
         }
         // dYdX authenticator error code 104 with sequence hint
         msg.contains(&format!("code={DYDX_ERROR_CODE_ALL_OF_FAILED}")) && msg.contains("sequence")
+    }
+
+    /// Returns true if this error indicates the transaction is already in the mempool (code=19).
+    ///
+    /// This is benign for short-term orders -- the transaction was already accepted by the
+    /// mempool on a previous submission and will be processed. Callers can safely treat
+    /// this as success.
+    #[must_use]
+    pub fn is_tx_in_mempool(&self) -> bool {
+        match self {
+            Self::Nautilus(e) => {
+                let msg = e.to_string();
+                msg.contains(&format!("code={COSMOS_ERROR_CODE_TX_IN_MEMPOOL_CACHE}"))
+                    || msg.contains("tx already in mempool")
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns true if this error indicates a duplicate cancel already in the memclob (code=9).
+    ///
+    /// dYdX rejects cancel messages when an existing cancel for the same order has a
+    /// greater-than-or-equal `GoodTilBlock`. The original cancel will be processed.
+    #[must_use]
+    pub fn is_cancel_already_in_memclob(&self) -> bool {
+        match self {
+            Self::Nautilus(e) => {
+                let msg = e.to_string();
+                msg.contains(&format!("code={DYDX_ERROR_CODE_CANCEL_ALREADY_IN_MEMCLOB}"))
+                    && msg.contains("cancel already exists")
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns true if this error indicates the order to cancel does not exist (code=3006).
+    ///
+    /// The order was already filled, expired, or previously cancelled.
+    #[must_use]
+    pub fn is_order_does_not_exist(&self) -> bool {
+        match self {
+            Self::Nautilus(e) => {
+                let msg = e.to_string();
+                msg.contains(&format!("code={DYDX_ERROR_CODE_ORDER_DOES_NOT_EXIST}"))
+                    || msg.contains("Order Id to cancel does not exist")
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns true if this error is benign for short-term cancel operations.
+    ///
+    /// Benign cancel errors occur during overlapping cancel waves (common in grid MM):
+    /// - code=19: Transaction already in mempool cache (duplicate tx bytes)
+    /// - code=9: Cancel already exists in memclob with >= GoodTilBlock
+    /// - code=3006: Order to cancel does not exist (already filled/expired/cancelled)
+    #[must_use]
+    pub fn is_benign_cancel_error(&self) -> bool {
+        self.is_tx_in_mempool()
+            || self.is_cancel_already_in_memclob()
+            || self.is_order_does_not_exist()
     }
 
     /// Returns true if this error is likely transient and worth retrying.
@@ -174,6 +249,29 @@ impl DydxError {
                         | tonic::Code::ResourceExhausted
                 )
             }
+            _ => false,
+        }
+    }
+
+    /// Returns true if this error is a definitive CheckTx rejection of the broadcast
+    /// transaction.
+    ///
+    /// `broadcast_tx` uses sync mode, so a `code=N` failure is the node's verdict:
+    /// the transaction never entered the mempool and no message in it executed.
+    /// Benign codes (tx already in mempool, duplicate cancel, order already gone)
+    /// mean the command was already handled, and transient errors (sequence
+    /// mismatch, timeouts) are never a final verdict; both return false, as do
+    /// transport failures that leave the outcome unknown.
+    #[must_use]
+    pub fn is_definitive_broadcast_rejection(&self) -> bool {
+        if self.is_benign_cancel_error() || self.is_transient() {
+            return false;
+        }
+
+        match self {
+            Self::Nautilus(e) => e
+                .to_string()
+                .contains("Transaction broadcast failed: code="),
             _ => false,
         }
     }
@@ -276,5 +374,88 @@ mod tests {
     fn test_is_not_transient_config_error() {
         let err = DydxError::Config("invalid".to_string());
         assert!(!err.is_transient());
+    }
+
+    #[rstest]
+    fn test_benign_cancel_tx_in_mempool() {
+        let err = DydxError::Nautilus(anyhow::anyhow!(
+            "Transaction broadcast failed: code=19, tx already in mempool cache"
+        ));
+        assert!(err.is_tx_in_mempool());
+        assert!(err.is_benign_cancel_error());
+    }
+
+    #[rstest]
+    fn test_benign_cancel_already_in_memclob() {
+        let err = DydxError::Nautilus(anyhow::anyhow!(
+            "Transaction broadcast failed: code=9, cancel already exists in memclob with >= GoodTilBlock"
+        ));
+        assert!(err.is_cancel_already_in_memclob());
+        assert!(err.is_benign_cancel_error());
+    }
+
+    #[rstest]
+    fn test_benign_cancel_order_does_not_exist() {
+        let err = DydxError::Nautilus(anyhow::anyhow!(
+            "Transaction broadcast failed: code=3006, Order Id to cancel does not exist"
+        ));
+        assert!(err.is_order_does_not_exist());
+        assert!(err.is_benign_cancel_error());
+    }
+
+    #[rstest]
+    fn test_non_benign_error_not_treated_as_benign() {
+        let err = DydxError::Nautilus(anyhow::anyhow!("insufficient funds"));
+        assert!(!err.is_benign_cancel_error());
+    }
+
+    #[rstest]
+    fn test_benign_cancel_non_nautilus_variant() {
+        let err = DydxError::Order("order rejected".to_string());
+        assert!(!err.is_benign_cancel_error());
+    }
+
+    #[rstest]
+    fn test_definitive_broadcast_rejection_checktx_code() {
+        let err = DydxError::Nautilus(anyhow::anyhow!(
+            "Transaction broadcast failed: code=2000, log=insufficient margin"
+        ));
+        assert!(err.is_definitive_broadcast_rejection());
+    }
+
+    #[rstest]
+    fn test_definitive_broadcast_rejection_excludes_benign_codes() {
+        let err = DydxError::Nautilus(anyhow::anyhow!(
+            "Transaction broadcast failed: code=19, tx already in mempool cache"
+        ));
+        assert!(!err.is_definitive_broadcast_rejection());
+
+        let err = DydxError::Nautilus(anyhow::anyhow!(
+            "Transaction broadcast failed: code=3006, Order Id to cancel does not exist"
+        ));
+        assert!(!err.is_definitive_broadcast_rejection());
+    }
+
+    #[rstest]
+    fn test_definitive_broadcast_rejection_excludes_transport_errors() {
+        let status = tonic::Status::unavailable("node unavailable");
+        let err = DydxError::Grpc(Box::new(status));
+        assert!(!err.is_definitive_broadcast_rejection());
+
+        let err = DydxError::Nautilus(anyhow::anyhow!("connection reset by peer"));
+        assert!(!err.is_definitive_broadcast_rejection());
+    }
+
+    #[rstest]
+    fn test_definitive_broadcast_rejection_excludes_sequence_mismatch() {
+        let err = DydxError::Nautilus(anyhow::anyhow!(
+            "Transaction broadcast failed: code=32, log=account sequence mismatch, expected 15, received 14"
+        ));
+        assert!(!err.is_definitive_broadcast_rejection());
+
+        let err = DydxError::Nautilus(anyhow::anyhow!(
+            "Transaction broadcast failed: code=104, log=signature verification failed; please verify sequence (545)"
+        ));
+        assert!(!err.is_definitive_broadcast_rejection());
     }
 }

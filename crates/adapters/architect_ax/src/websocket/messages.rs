@@ -26,70 +26,46 @@ use nautilus_core::{
     },
 };
 use nautilus_model::{
-    data::{Bar, Data, OrderBookDeltas},
-    events::{
-        OrderAccepted, OrderCancelRejected, OrderCanceled, OrderExpired, OrderFilled, OrderRejected,
-    },
     identifiers::{ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
-    reports::{FillReport, OrderStatusReport},
-    types::Currency,
+    types::{Currency, Price},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
 use super::error::AxWsErrorResponse;
-use crate::common::{
-    enums::{
-        AxCancelReason, AxCancelRejectionReason, AxCandleWidth, AxMarketDataLevel, AxMdRequestType,
-        AxOrderRequestType, AxOrderSide, AxOrderStatus, AxOrderType, AxOrderWsMessageType,
-        AxTimeInForce,
+use crate::{
+    common::{
+        enums::{
+            AxCancelReason, AxCancelRejectionReason, AxCandleWidth, AxInstrumentState,
+            AxMarketDataLevel, AxMdRequestType, AxOrderRequestType, AxOrderSide, AxOrderStatus,
+            AxOrderType, AxOrderWsMessageType, AxTimeInForce,
+        },
+        parse::{
+            deserialize_decimal_or_zero, deserialize_optional_decimal_from_str,
+            deserialize_optional_decimal_or_zero,
+        },
     },
-    parse::{deserialize_decimal_or_zero, deserialize_optional_decimal_or_zero},
+    http::models::AxOrderRejectReason,
 };
 
-/// Nautilus domain message emitted after parsing Ax WebSocket events.
+/// Market data WebSocket message emitted by the data handler.
 ///
-/// This enum contains fully-parsed Nautilus domain objects ready for consumption
-/// by the DataClient without additional processing.
+/// Contains raw venue types for downstream consumers to parse
+/// into Nautilus domain objects.
 #[derive(Debug, Clone)]
-pub enum NautilusDataWsMessage {
-    /// Market data (trades, quotes).
-    Data(Vec<Data>),
-    /// Order book deltas.
-    Deltas(OrderBookDeltas),
-    /// Bar/candle data.
-    Bar(Bar),
-    /// Heartbeat message.
-    Heartbeat,
-    /// Error from venue or client.
-    Error(AxWsError),
+pub enum AxDataWsMessage {
+    /// Parsed market data message from the venue.
+    MdMessage(AxMdMessage),
     /// WebSocket reconnected notification.
     Reconnected,
-}
-
-/// Nautilus domain messages for the Ax orders WebSocket.
-///
-/// This enum contains parsed messages from the WebSocket stream.
-/// Variants contain fully-parsed Nautilus domain objects.
-#[derive(Debug, Clone)]
-pub enum NautilusExecWsMessage {
-    /// Order accepted by the venue.
-    OrderAccepted(OrderAccepted),
-    /// Order filled (partial or complete).
-    OrderFilled(Box<OrderFilled>),
-    /// Order canceled.
-    OrderCanceled(OrderCanceled),
-    /// Order expired.
-    OrderExpired(OrderExpired),
-    /// Order rejected by venue.
-    OrderRejected(OrderRejected),
-    /// Order cancel rejected by venue.
-    OrderCancelRejected(OrderCancelRejected),
-    /// Order status reports from order updates.
-    OrderStatusReports(Vec<OrderStatusReport>),
-    /// Fill reports from executions.
-    FillReports(Vec<FillReport>),
+    /// A candle subscription was removed (clear cached state for this key).
+    CandleUnsubscribed {
+        /// Instrument symbol.
+        symbol: Ustr,
+        /// Candle width/interval.
+        width: AxCandleWidth,
+    },
 }
 
 /// Subscribe request for market data.
@@ -99,7 +75,7 @@ pub enum NautilusExecWsMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AxMdSubscribe {
     /// Client request ID for correlation.
-    pub request_id: i64,
+    pub rid: i64,
     /// Request type (always "subscribe").
     #[serde(rename = "type")]
     pub msg_type: AxMdRequestType,
@@ -116,7 +92,7 @@ pub struct AxMdSubscribe {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AxMdUnsubscribe {
     /// Client request ID for correlation.
-    pub request_id: i64,
+    pub rid: i64,
     /// Request type (always "unsubscribe").
     #[serde(rename = "type")]
     pub msg_type: AxMdRequestType,
@@ -131,7 +107,7 @@ pub struct AxMdUnsubscribe {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AxMdSubscribeCandles {
     /// Client request ID for correlation.
-    pub request_id: i64,
+    pub rid: i64,
     /// Request type (always "subscribe_candles").
     #[serde(rename = "type")]
     pub msg_type: AxMdRequestType,
@@ -148,7 +124,7 @@ pub struct AxMdSubscribeCandles {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AxMdUnsubscribeCandles {
     /// Client request ID for correlation.
-    pub request_id: i64,
+    pub rid: i64,
     /// Request type (always "unsubscribe_candles").
     #[serde(rename = "type")]
     pub msg_type: AxMdRequestType,
@@ -182,7 +158,6 @@ pub enum AxMdMessage {
     Trade(AxMdTrade),
     Candle(AxMdCandle),
     Heartbeat(AxMdHeartbeat),
-    /// Subscription response (success or already subscribed).
     SubscriptionResponse(AxMdSubscriptionResponse),
     Error(AxWsError),
 }
@@ -272,6 +247,21 @@ pub struct AxMdTicker {
     /// Open interest.
     #[serde(default)]
     pub oi: Option<i64>,
+    /// Mark price.
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
+    pub m: Option<Decimal>,
+    /// Instrument state.
+    #[serde(default)]
+    pub i: Option<AxInstrumentState>,
+    /// Price band lower limit.
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
+    pub pl: Option<Decimal>,
+    /// Price band upper limit.
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
+    pub pu: Option<Decimal>,
+    /// Last settlement price.
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
+    pub lsp: Option<Decimal>,
 }
 
 /// Trade message from market data WebSocket.
@@ -384,6 +374,9 @@ pub struct AxMdBookL2 {
     pub b: Vec<AxBookLevel>,
     /// Ask levels.
     pub a: Vec<AxBookLevel>,
+    /// Whether this update is a full snapshot.
+    #[serde(default)]
+    pub st: bool,
 }
 
 /// Level 3 order book update (individual order quantities).
@@ -402,6 +395,9 @@ pub struct AxMdBookL3 {
     pub b: Vec<AxBookLevelL3>,
     /// Ask levels with order breakdown.
     pub a: Vec<AxBookLevelL3>,
+    /// Whether this update is a full snapshot.
+    #[serde(default)]
+    pub st: bool,
 }
 
 /// Place order request via WebSocket.
@@ -724,9 +720,9 @@ pub struct AxWsOrderRejected {
     pub eid: String,
     /// Order details.
     pub o: AxWsOrder,
-    /// Rejection reason code (can be null, defaults to txt or "UNKNOWN").
+    /// Rejection reason code.
     #[serde(default)]
-    pub r: Option<String>,
+    pub r: Option<AxOrderRejectReason>,
     /// Rejection text/description.
     #[serde(default)]
     pub txt: Option<String>,
@@ -799,13 +795,13 @@ pub struct AxWsCancelRejected {
     pub txt: Option<String>,
 }
 
-/// Internal raw message from the Ax orders WebSocket.
+/// Venue-level order event from the Ax orders WebSocket.
 ///
 /// This enum uses serde's tagged deserialization to automatically
 /// discriminate between different event types based on the "t" field.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "t")]
-pub(crate) enum AxWsOrderEvent {
+pub enum AxWsOrderEvent {
     /// Heartbeat message.
     #[serde(rename = "h")]
     Heartbeat,
@@ -855,7 +851,7 @@ pub(crate) enum AxWsOrderResponse {
 
 /// Internal raw message from the Ax orders WebSocket.
 #[derive(Debug, Clone)]
-pub(crate) enum AxWsRawMessage {
+pub(crate) enum AxOrdersWsFrame {
     /// Error response message (has "rid" and "err").
     Error(AxWsOrderErrorResponse),
     /// Response message (has "rid" and "res").
@@ -864,13 +860,14 @@ pub(crate) enum AxWsRawMessage {
     Event(Box<AxWsOrderEvent>),
 }
 
-/// Ax-specific messages for the orders WebSocket.
+/// Messages from the Ax orders WebSocket handler.
 ///
-/// This enum contains response and control messages from the WebSocket stream.
+/// Contains venue-level events and responses for downstream consumers
+/// to parse into Nautilus domain objects.
 #[derive(Debug, Clone)]
 pub enum AxOrdersWsMessage {
-    /// Nautilus domain messages parsed from order events.
-    Nautilus(NautilusExecWsMessage),
+    /// Venue-level order event.
+    Event(Box<AxWsOrderEvent>),
     /// Place order response.
     PlaceOrderResponse(AxWsPlaceOrderResponse),
     /// Cancel order response.
@@ -961,6 +958,8 @@ pub struct OrderMetadata {
     pub price_precision: u8,
     /// Quote currency for the instrument.
     pub quote_currency: Currency,
+    /// Pending trigger price from a modify command (WS does not carry this).
+    pub pending_trigger_price: Option<Price>,
 }
 
 #[cfg(test)]
@@ -976,66 +975,66 @@ mod tests {
     #[rstest]
     fn test_md_subscribe_serialization() {
         let msg = AxMdSubscribe {
-            request_id: 2,
+            rid: 2,
             msg_type: AxMdRequestType::Subscribe,
-            symbol: Ustr::from("BTCUSD-PERP"),
+            symbol: Ustr::from("EURUSD-PERP"),
             level: AxMarketDataLevel::Level2,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed["request_id"], 2);
+        assert_eq!(parsed["rid"], 2);
         assert_eq!(parsed["type"], "subscribe");
-        assert_eq!(parsed["symbol"], "BTCUSD-PERP");
+        assert_eq!(parsed["symbol"], "EURUSD-PERP");
         assert_eq!(parsed["level"], "LEVEL_2");
     }
 
     #[rstest]
     fn test_md_unsubscribe_serialization() {
         let msg = AxMdUnsubscribe {
-            request_id: 3,
+            rid: 3,
             msg_type: AxMdRequestType::Unsubscribe,
-            symbol: Ustr::from("BTCUSD-PERP"),
+            symbol: Ustr::from("EURUSD-PERP"),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed["request_id"], 3);
+        assert_eq!(parsed["rid"], 3);
         assert_eq!(parsed["type"], "unsubscribe");
-        assert_eq!(parsed["symbol"], "BTCUSD-PERP");
+        assert_eq!(parsed["symbol"], "EURUSD-PERP");
     }
 
     #[rstest]
     fn test_md_subscribe_candles_serialization() {
         let msg = AxMdSubscribeCandles {
-            request_id: 4,
+            rid: 4,
             msg_type: AxMdRequestType::SubscribeCandles,
-            symbol: Ustr::from("BTCUSD-PERP"),
+            symbol: Ustr::from("EURUSD-PERP"),
             width: AxCandleWidth::Minutes1,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed["request_id"], 4);
+        assert_eq!(parsed["rid"], 4);
         assert_eq!(parsed["type"], "subscribe_candles");
-        assert_eq!(parsed["symbol"], "BTCUSD-PERP");
+        assert_eq!(parsed["symbol"], "EURUSD-PERP");
         assert_eq!(parsed["width"], "1m");
     }
 
     #[rstest]
     fn test_md_unsubscribe_candles_serialization() {
         let msg = AxMdUnsubscribeCandles {
-            request_id: 5,
+            rid: 5,
             msg_type: AxMdRequestType::UnsubscribeCandles,
-            symbol: Ustr::from("BTCUSD-PERP"),
+            symbol: Ustr::from("EURUSD-PERP"),
             width: AxCandleWidth::Minutes1,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed["request_id"], 5);
+        assert_eq!(parsed["rid"], 5);
         assert_eq!(parsed["type"], "unsubscribe_candles");
-        assert_eq!(parsed["symbol"], "BTCUSD-PERP");
+        assert_eq!(parsed["symbol"], "EURUSD-PERP");
         assert_eq!(parsed["width"], "1m");
     }
 
@@ -1044,7 +1043,7 @@ mod tests {
         let msg = AxWsPlaceOrder {
             rid: 1,
             t: AxOrderRequestType::PlaceOrder,
-            s: Ustr::from("BTCUSD-PERP"),
+            s: Ustr::from("EURUSD-PERP"),
             d: AxOrderSide::Buy,
             q: 100,
             p: dec!(50000.50),
@@ -1061,7 +1060,7 @@ mod tests {
 
         assert_eq!(parsed["rid"], 1);
         assert_eq!(parsed["t"], "p");
-        assert_eq!(parsed["s"], "BTCUSD-PERP");
+        assert_eq!(parsed["s"], "EURUSD-PERP");
         assert_eq!(parsed["d"], "B");
         assert_eq!(parsed["q"], 100);
         assert_eq!(parsed["p"], "50000.50");
@@ -1078,7 +1077,7 @@ mod tests {
         let msg = AxWsPlaceOrder {
             rid: 2,
             t: AxOrderRequestType::PlaceOrder,
-            s: Ustr::from("BTCUSD-PERP"),
+            s: Ustr::from("EURUSD-PERP"),
             d: AxOrderSide::Sell,
             q: 50,
             p: dec!(48000.00),
@@ -1137,7 +1136,18 @@ mod tests {
     fn test_load_md_ticker_from_file() {
         let json = include_str!("../../test_data/ws_md_ticker.json");
         let msg: AxMdTicker = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.s.as_str(), "BTCUSD-PERP");
+        assert_eq!(msg.s.as_str(), "EURUSD-PERP");
+        assert_eq!(msg.m, Some(dec!(50010.50)));
+        assert_eq!(msg.i, Some(AxInstrumentState::Open));
+    }
+
+    #[rstest]
+    fn test_load_md_ticker_captured_optional_fields_default_to_none() {
+        let json = include_str!("../../test_data/ws_md_ticker_captured.json");
+        let msg: AxMdTicker = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.s.as_str(), "EURUSD-PERP");
+        assert_eq!(msg.m, None);
+        assert_eq!(msg.i, None);
     }
 
     #[rstest]
@@ -1238,7 +1248,7 @@ mod tests {
     fn test_load_order_rejected_from_file() {
         let json = include_str!("../../test_data/ws_order_rejected.json");
         let msg: AxWsOrderRejected = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.r, Some("INSUFFICIENT_MARGIN".to_string()));
+        assert_eq!(msg.r, Some(AxOrderRejectReason::InsufficientMargin));
     }
 
     #[rstest]
@@ -1299,60 +1309,61 @@ mod tests {
         assert_eq!(orders[1].oid, "O-01KF4QM3K9FJZWYA02JF9Y1FJA");
     }
 
-    #[rstest]
-    fn test_raw_message_error_variant() {
-        let json = include_str!("../../test_data/ws_order_error_response.json");
-        let msg = parse_order_message(json).unwrap();
-        assert!(matches!(msg, AxWsRawMessage::Error(_)));
+    #[derive(Debug, Eq, PartialEq)]
+    enum FrameKind {
+        Error,
+        ListResponse,
+        AcknowledgedEvent,
+        PlaceResponse,
+        CancelResponse,
+        OpenOrdersResponse,
+    }
+
+    fn classify(frame: &AxOrdersWsFrame) -> FrameKind {
+        match frame {
+            AxOrdersWsFrame::Error(_) => FrameKind::Error,
+            AxOrdersWsFrame::Response(AxWsOrderResponse::List(_)) => FrameKind::ListResponse,
+            AxOrdersWsFrame::Response(AxWsOrderResponse::PlaceOrder(_)) => FrameKind::PlaceResponse,
+            AxOrdersWsFrame::Response(AxWsOrderResponse::CancelOrder(_)) => {
+                FrameKind::CancelResponse
+            }
+            AxOrdersWsFrame::Response(AxWsOrderResponse::OpenOrders(_)) => {
+                FrameKind::OpenOrdersResponse
+            }
+            AxOrdersWsFrame::Event(e) => match **e {
+                AxWsOrderEvent::Acknowledged(_) => FrameKind::AcknowledgedEvent,
+                _ => panic!("unexpected event variant"),
+            },
+        }
     }
 
     #[rstest]
-    fn test_raw_message_list_response_variant() {
-        let json = include_str!("../../test_data/ws_order_list_response.json");
-        let msg = parse_order_message(json).unwrap();
-        assert!(matches!(
-            msg,
-            AxWsRawMessage::Response(AxWsOrderResponse::List(_))
-        ));
-    }
-
-    #[rstest]
-    fn test_raw_message_event_variant() {
-        let json = include_str!("../../test_data/ws_order_acknowledged.json");
-        let msg = parse_order_message(json).unwrap();
-        assert!(matches!(
-            msg,
-            AxWsRawMessage::Event(ref e) if matches!(**e, AxWsOrderEvent::Acknowledged(_))
-        ));
-    }
-
-    #[rstest]
-    fn test_raw_message_place_response_variant() {
-        let json = include_str!("../../test_data/ws_order_place_response.json");
-        let msg = parse_order_message(json).unwrap();
-        assert!(matches!(
-            msg,
-            AxWsRawMessage::Response(AxWsOrderResponse::PlaceOrder(_))
-        ));
-    }
-
-    #[rstest]
-    fn test_raw_message_cancel_response_variant() {
-        let json = include_str!("../../test_data/ws_order_cancel_response.json");
-        let msg = parse_order_message(json).unwrap();
-        assert!(matches!(
-            msg,
-            AxWsRawMessage::Response(AxWsOrderResponse::CancelOrder(_))
-        ));
-    }
-
-    #[rstest]
-    fn test_raw_message_open_orders_response_variant() {
-        let json = include_str!("../../test_data/ws_order_open_orders_response.json");
-        let msg = parse_order_message(json).unwrap();
-        assert!(matches!(
-            msg,
-            AxWsRawMessage::Response(AxWsOrderResponse::OpenOrders(_))
-        ));
+    #[case::error(
+        include_str!("../../test_data/ws_order_error_response.json"),
+        FrameKind::Error,
+    )]
+    #[case::list(
+        include_str!("../../test_data/ws_order_list_response.json"),
+        FrameKind::ListResponse,
+    )]
+    #[case::acknowledged_event(
+        include_str!("../../test_data/ws_order_acknowledged.json"),
+        FrameKind::AcknowledgedEvent,
+    )]
+    #[case::place_response(
+        include_str!("../../test_data/ws_order_place_response.json"),
+        FrameKind::PlaceResponse,
+    )]
+    #[case::cancel_response(
+        include_str!("../../test_data/ws_order_cancel_response.json"),
+        FrameKind::CancelResponse,
+    )]
+    #[case::open_orders(
+        include_str!("../../test_data/ws_order_open_orders_response.json"),
+        FrameKind::OpenOrdersResponse,
+    )]
+    fn test_parse_order_message_variants(#[case] json: &str, #[case] expected: FrameKind) {
+        let msg = parse_order_message(json).expect("should parse");
+        assert_eq!(classify(&msg), expected);
     }
 }

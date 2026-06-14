@@ -18,10 +18,11 @@
 use nautilus_model::{
     data::BarSpecification,
     enums::{
-        AggressorSide, BarAggregation, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
+        AggressorSide, AssetClass, BarAggregation, MarketStatusAction, OrderSide, OrderStatus,
+        OrderType, PositionSide, TimeInForce,
     },
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
 
 use super::consts::{
@@ -45,6 +46,7 @@ use super::consts::{
     Serialize,
     Deserialize,
 )]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[strum(ascii_case_insensitive)]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
@@ -54,8 +56,14 @@ use super::consts::{
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect"
+        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
     )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.architect_ax")
 )]
 pub enum AxEnvironment {
     /// Sandbox/test environment.
@@ -125,19 +133,118 @@ impl AxEnvironment {
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        frozen,
+        hash,
+        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.architect_ax")
 )]
 pub enum AxInstrumentState {
     /// Instrument is in pre-open state.
     PreOpen,
     /// Instrument is open for trading.
     Open,
+    /// Instrument trading is closed.
+    Closed,
+    /// Instrument trading is closed and frozen.
+    ClosedFrozen,
+    /// Instrument trading is halted.
+    Halted,
+    /// Instrument is in a match-and-close auction.
+    MatchAndCloseAuction,
     /// Instrument trading is suspended.
     Suspended,
     /// Instrument has been delisted.
     Delisted,
     /// Instrument state is unknown.
+    #[serde(other)]
     Unknown,
+}
+
+impl AxInstrumentState {
+    /// Returns whether the instrument is in a tradeable state.
+    #[must_use]
+    pub fn is_tradeable(self) -> bool {
+        matches!(self, Self::Open | Self::PreOpen)
+    }
+}
+
+impl From<AxInstrumentState> for MarketStatusAction {
+    fn from(state: AxInstrumentState) -> Self {
+        match state {
+            AxInstrumentState::PreOpen => Self::PreOpen,
+            AxInstrumentState::Open => Self::Trading,
+            AxInstrumentState::Closed | AxInstrumentState::ClosedFrozen => Self::Close,
+            AxInstrumentState::Halted => Self::Halt,
+            AxInstrumentState::MatchAndCloseAuction => Self::Cross,
+            AxInstrumentState::Suspended => Self::Suspend,
+            AxInstrumentState::Delisted | AxInstrumentState::Unknown => {
+                Self::NotAvailableForTrading
+            }
+        }
+    }
+}
+
+/// Instrument category as returned by the AX Exchange API.
+///
+/// Deserialization is case-insensitive; unrecognized values map to `Unknown`.
+///
+/// # References
+/// - <https://docs.architect.exchange/api-reference/symbols-instruments/get-instruments>
+#[derive(
+    Clone, Copy, Debug, Display, Eq, PartialEq, Hash, AsRefStr, EnumIter, EnumString, Serialize,
+)]
+#[strum(serialize_all = "lowercase")]
+pub enum AxCategory {
+    Fx,
+    Equities,
+    Metals,
+    Energy,
+    Crypto,
+    Rates,
+    Indexes,
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for AxCategory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "fx" => Self::Fx,
+            "equities" => Self::Equities,
+            "metals" => Self::Metals,
+            "energy" => Self::Energy,
+            "crypto" => Self::Crypto,
+            "rates" => Self::Rates,
+            "indexes" => Self::Indexes,
+            _ => Self::Unknown,
+        })
+    }
+}
+
+impl From<AxCategory> for AssetClass {
+    fn from(category: AxCategory) -> Self {
+        match category {
+            AxCategory::Fx => Self::FX,
+            AxCategory::Equities => Self::Equity,
+            AxCategory::Metals | AxCategory::Energy => Self::Commodity,
+            AxCategory::Crypto => Self::Cryptocurrency,
+            AxCategory::Rates => Self::Debt,
+            AxCategory::Indexes => Self::Index,
+            AxCategory::Unknown => Self::Alternative,
+        }
+    }
 }
 
 /// Order side for trading operations.
@@ -160,7 +267,19 @@ pub enum AxInstrumentState {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        frozen,
+        hash,
+        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.architect_ax")
 )]
 pub enum AxOrderSide {
     /// Buy order.
@@ -234,7 +353,19 @@ impl TryFrom<OrderSide> for AxOrderSide {
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        frozen,
+        hash,
+        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.architect_ax")
 )]
 pub enum AxOrderStatus {
     /// Order is pending submission.
@@ -310,7 +441,19 @@ impl From<AxOrderStatus> for OrderStatus {
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        frozen,
+        hash,
+        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.architect_ax")
 )]
 pub enum AxTimeInForce {
     /// Good-Till-Canceled: order remains active until filled or canceled.
@@ -362,7 +505,7 @@ impl TryFrom<TimeInForce> for AxTimeInForce {
 /// Order type as defined by the AX Exchange API.
 ///
 /// # References
-/// - <https://docs.architect.co/sdk-reference/order-entry>
+/// - <https://docs.architect.exchange/api-reference/order-management/place-order>
 #[derive(
     Clone,
     Copy,
@@ -381,7 +524,19 @@ impl TryFrom<TimeInForce> for AxTimeInForce {
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        frozen,
+        hash,
+        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.architect_ax")
 )]
 pub enum AxOrderType {
     /// Market order; execute immediately at best available price.
@@ -422,6 +577,12 @@ impl TryFrom<OrderType> for AxOrderType {
 
 /// Market data subscription level.
 ///
+/// The AX API uses `LEVEL_1`, `LEVEL_2`, `LEVEL_3` on the wire (with underscore
+/// before the digit). Serde and strum per-variant renames handle the wire and
+/// string formats correctly, however PyO3's `rename_all` does not insert an
+/// underscore at letter-digit boundaries, so the Python variant names are
+/// `LEVEL1`, `LEVEL2`, `LEVEL3` (without underscore).
+///
 /// # References
 /// - <https://docs.architect.exchange/api-reference/marketdata/md-ws>
 #[derive(
@@ -439,6 +600,7 @@ impl TryFrom<OrderType> for AxOrderType {
     Deserialize,
 )]
 #[strum(ascii_case_insensitive)]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
@@ -446,8 +608,14 @@ impl TryFrom<OrderType> for AxOrderType {
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect"
+        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
     )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.architect_ax")
 )]
 pub enum AxMarketDataLevel {
     /// Level 1: best bid/ask only.
@@ -552,22 +720,16 @@ impl TryFrom<&BarSpecification> for AxCandleWidth {
     Serialize,
     Deserialize,
 )]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum AxMdRequestType {
     /// Subscribe to market data for a symbol.
-    #[serde(rename = "subscribe")]
-    #[strum(serialize = "subscribe")]
     Subscribe,
     /// Unsubscribe from market data for a symbol.
-    #[serde(rename = "unsubscribe")]
-    #[strum(serialize = "unsubscribe")]
     Unsubscribe,
     /// Subscribe to candle data for a symbol.
-    #[serde(rename = "subscribe_candles")]
-    #[strum(serialize = "subscribe_candles")]
     SubscribeCandles,
     /// Unsubscribe from candle data for a symbol.
-    #[serde(rename = "unsubscribe_candles")]
-    #[strum(serialize = "unsubscribe_candles")]
     UnsubscribeCandles,
 }
 
@@ -624,7 +786,19 @@ pub enum AxOrderRequestType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        frozen,
+        hash,
+        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.architect_ax")
 )]
 pub enum AxMdWsMessageType {
     /// Heartbeat event.
@@ -677,7 +851,19 @@ pub enum AxMdWsMessageType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        frozen,
+        hash,
+        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.architect_ax")
 )]
 pub enum AxOrderWsMessageType {
     /// Heartbeat event.
@@ -744,7 +930,19 @@ pub enum AxOrderWsMessageType {
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        frozen,
+        hash,
+        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.architect_ax")
 )]
 pub enum AxCancelReason {
     /// User requested cancellation.
@@ -776,7 +974,19 @@ pub enum AxCancelReason {
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        frozen,
+        hash,
+        module = "nautilus_trader.core.nautilus_pyo3.architect_ax",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.architect_ax")
 )]
 pub enum AxCancelRejectionReason {
     /// Order not found or already canceled.
@@ -795,6 +1005,10 @@ mod tests {
     #[rstest]
     #[case(AxInstrumentState::Open, "\"OPEN\"")]
     #[case(AxInstrumentState::PreOpen, "\"PRE_OPEN\"")]
+    #[case(AxInstrumentState::Closed, "\"CLOSED\"")]
+    #[case(AxInstrumentState::ClosedFrozen, "\"CLOSED_FROZEN\"")]
+    #[case(AxInstrumentState::Halted, "\"HALTED\"")]
+    #[case(AxInstrumentState::MatchAndCloseAuction, "\"MATCH_AND_CLOSE_AUCTION\"")]
     #[case(AxInstrumentState::Suspended, "\"SUSPENDED\"")]
     #[case(AxInstrumentState::Delisted, "\"DELISTED\"")]
     fn test_instrument_state_serialization(
@@ -806,6 +1020,49 @@ mod tests {
 
         let parsed: AxInstrumentState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, state);
+    }
+
+    #[rstest]
+    fn test_instrument_state_unknown_string_deserializes_as_unknown() {
+        let parsed: AxInstrumentState = serde_json::from_str("\"SOME_FUTURE_STATE\"").unwrap();
+        assert_eq!(parsed, AxInstrumentState::Unknown);
+    }
+
+    #[rstest]
+    #[case(AxInstrumentState::PreOpen, true)]
+    #[case(AxInstrumentState::Open, true)]
+    #[case(AxInstrumentState::Closed, false)]
+    #[case(AxInstrumentState::ClosedFrozen, false)]
+    #[case(AxInstrumentState::Halted, false)]
+    #[case(AxInstrumentState::MatchAndCloseAuction, false)]
+    #[case(AxInstrumentState::Suspended, false)]
+    #[case(AxInstrumentState::Delisted, false)]
+    #[case(AxInstrumentState::Unknown, false)]
+    fn test_instrument_state_is_tradeable(
+        #[case] state: AxInstrumentState,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(state.is_tradeable(), expected);
+    }
+
+    #[rstest]
+    #[case(AxInstrumentState::PreOpen, MarketStatusAction::PreOpen)]
+    #[case(AxInstrumentState::Open, MarketStatusAction::Trading)]
+    #[case(AxInstrumentState::Closed, MarketStatusAction::Close)]
+    #[case(AxInstrumentState::ClosedFrozen, MarketStatusAction::Close)]
+    #[case(AxInstrumentState::Halted, MarketStatusAction::Halt)]
+    #[case(AxInstrumentState::MatchAndCloseAuction, MarketStatusAction::Cross)]
+    #[case(AxInstrumentState::Suspended, MarketStatusAction::Suspend)]
+    #[case(
+        AxInstrumentState::Delisted,
+        MarketStatusAction::NotAvailableForTrading
+    )]
+    #[case(AxInstrumentState::Unknown, MarketStatusAction::NotAvailableForTrading)]
+    fn test_instrument_state_to_market_status_action(
+        #[case] state: AxInstrumentState,
+        #[case] expected: MarketStatusAction,
+    ) {
+        assert_eq!(MarketStatusAction::from(state), expected);
     }
 
     #[rstest]
@@ -960,5 +1217,26 @@ mod tests {
 
         let parsed: AxOrderRequestType = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, request_type);
+    }
+
+    #[rstest]
+    #[case("\"fx\"", AxCategory::Fx)]
+    #[case("\"FX\"", AxCategory::Fx)]
+    #[case("\"Fx\"", AxCategory::Fx)]
+    #[case("\"equities\"", AxCategory::Equities)]
+    #[case("\"EQUITIES\"", AxCategory::Equities)]
+    #[case("\"metals\"", AxCategory::Metals)]
+    #[case("\"Metals\"", AxCategory::Metals)]
+    #[case("\"energy\"", AxCategory::Energy)]
+    #[case("\"crypto\"", AxCategory::Crypto)]
+    #[case("\"rates\"", AxCategory::Rates)]
+    #[case("\"indexes\"", AxCategory::Indexes)]
+    #[case("\"something_new\"", AxCategory::Unknown)]
+    fn test_category_deserialization_case_insensitive(
+        #[case] json: &str,
+        #[case] expected: AxCategory,
+    ) {
+        let parsed: AxCategory = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, expected);
     }
 }

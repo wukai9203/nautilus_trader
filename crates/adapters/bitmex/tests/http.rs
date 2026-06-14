@@ -15,7 +15,16 @@
 
 //! Integration tests for BitMEX HTTP client using a mock server.
 
-use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Router,
@@ -25,16 +34,36 @@ use axum::{
     routing::get,
 };
 use nautilus_bitmex::{
-    common::enums::{BitmexOrderType, BitmexSide},
+    common::{
+        consts::BITMEX_CLIENT_ID,
+        enums::{BitmexEnvironment, BitmexOrderType, BitmexPegPriceType, BitmexSide},
+    },
+    config::BitmexDataClientConfig,
+    data::BitmexDataClient,
     http::{
         client::{BitmexHttpClient, BitmexRawHttpClient},
         query::{
-            DeleteOrderParams, GetOrderParamsBuilder, GetPositionParamsBuilder, PostOrderParams,
+            DeleteOrderParams, GetOrderParamsBuilder, GetPositionParamsBuilder,
+            PostCancelAllAfterParams, PostOrderParams,
         },
     },
 };
-use nautilus_common::testing::wait_until_async;
-use nautilus_model::{identifiers::InstrumentId, instruments::Instrument};
+use nautilus_common::{
+    clients::DataClient,
+    live::runner::replace_data_event_sender,
+    messages::{
+        DataEvent, DataResponse,
+        data::{InstrumentResponse, RequestInstrument},
+    },
+    testing::wait_until_async,
+};
+use nautilus_core::{UUID4, UnixNanos};
+use nautilus_model::{
+    enums::{OrderSide, OrderType, TimeInForce},
+    identifiers::{ClientOrderId, InstrumentId},
+    instruments::Instrument,
+    types::Quantity,
+};
 use nautilus_network::http::HttpClient;
 use rstest::rstest;
 use serde_json::{Value, json};
@@ -42,12 +71,16 @@ use serde_json::{Value, json};
 #[derive(Clone)]
 struct TestServerState {
     request_count: Arc<tokio::sync::Mutex<usize>>,
+    instrument_request_count: Arc<AtomicUsize>,
+    instrument_returns_empty: Arc<AtomicBool>,
 }
 
 impl Default for TestServerState {
     fn default() -> Self {
         Self {
             request_count: Arc::new(tokio::sync::Mutex::new(0)),
+            instrument_request_count: Arc::new(AtomicUsize::new(0)),
+            instrument_returns_empty: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -68,7 +101,18 @@ async fn handle_get_instruments() -> impl IntoResponse {
     Json(vec![instrument])
 }
 
-async fn handle_get_instrument(query: Query<HashMap<String, String>>) -> impl IntoResponse {
+async fn handle_get_instrument(
+    State(state): State<TestServerState>,
+    query: Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    state
+        .instrument_request_count
+        .fetch_add(1, Ordering::Relaxed);
+
+    if state.instrument_returns_empty.load(Ordering::Relaxed) {
+        return Json(Vec::<Value>::new());
+    }
+
     let instrument = load_test_data("http_get_instrument_xbtusd.json");
     let requested_symbol = query.get("symbol");
 
@@ -168,16 +212,20 @@ async fn handle_post_order(headers: axum::http::HeaderMap, body: String) -> Resp
             .into_response();
     }
 
-    // Create a mock order response
     Json(json!({
-        "orderID": "new-order-id-12345",
+        "orderID": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
         "clOrdID": params.get("clOrdID").unwrap_or(&String::new()),
+        "account": 1234567,
         "symbol": params.get("symbol").unwrap(),
         "orderQty": params.get("orderQty").unwrap().parse::<i64>().unwrap_or(0),
+        "leavesQty": params.get("orderQty").unwrap().parse::<i64>().unwrap_or(0),
+        "cumQty": 0,
         "side": params.get("side").unwrap_or(&"Buy".to_string()),
         "ordStatus": "New",
         "ordType": params.get("ordType").unwrap_or(&"Limit".to_string()),
         "price": params.get("price").and_then(|p| p.parse::<f64>().ok()),
+        "pegPriceType": params.get("pegPriceType").cloned(),
+        "pegOffsetValue": params.get("pegOffsetValue").and_then(|p| p.parse::<f64>().ok()),
         "timestamp": "2025-01-05T17:50:00.000Z",
         "transactTime": "2025-01-05T17:50:00.000Z"
     }))
@@ -229,6 +277,30 @@ async fn handle_delete_order(headers: axum::http::HeaderMap, body: String) -> Re
         .into_response()
 }
 
+async fn handle_cancel_all_after(headers: axum::http::HeaderMap, body: String) -> Response {
+    if !headers.contains_key("api-key") || !headers.contains_key("api-signature") {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": { "message": "Invalid API Key.", "name": "HTTPError" }
+            })),
+        )
+            .into_response();
+    }
+
+    let params: HashMap<String, String> = serde_urlencoded::from_str(&body).unwrap_or_default();
+    let timeout = params
+        .get("timeout")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    Json(json!({
+        "now": "2025-01-05T17:50:00.000Z",
+        "cancelTime": if timeout > 0 { "2025-01-05T17:51:00.000Z" } else { "" }
+    }))
+    .into_response()
+}
+
 fn create_test_router(state: TestServerState) -> Router {
     Router::new()
         .route("/instrument/active", get(handle_get_instruments))
@@ -238,6 +310,10 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/order", get(handle_get_orders))
         .route("/order", axum::routing::post(handle_post_order))
         .route("/order", axum::routing::delete(handle_delete_order))
+        .route(
+            "/order/cancelAllAfter",
+            axum::routing::post(handle_cancel_all_after),
+        )
         .with_state(state)
 }
 
@@ -270,24 +346,48 @@ async fn start_test_server()
     Ok((addr, state))
 }
 
+async fn drain_data_events(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    timeout: Duration,
+) -> Vec<DataEvent> {
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        events.push(event);
+    }
+    events
+}
+
+fn instrument_response(events: &[DataEvent]) -> Option<&InstrumentResponse> {
+    events.iter().find_map(|event| match event {
+        DataEvent::Response(DataResponse::Instrument(response)) => Some(response.as_ref()),
+        _ => None,
+    })
+}
+
+fn create_data_client(addr: SocketAddr) -> BitmexDataClient {
+    let config = BitmexDataClientConfig {
+        base_url_http: Some(format!("http://{addr}")),
+        base_url_ws: Some(format!("ws://{addr}/realtime")),
+        environment: BitmexEnvironment::Mainnet,
+        max_retries: 1,
+        retry_delay_initial_ms: 10,
+        retry_delay_max_ms: 10,
+        ..BitmexDataClientConfig::default()
+    };
+
+    BitmexDataClient::new(*BITMEX_CLIENT_ID, config).expect("BitMEX data client")
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_get_instruments() {
     let (addr, _state) = start_test_server().await.unwrap();
     let base_url = format!("http://{addr}");
 
-    let client = BitmexRawHttpClient::new(
-        Some(base_url),
-        Some(60),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    let client =
+        BitmexRawHttpClient::new(Some(base_url), 60, 3, 1_000, 10_000, 10_000, 10, 30, None)
+            .unwrap();
     let instruments = client.get_instruments(true).await.unwrap();
 
     assert_eq!(instruments.len(), 1);
@@ -300,18 +400,9 @@ async fn test_get_instrument_single_result() {
     let (addr, _state) = start_test_server().await.unwrap();
     let base_url = format!("http://{addr}");
 
-    let client = BitmexRawHttpClient::new(
-        Some(base_url),
-        Some(60),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    let client =
+        BitmexRawHttpClient::new(Some(base_url), 60, 3, 1_000, 10_000, 10_000, 10, 30, None)
+            .unwrap();
     let instrument = client.get_instrument("XBTUSD").await.unwrap();
 
     assert!(instrument.is_some());
@@ -328,15 +419,15 @@ async fn test_request_instrument() {
         Some(base_url),
         None,
         None,
-        false,
-        Some(60),
+        BitmexEnvironment::Mainnet,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
         None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None, // proxy_url
     )
     .unwrap();
 
@@ -350,6 +441,68 @@ async fn test_request_instrument() {
 
 #[rstest]
 #[tokio::test]
+async fn test_data_client_request_instrument_refetches_when_cached() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let client = create_data_client(addr);
+    let instrument_id = InstrumentId::from("XBTUSD.BITMEX");
+
+    let first_request_id = UUID4::new();
+    client
+        .request_instrument(RequestInstrument::new(
+            instrument_id,
+            None,
+            None,
+            Some(*BITMEX_CLIENT_ID),
+            first_request_id,
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("first request_instrument");
+
+    wait_until_async(
+        || async { state.instrument_request_count.load(Ordering::Relaxed) >= 1 && !rx.is_empty() },
+        Duration::from_secs(5),
+    )
+    .await;
+    let events = drain_data_events(&mut rx, Duration::from_millis(200)).await;
+    let response = instrument_response(&events).expect("instrument response");
+    assert_eq!(response.correlation_id, first_request_id);
+    assert_eq!(response.client_id, *BITMEX_CLIENT_ID);
+    assert_eq!(response.instrument_id, instrument_id);
+
+    state
+        .instrument_returns_empty
+        .store(true, Ordering::Relaxed);
+
+    client
+        .request_instrument(RequestInstrument::new(
+            instrument_id,
+            None,
+            None,
+            Some(*BITMEX_CLIENT_ID),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .expect("second request_instrument");
+
+    wait_until_async(
+        || async { state.instrument_request_count.load(Ordering::Relaxed) >= 2 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let events = drain_data_events(&mut rx, Duration::from_millis(300)).await;
+    assert!(
+        instrument_response(&events).is_none(),
+        "request_instrument must not emit a stale cached response when BitMEX returns no instrument; events were: {events:?}",
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_get_wallet_requires_auth() {
     let (addr, _state) = start_test_server().await.unwrap();
     let base_url = format!("http://{addr}");
@@ -357,14 +510,14 @@ async fn test_get_wallet_requires_auth() {
     // Test without credentials - should fail
     let client = BitmexRawHttpClient::new(
         Some(base_url.clone()),
-        Some(60),
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        30,
         None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None, // proxy_url
     )
     .unwrap();
     let result = client.get_wallet().await;
@@ -375,14 +528,14 @@ async fn test_get_wallet_requires_auth() {
         "test_api_key".to_string(),
         "test_api_secret".to_string(),
         base_url,
-        Some(60),
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
         None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None, // proxy_url
     )
     .unwrap();
     let wallet = client.get_wallet().await.unwrap();
@@ -399,14 +552,14 @@ async fn test_get_orders() {
         "test_api_key".to_string(),
         "test_api_secret".to_string(),
         base_url,
-        Some(60),
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
         None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None, // proxy_url
     )
     .unwrap();
 
@@ -427,14 +580,14 @@ async fn test_place_order() {
         "test_api_key".to_string(),
         "test_api_secret".to_string(),
         base_url,
-        Some(60),
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
         None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None, // proxy_url
     )
     .unwrap();
 
@@ -466,14 +619,14 @@ async fn test_cancel_order() {
         "test_api_key".to_string(),
         "test_api_secret".to_string(),
         base_url,
-        Some(60),
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
         None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None, // proxy_url
     )
     .unwrap();
 
@@ -513,14 +666,14 @@ async fn test_rate_limiting() {
         "test_api_key".to_string(),
         "test_api_secret".to_string(),
         base_url,
-        Some(60),
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
         None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None, // proxy_url
     )
     .unwrap();
 
@@ -528,6 +681,7 @@ async fn test_rate_limiting() {
     let params = GetOrderParamsBuilder::default().build().unwrap();
     for i in 0..6 {
         let result = client.get_orders(params.clone()).await;
+
         if i < 5 {
             assert!(result.is_ok(), "Request {} should succeed", i + 1);
         } else {
@@ -542,18 +696,9 @@ async fn test_client_creation() {
     let (addr, _state) = start_test_server().await.unwrap();
     let base_url = format!("http://{addr}");
 
-    let client = BitmexRawHttpClient::new(
-        Some(base_url),
-        Some(60),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    let client =
+        BitmexRawHttpClient::new(Some(base_url), 60, 3, 1_000, 10_000, 10_000, 10, 30, None)
+            .unwrap();
 
     let result = client.get_instruments(false).await;
     assert!(result.is_ok());
@@ -569,13 +714,13 @@ async fn test_client_with_credentials() {
         "test_key".to_string(),
         "test_secret".to_string(),
         base_url.clone(),
-        Some(60),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
         None,
     )
     .unwrap();
@@ -590,18 +735,9 @@ async fn test_get_positions_requires_credentials() {
     let (addr, _state) = start_test_server().await.unwrap();
     let base_url = format!("http://{addr}");
 
-    let client = BitmexRawHttpClient::new(
-        Some(base_url),
-        Some(60),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    let client =
+        BitmexRawHttpClient::new(Some(base_url), 60, 3, 1_000, 10_000, 10_000, 10, 30, None)
+            .unwrap();
 
     let params = GetPositionParamsBuilder::default().build().unwrap();
     let result = client.get_positions(params).await;
@@ -619,18 +755,9 @@ async fn test_get_positions_requires_credentials() {
 async fn test_http_network_error() {
     let base_url = "http://127.0.0.1:1".to_string();
 
-    let client = BitmexRawHttpClient::new(
-        Some(base_url),
-        Some(1),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    let client =
+        BitmexRawHttpClient::new(Some(base_url), 1, 3, 1_000, 10_000, 10_000, 10, 30, None)
+            .unwrap();
 
     let result = client.get_instruments(false).await;
 
@@ -671,18 +798,9 @@ async fn test_http_500_internal_server_error() {
     .await;
 
     let base_url = format!("http://{addr}");
-    let client = BitmexRawHttpClient::new(
-        Some(base_url),
-        Some(60),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    let client =
+        BitmexRawHttpClient::new(Some(base_url), 60, 3, 1_000, 10_000, 10_000, 10, 30, None)
+            .unwrap();
 
     let result = client.get_instruments(false).await;
 
@@ -692,4 +810,347 @@ async fn test_http_500_internal_server_error() {
         error_str.contains("500") || error_str.contains("Internal Server Error"),
         "Expected 500 error, was: {error_str}"
     );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_place_pegged_order() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    let client = BitmexRawHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        base_url,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
+        None,
+    )
+    .unwrap();
+
+    let params = PostOrderParams {
+        symbol: "XBTUSD".to_string(),
+        side: Some(BitmexSide::Buy),
+        order_qty: Some(100),
+        ord_type: Some(BitmexOrderType::Pegged),
+        peg_price_type: Some(BitmexPegPriceType::PrimaryPeg),
+        peg_offset_value: Some(0.0),
+        cl_ord_id: Some("TEST-PEGGED-001".to_string()),
+        ..Default::default()
+    };
+
+    let order = client.place_order(params).await.unwrap();
+
+    assert_eq!(order["clOrdID"], "TEST-PEGGED-001");
+    assert_eq!(order["symbol"], "XBTUSD");
+    assert_eq!(order["ordType"], "Pegged");
+    assert_eq!(order["pegPriceType"], "PrimaryPeg");
+    assert_eq!(order["pegOffsetValue"], 0.0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_place_pegged_order_with_negative_offset() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    let client = BitmexRawHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        base_url,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
+        None,
+    )
+    .unwrap();
+
+    let params = PostOrderParams {
+        symbol: "XBTUSD".to_string(),
+        side: Some(BitmexSide::Sell),
+        order_qty: Some(50),
+        ord_type: Some(BitmexOrderType::Pegged),
+        peg_price_type: Some(BitmexPegPriceType::MarketPeg),
+        peg_offset_value: Some(-1.5),
+        cl_ord_id: Some("TEST-PEGGED-002".to_string()),
+        ..Default::default()
+    };
+
+    let order = client.place_order(params).await.unwrap();
+
+    assert_eq!(order["ordType"], "Pegged");
+    assert_eq!(order["pegPriceType"], "MarketPeg");
+    assert_eq!(order["pegOffsetValue"], -1.5);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_order_pegged_via_high_level_client() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    let client = BitmexHttpClient::new(
+        Some(base_url),
+        Some("test_api_key".to_string()),
+        Some("test_api_secret".to_string()),
+        BitmexEnvironment::Mainnet,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
+        None,
+    )
+    .unwrap();
+
+    let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
+    let instrument = client
+        .request_instrument(instrument_id)
+        .await
+        .unwrap()
+        .unwrap();
+    client.cache_instrument(instrument);
+
+    let report = client
+        .submit_order(
+            instrument_id,
+            ClientOrderId::from("PEG-001"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from("100"),
+            TimeInForce::Gtc,
+            None,  // price
+            None,  // trigger_price
+            None,  // trigger_type
+            None,  // trailing_offset
+            None,  // trailing_offset_type
+            None,  // display_qty
+            false, // post_only
+            false, // reduce_only
+            None,  // order_list_id
+            None,  // contingency_type
+            Some(BitmexPegPriceType::PrimaryPeg),
+            Some(0.0),
+        )
+        .await;
+
+    assert!(
+        report.is_ok(),
+        "Expected OK, was: {:?}",
+        report.unwrap_err()
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_order_pegged_rejects_non_limit() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    let client = BitmexHttpClient::new(
+        Some(base_url),
+        Some("test_api_key".to_string()),
+        Some("test_api_secret".to_string()),
+        BitmexEnvironment::Mainnet,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
+        None,
+    )
+    .unwrap();
+
+    let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
+    let instrument = client
+        .request_instrument(instrument_id)
+        .await
+        .unwrap()
+        .unwrap();
+    client.cache_instrument(instrument);
+
+    let result = client
+        .submit_order(
+            instrument_id,
+            ClientOrderId::from("PEG-002"),
+            OrderSide::Buy,
+            OrderType::Market,
+            Quantity::from("100"),
+            TimeInForce::Gtc,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+            Some(BitmexPegPriceType::PrimaryPeg),
+            Some(0.0),
+        )
+        .await;
+
+    assert!(result.is_err());
+    let error_str = result.unwrap_err().to_string();
+    assert!(
+        error_str.contains("LIMIT"),
+        "Expected LIMIT order type error, was: {error_str}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_order_pegged_rejects_offset_without_type() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    let client = BitmexHttpClient::new(
+        Some(base_url),
+        Some("test_api_key".to_string()),
+        Some("test_api_secret".to_string()),
+        BitmexEnvironment::Mainnet,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
+        None,
+    )
+    .unwrap();
+
+    let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
+    let instrument = client
+        .request_instrument(instrument_id)
+        .await
+        .unwrap()
+        .unwrap();
+    client.cache_instrument(instrument);
+
+    let result = client
+        .submit_order(
+            instrument_id,
+            ClientOrderId::from("PEG-003"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from("100"),
+            TimeInForce::Gtc,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,      // peg_price_type missing
+            Some(0.0), // peg_offset_value present
+        )
+        .await;
+
+    assert!(result.is_err());
+    let error_str = result.unwrap_err().to_string();
+    assert!(
+        error_str.contains("peg_price_type"),
+        "Expected peg_price_type error, was: {error_str}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cancel_all_after() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    let client = BitmexRawHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        base_url,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
+        None,
+    )
+    .unwrap();
+
+    let params = PostCancelAllAfterParams { timeout: 60_000 };
+    let result = client.cancel_all_after(params).await.unwrap();
+    assert_eq!(result["cancelTime"], "2025-01-05T17:51:00.000Z");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cancel_all_after_disarm() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    let client = BitmexRawHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        base_url,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
+        None,
+    )
+    .unwrap();
+
+    let params = PostCancelAllAfterParams { timeout: 0 };
+    let result = client.cancel_all_after(params).await.unwrap();
+    assert_eq!(result["cancelTime"], "");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cancel_all_after_high_level() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    let client = BitmexHttpClient::new(
+        Some(base_url),
+        Some("test_api_key".to_string()),
+        Some("test_api_secret".to_string()),
+        BitmexEnvironment::Mainnet,
+        60,
+        3,
+        1_000,
+        10_000,
+        10_000,
+        10,
+        120,
+        None,
+    )
+    .unwrap();
+
+    // Should succeed without error
+    client.cancel_all_after(60_000).await.unwrap();
+
+    // Disarm should also succeed
+    client.cancel_all_after(0).await.unwrap();
 }

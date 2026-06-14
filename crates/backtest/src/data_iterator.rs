@@ -13,25 +13,66 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+//! Multi-stream, time-ordered data iterator for replaying historical data.
+
 use std::collections::BinaryHeap;
 
 use ahash::AHashMap;
 use nautilus_core::UnixNanos;
 use nautilus_model::data::{Data, HasTsInit};
 
-/// Internal convenience struct to keep heap entries ordered by `(ts_init, priority)`.
+#[cfg(feature = "defi")]
+use crate::defi::replay::replay_position;
+
+// TODO: block_number/transaction_index/log_index/phase are DeFi-only (zero for all other data,
+// even in non-DeFi builds); they exist to order same-block DeFi events in canonical chain order.
+// This leaks DeFi-specific shape into a general key, so it could be cfg-gated or moved behind an
+// opaque secondary key later (non-breaking, no correctness or perf cost).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+struct ReplayKey {
+    ts: UnixNanos,
+    block_number: u64,
+    transaction_index: u32,
+    log_index: u32,
+    phase: u8,
+}
+
+fn replay_key(data: &Data) -> ReplayKey {
+    match data {
+        #[cfg(feature = "defi")]
+        Data::Defi(defi) => {
+            let (block_number, transaction_index, log_index, phase) = replay_position(defi);
+            ReplayKey {
+                ts: defi.ts_init(),
+                block_number,
+                transaction_index,
+                log_index,
+                phase,
+            }
+        }
+        _ => ReplayKey {
+            ts: data.ts_init(),
+            block_number: 0,
+            transaction_index: 0,
+            log_index: 0,
+            phase: 0,
+        },
+    }
+}
+
+/// Internal convenience struct to keep heap entries ordered by replay key and priority.
 #[derive(Debug, Eq, PartialEq)]
 struct HeapEntry {
-    ts: UnixNanos,
+    key: ReplayKey,
     priority: i32,
     index: usize,
 }
 
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // min-heap on ts, then priority sign (+/-) then index
-        self.ts
-            .cmp(&other.ts)
+        // min-heap on replay key, then priority sign (+/-) then index
+        self.key
+            .cmp(&other.key)
             .then_with(|| self.priority.cmp(&other.priority))
             .then_with(|| self.index.cmp(&other.index))
             .reverse() // BinaryHeap is max by default -> reverse for min behaviour
@@ -57,7 +98,7 @@ pub struct BacktestDataIterator {
 }
 
 impl BacktestDataIterator {
-    /// Create an empty [`BacktestDataIterator`].
+    /// Creates a new empty [`BacktestDataIterator`].
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -71,16 +112,21 @@ impl BacktestDataIterator {
         }
     }
 
-    /// Add (or replace) a named data stream.  `append_data=true` gives the stream
-    /// lower priority when timestamps tie, mirroring the original behaviour.
+    /// Adds (or replaces) a named data stream.
+    ///
+    /// When `append_data` is true the stream gets lower priority on timestamp
+    /// ties; when false (prepend) it wins ties.
     pub fn add_data(&mut self, name: &str, mut data: Vec<Data>, append_data: bool) {
         if data.is_empty() {
             return;
         }
 
-        // Ensure sorted by ts_init
-        data.sort_by_key(HasTsInit::ts_init);
+        data.sort_by_key(replay_key);
 
+        self.add_stream(name, data, append_data);
+    }
+
+    fn add_stream(&mut self, name: &str, data: Vec<Data>, append_data: bool) {
         let priority = if let Some(p) = self.priorities.get(name) {
             // Replace existing stream – remove previous traces then re-insert below.
             *p
@@ -101,8 +147,7 @@ impl BacktestDataIterator {
         self.rebuild_heap();
     }
 
-    /// Remove a stream.  `complete_remove` also discards placeholder generator
-    /// (not implemented yet).
+    /// Removes a named data stream.
     pub fn remove_data(&mut self, name: &str, complete_remove: bool) {
         if let Some(priority) = self.priorities.remove(name) {
             self.streams.remove(&priority);
@@ -116,12 +161,13 @@ impl BacktestDataIterator {
                 self.single_priority = None;
             }
         }
+
         if complete_remove {
             // Placeholder for future generator cleanup
         }
     }
 
-    /// Move cursor of stream to `index` (0-based).
+    /// Sets the cursor of a named stream to `index` (0-based).
     pub fn set_index(&mut self, name: &str, index: usize) {
         if let Some(priority) = self.priorities.get(name) {
             self.indices.insert(*priority, index);
@@ -129,7 +175,7 @@ impl BacktestDataIterator {
         }
     }
 
-    /// Reset all stream cursors to the beginning.
+    /// Resets all stream cursors to the beginning.
     pub fn reset_all_cursors(&mut self) {
         for idx in self.indices.values_mut() {
             *idx = 0;
@@ -137,9 +183,8 @@ impl BacktestDataIterator {
         self.rebuild_heap();
     }
 
-    /// Return next Data element across all streams in chronological order.
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<Data> {
+    /// Returns the next backtest data element across all streams in replay order.
+    pub(crate) fn next_item(&mut self) -> Option<Data> {
         // Fast path for single stream
         if let Some(p) = self.single_priority {
             let data = self.streams.get_mut(&p)?;
@@ -162,7 +207,7 @@ impl BacktestDataIterator {
         self.indices.insert(entry.priority, next_index);
         if next_index < stream_vec.len() {
             self.heap.push(HeapEntry {
-                ts: stream_vec[next_index].ts_init(),
+                key: replay_key(&stream_vec[next_index]),
                 priority: entry.priority,
                 index: next_index,
             });
@@ -171,6 +216,13 @@ impl BacktestDataIterator {
         Some(element)
     }
 
+    /// Returns the next market [`Data`] element across all streams in chronological order.
+    #[expect(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<Data> {
+        self.next_item()
+    }
+
+    /// Returns whether all streams have been fully consumed.
     #[must_use]
     pub fn is_done(&self) -> bool {
         if let Some(p) = self.single_priority {
@@ -199,7 +251,7 @@ impl BacktestDataIterator {
             let idx = *self.indices.get(&priority).unwrap_or(&0);
             if idx < vec.len() {
                 self.heap.push(HeapEntry {
-                    ts: vec[idx].ts_init(),
+                    key: replay_key(&vec[idx]),
                     priority,
                     index: idx,
                 });
@@ -214,6 +266,15 @@ mod tests {
         data::QuoteTick,
         identifiers::InstrumentId,
         types::{Price, Quantity},
+    };
+    #[cfg(feature = "defi")]
+    use nautilus_model::{
+        defi::{
+            DefiData,
+            data::block::BlockPosition,
+            pool_analysis::snapshot::{PoolAnalytics, PoolSnapshot, PoolState},
+        },
+        identifiers::{Symbol, Venue},
     };
     use rstest::rstest;
 
@@ -238,6 +299,23 @@ mod tests {
             ts.push(d.ts_init().as_u64());
         }
         ts
+    }
+
+    #[cfg(feature = "defi")]
+    fn defi_snapshot(ts: u64, block: u64, transaction_index: u32, log_index: u32) -> Data {
+        let instrument_id = InstrumentId::new(Symbol::from("ETH/USDC"), Venue::from("UNISWAPV3"));
+        let snapshot = PoolSnapshot::new(
+            instrument_id,
+            PoolState::default(),
+            Vec::new(),
+            Vec::new(),
+            PoolAnalytics::default(),
+            BlockPosition::new(block, format!("0x{block:x}"), transaction_index, log_index),
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+        );
+
+        Data::Defi(Box::new(DefiData::PoolSnapshot(snapshot)))
     }
 
     #[rstest]
@@ -530,5 +608,67 @@ mod tests {
         it.add_data("batch_1", vec![quote("A.B", 2), quote("A.B", 4)], true);
 
         assert_eq!(collect_ts(&mut it), vec![1, 2, 3, 4]);
+    }
+
+    #[rstest]
+    fn test_prepend_stream_always_wins_ties_across_batches() {
+        // Verifies that a prepend stream (negative priority) wins ties
+        // even when added after multiple append streams
+        let mut it = BacktestDataIterator::new();
+        it.add_data("append_a", vec![quote("A.B", 100)], true);
+        it.add_data("append_b", vec![quote("C.D", 100)], true);
+        it.add_data("prepend", vec![quote("E.F", 100)], false);
+
+        let first = it.next().unwrap();
+        assert_eq!(
+            first.instrument_id(),
+            InstrumentId::from("E.F"),
+            "Prepend stream should always come first in ties"
+        );
+    }
+
+    #[rstest]
+    fn test_equal_timestamps_across_many_streams_preserves_priority_order() {
+        // All items at the same timestamp — ordering is strictly by priority
+        let mut it = BacktestDataIterator::new();
+        it.add_data("s1", vec![quote("A.B", 50)], true);
+        it.add_data("s2", vec![quote("C.D", 50)], true);
+        it.add_data("s3", vec![quote("E.F", 50)], true);
+        it.add_data("s4", vec![quote("G.H", 50)], true);
+
+        let mut ids = Vec::new();
+        while let Some(d) = it.next() {
+            ids.push(d.instrument_id());
+        }
+
+        assert_eq!(ids.len(), 4);
+
+        // All should be yielded (no duplicates dropped, no items lost)
+        assert!(ids.contains(&InstrumentId::from("A.B")));
+        assert!(ids.contains(&InstrumentId::from("C.D")));
+        assert!(ids.contains(&InstrumentId::from("E.F")));
+        assert!(ids.contains(&InstrumentId::from("G.H")));
+    }
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    fn test_defi_data_orders_equal_timestamps_by_block_position() {
+        let mut it = BacktestDataIterator::new();
+        it.add_data(
+            "defi",
+            vec![
+                defi_snapshot(100, 12, 4, 1),
+                defi_snapshot(100, 11, 9, 9),
+                defi_snapshot(100, 12, 2, 7),
+            ],
+            true,
+        );
+
+        let mut positions = Vec::new();
+        while let Some(Data::Defi(data)) = it.next_item() {
+            positions.push(data.block_position());
+        }
+
+        assert_eq!(positions, vec![(11, 9, 9), (12, 2, 7), (12, 4, 1)]);
     }
 }

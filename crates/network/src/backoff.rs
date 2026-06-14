@@ -95,6 +95,10 @@ impl ExponentialBackoff {
     /// If the `immediate_first` flag is set and this is the first call (i.e. the current
     /// delay equals the initial delay), it returns `Duration::ZERO` to trigger an immediate
     /// reconnect and disables the immediate behavior for subsequent calls.
+    ///
+    /// Near the cap the jittered base is lowered to `delay_max - jitter` so
+    /// the spread survives saturation; the result is clamped into
+    /// `[min(delay_initial, delay_max), delay_max]`.
     pub fn next_duration(&mut self) -> Duration {
         if self.immediate_reconnect && self.delay_current == self.delay_initial {
             self.immediate_reconnect = false;
@@ -102,11 +106,19 @@ impl ExponentialBackoff {
         }
 
         // Generate random jitter
-        let jitter = rand::rng().random_range(0..=self.jitter_ms);
-        let delay_with_jitter = self.delay_current + Duration::from_millis(jitter);
+        let jitter = rand::rng().random_range(0..=self.jitter_ms); // dst-ok: transport-layer reconnect jitter, out of DST scope
 
-        // Clamp the returned delay to never exceed delay_max
-        let clamped_delay = std::cmp::min(delay_with_jitter, self.delay_max);
+        // Cap the jittered base below delay_max so the spread survives saturation at the cap
+        let base = std::cmp::min(
+            self.delay_current,
+            self.delay_max
+                .saturating_sub(Duration::from_millis(self.jitter_ms)),
+        );
+        let delay_with_jitter = base + Duration::from_millis(jitter);
+
+        // The floor keeps a jitter range wider than delay_max from producing a zero delay
+        let floor = std::cmp::min(self.delay_initial, self.delay_max);
+        let clamped_delay = delay_with_jitter.clamp(floor, self.delay_max);
 
         // Prepare the next delay with overflow protection
         // Keep all math in u128 to avoid silent truncation
@@ -216,7 +228,7 @@ mod tests {
     #[rstest]
     fn test_jitter_within_bounds() {
         let initial = Duration::from_millis(100);
-        let max = Duration::from_millis(1000);
+        let max = Duration::from_secs(1);
         let factor = 2.0;
         let jitter = 50;
         // Run several iterations to ensure that jitter stays within bounds
@@ -267,7 +279,7 @@ mod tests {
     #[rstest]
     fn test_max_delay_is_respected() {
         let initial = Duration::from_millis(500);
-        let max = Duration::from_millis(1000);
+        let max = Duration::from_secs(1);
         let factor = 3.0;
         let jitter = 0;
         let mut backoff = ExponentialBackoff::new(initial, max, factor, jitter, false).unwrap();
@@ -278,11 +290,11 @@ mod tests {
 
         // 2nd call: would be 500 * 3 = 1500ms but is capped to 1000ms
         let d2 = backoff.next_duration();
-        assert_eq!(d2, Duration::from_millis(1000));
+        assert_eq!(d2, Duration::from_secs(1));
 
         // Subsequent calls should continue to return the max delay
         let d3 = backoff.next_duration();
-        assert_eq!(d3, Duration::from_millis(1000));
+        assert_eq!(d3, Duration::from_secs(1));
     }
 
     #[rstest]
@@ -307,8 +319,7 @@ mod tests {
 
     #[rstest]
     fn test_validation_zero_initial_delay() {
-        let result =
-            ExponentialBackoff::new(Duration::ZERO, Duration::from_millis(1000), 2.0, 0, false);
+        let result = ExponentialBackoff::new(Duration::ZERO, Duration::from_secs(1), 2.0, 0, false);
         assert!(result.is_err());
         assert!(
             result
@@ -321,7 +332,7 @@ mod tests {
     #[rstest]
     fn test_validation_max_less_than_initial() {
         let result = ExponentialBackoff::new(
-            Duration::from_millis(1000),
+            Duration::from_secs(1),
             Duration::from_millis(500),
             2.0,
             0,
@@ -340,7 +351,7 @@ mod tests {
     fn test_validation_factor_too_small() {
         let result = ExponentialBackoff::new(
             Duration::from_millis(100),
-            Duration::from_millis(1000),
+            Duration::from_secs(1),
             0.5,
             0,
             false,
@@ -353,7 +364,7 @@ mod tests {
     fn test_validation_factor_too_large() {
         let result = ExponentialBackoff::new(
             Duration::from_millis(100),
-            Duration::from_millis(1000),
+            Duration::from_secs(1),
             150.0,
             0,
             false,
@@ -440,7 +451,7 @@ mod tests {
     #[rstest]
     fn test_jitter_never_exceeds_max_delay() {
         let initial = Duration::from_millis(100);
-        let max = Duration::from_millis(1000);
+        let max = Duration::from_secs(1);
         let factor = 2.0;
         let jitter = 500;
 
@@ -458,6 +469,48 @@ mod tests {
                 delay <= max,
                 "Delay with jitter {delay:?} exceeded max {max:?}"
             );
+        }
+    }
+
+    #[rstest]
+    fn test_jitter_spreads_delays_at_cap() {
+        // Regression: clamping after adding jitter collapsed the spread to a
+        // single value once the backoff saturated, re-synchronizing clients
+        // exactly during extended outages
+        let initial = Duration::from_millis(100);
+        let max = Duration::from_secs(1);
+        let mut backoff = ExponentialBackoff::new(initial, max, 2.0, 500, false).unwrap();
+
+        while backoff.current_delay() < max {
+            backoff.next_duration();
+        }
+
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..100 {
+            distinct.insert(backoff.next_duration());
+        }
+
+        assert!(
+            distinct.len() >= 2,
+            "Jitter must keep spreading delays once the backoff saturates at the cap"
+        );
+    }
+
+    #[rstest]
+    fn test_jitter_wider_than_max_never_returns_zero_delay() {
+        // A jitter range wider than delay_max collapses the base to zero; the
+        // floor keeps non-immediate delays positive.
+        let max = Duration::from_millis(50);
+        let mut backoff =
+            ExponentialBackoff::new(Duration::from_millis(10), max, 2.0, 100, false).unwrap();
+
+        for _ in 0..200 {
+            let delay = backoff.next_duration();
+            assert!(
+                !delay.is_zero(),
+                "Non-immediate backoff delay must be positive"
+            );
+            assert!(delay <= max, "Delay {delay:?} exceeded max {max:?}");
         }
     }
 }

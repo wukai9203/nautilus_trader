@@ -36,16 +36,18 @@
 //! This design removes all manual INCREF/DECREF on `callback_ptr`, eliminates
 //! leaks, and is safe on any thread.
 
-use std::{
-    ffi::c_char,
-    sync::{Mutex, OnceLock},
-};
+use std::ffi::c_char;
+#[cfg(feature = "python")]
+use std::sync::{Mutex, OnceLock};
 
+#[cfg(feature = "python")]
 use ahash::AHashMap;
+#[cfg(feature = "python")]
+use nautilus_core::MUTEX_POISONED;
 #[cfg(feature = "python")]
 use nautilus_core::python::clone_py_object;
 use nautilus_core::{
-    MUTEX_POISONED, UUID4,
+    UUID4,
     ffi::string::{cstr_to_ustr, str_to_cstr},
 };
 #[cfg(feature = "python")]
@@ -116,8 +118,8 @@ impl From<TimeEventHandler> for TimeEventHandler_API {
     /// since only Python callbacks are supported by `TimeEventHandler_API`.
     fn from(value: TimeEventHandler) -> Self {
         match value.callback {
-            TimeEventCallback::Python(callback_arc) => {
-                let raw_ptr = callback_arc.as_ptr().cast::<c_char>();
+            TimeEventCallback::Python(callback) => {
+                let raw_ptr = callback.callback().as_ptr().cast::<c_char>();
 
                 // Keep an explicit ref-count per raw pointer in the registry.
                 let key = raw_ptr as usize;
@@ -127,7 +129,7 @@ impl From<TimeEventHandler> for TimeEventHandler_API {
                         e.get_mut().1 += 1;
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert((clone_py_object(&callback_arc), 1));
+                        e.insert((clone_py_object(callback.callback()), 1));
                     }
                 }
 
@@ -195,7 +197,7 @@ impl Drop for TimeEventHandler_API {
 }
 
 impl TimeEventHandler_API {
-    /// Creates a null (sentinel) TimeEventHandler_API.
+    /// Creates a null (sentinel) `TimeEventHandler_API`.
     ///
     /// Used to indicate "no event" when returning from pop operations.
     #[must_use]
@@ -208,8 +210,6 @@ impl TimeEventHandler_API {
 }
 
 /// Drops a `TimeEventHandler_API`, releasing any Python callback reference.
-///
-/// # Safety
 ///
 /// The handler must be valid and not previously dropped.
 #[unsafe(no_mangle)]
@@ -279,6 +279,7 @@ pub unsafe extern "C" fn time_event_new(
     ts_event: u64,
     ts_init: u64,
 ) -> TimeEvent {
+    // SAFETY: `name_ptr` is guaranteed to be a valid C string by the FFI caller contract.
     TimeEvent::new(
         unsafe { cstr_to_ustr(name_ptr) },
         event_id,

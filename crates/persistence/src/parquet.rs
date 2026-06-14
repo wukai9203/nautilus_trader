@@ -17,15 +17,65 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 use arrow::record_batch::RecordBatch;
-use object_store::{ObjectStore, path::Path as ObjectPath};
+use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use parquet::{
     arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
     file::{
+        metadata::KeyValue,
         properties::WriterProperties,
         reader::{FileReader, SerializedFileReader},
         statistics::Statistics,
     },
 };
+use url::Url;
+
+pub(crate) fn is_remote_uri_scheme(scheme: &str) -> bool {
+    matches!(
+        scheme,
+        "s3" | "gs" | "gcs" | "az" | "abfs" | "http" | "https"
+    )
+}
+
+pub(crate) fn remote_store_root_url(uri: &str) -> anyhow::Result<Url> {
+    let mut url = Url::parse(uri)?;
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+pub(crate) fn remote_full_uri(uri: &str, object_path: &str) -> anyhow::Result<String> {
+    let root = remote_store_root_url(uri)?;
+    let root = root.as_str().trim_end_matches('/');
+    let object_path = object_path.trim_start_matches('/');
+
+    if object_path.is_empty() {
+        Ok(root.to_string())
+    } else {
+        Ok(format!("{root}/{object_path}"))
+    }
+}
+
+pub(crate) enum ObjectStoreLocationKind {
+    Local,
+    Remote { store_root_url: Url },
+}
+
+pub(crate) struct ObjectStoreLocation {
+    pub object_store: Arc<dyn ObjectStore>,
+    pub base_path: String,
+    pub original_uri: String,
+    pub kind: ObjectStoreLocationKind,
+}
+
+impl ObjectStoreLocation {
+    pub(crate) fn store_root_url(&self) -> Option<&Url> {
+        match &self.kind {
+            ObjectStoreLocationKind::Local => None,
+            ObjectStoreLocationKind::Remote { store_root_url } => Some(store_root_url),
+        }
+    }
+}
 
 /// Writes a `RecordBatch` to a Parquet file using object store, with optional compression.
 ///
@@ -74,11 +124,45 @@ pub async fn write_batches_to_parquet(
         &object_path,
         compression,
         max_row_group_size,
+        None,
     )
     .await
 }
 
-/// Writes multiple `RecordBatch` items to an object store URI, with optional compression and row group sizing.
+/// Reads a Parquet file from an object store and returns all record batches plus
+/// the Arrow schema from the builder. The builder's schema includes metadata restored
+/// from the file's `ARROW:schema` `key_value_metadata`; use it for decoding instead of
+/// each batch's schema (which has metadata stripped).
+///
+/// # Errors
+///
+/// Returns an error if the path cannot be read or Parquet parsing fails.
+pub async fn read_parquet_from_object_store(
+    object_store: Arc<dyn ObjectStore>,
+    path: &ObjectPath,
+) -> anyhow::Result<(Vec<RecordBatch>, Arc<arrow::datatypes::Schema>)> {
+    let result: object_store::GetResult = object_store.get(path).await?;
+    let data = result.bytes().await?;
+    if data.is_empty() {
+        return Ok((
+            Vec::new(),
+            Arc::new(arrow::datatypes::Schema::new(
+                Vec::<arrow::datatypes::Field>::new(),
+            )),
+        ));
+    }
+    let builder = ParquetRecordBatchReaderBuilder::try_new(data)?;
+    let schema = builder.schema().clone();
+    let reader = builder.build()?;
+    let mut batches = Vec::new();
+    for batch in reader {
+        batches.push(batch?);
+    }
+    Ok((batches, schema))
+}
+
+/// Writes multiple `RecordBatch` items to an object store URI, with optional compression,
+/// row group sizing, and `key_value_metadata` (e.g. for instrument "class" so it survives roundtrip).
 ///
 /// # Errors
 ///
@@ -89,14 +173,19 @@ pub async fn write_batches_to_object_store(
     path: &ObjectPath,
     compression: Option<parquet::basic::Compression>,
     max_row_group_size: Option<usize>,
+    key_value_metadata: Option<Vec<KeyValue>>,
 ) -> anyhow::Result<()> {
     // Create a temporary buffer to write the parquet data
     let mut buffer = Vec::new();
 
-    let writer_props = WriterProperties::builder()
+    let mut props_builder = WriterProperties::builder()
         .set_compression(compression.unwrap_or(parquet::basic::Compression::SNAPPY))
-        .set_max_row_group_size(max_row_group_size.unwrap_or(5000))
-        .build();
+        .set_max_row_group_row_count(Some(max_row_group_size.unwrap_or(5000)));
+
+    if let Some(kv) = key_value_metadata {
+        props_builder = props_builder.set_key_value_metadata(Some(kv));
+    }
+    let writer_props = props_builder.build();
 
     let mut writer = ArrowWriter::try_new(&mut buffer, batches[0].schema(), Some(writer_props))?;
     for batch in batches {
@@ -110,6 +199,59 @@ pub async fn write_batches_to_object_store(
     Ok(())
 }
 
+/// Deduplicates a slice of `RecordBatch` items, removing rows that are identical across all columns.
+///
+/// Rows are compared by encoding each row to a canonical byte sequence using Arrow's row format.
+/// Only the first occurrence of each unique row is retained; the relative order of unique rows
+/// is preserved.
+///
+/// # Errors
+///
+/// Returns an error if the row converter cannot be constructed or if the `take` kernel fails.
+fn deduplicate_record_batches(batches: &[RecordBatch]) -> anyhow::Result<Vec<RecordBatch>> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let schema = batches[0].schema();
+
+    let fields: Vec<arrow_row::SortField> = schema
+        .fields()
+        .iter()
+        .map(|f| arrow_row::SortField::new(f.data_type().clone()))
+        .collect();
+
+    let converter = arrow_row::RowConverter::new(fields)?;
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut result: Vec<RecordBatch> = Vec::new();
+
+    for batch in batches {
+        let rows = converter.convert_columns(batch.columns())?;
+        let mut indices: Vec<u32> = Vec::new();
+
+        for (i, row) in rows.iter().enumerate() {
+            if seen.insert(row.as_ref().to_vec()) {
+                indices.push(
+                    u32::try_from(i)
+                        .map_err(|_| anyhow::anyhow!("record batch row index exceeds u32"))?,
+                );
+            }
+        }
+
+        if !indices.is_empty() {
+            let index_array = arrow::array::UInt32Array::from(indices);
+            let deduped_columns: Vec<arrow::array::ArrayRef> = batch
+                .columns()
+                .iter()
+                .map(|col| arrow::compute::take(col.as_ref(), &index_array, None))
+                .collect::<Result<_, _>>()?;
+            result.push(RecordBatch::try_new(schema.clone(), deduped_columns)?);
+        }
+    }
+
+    Ok(result)
+}
+
 /// Combines multiple Parquet files using object store with storage options
 ///
 /// # Errors
@@ -121,6 +263,7 @@ pub async fn combine_parquet_files(
     storage_options: Option<AHashMap<String, String>>,
     compression: Option<parquet::basic::Compression>,
     max_row_group_size: Option<usize>,
+    deduplicate: Option<bool>,
 ) -> anyhow::Result<()> {
     if file_paths.len() <= 1 {
         return Ok(());
@@ -154,6 +297,7 @@ pub async fn combine_parquet_files(
         &new_object_path,
         compression,
         max_row_group_size,
+        deduplicate,
     )
     .await
 }
@@ -169,17 +313,30 @@ pub async fn combine_parquet_files_from_object_store(
     new_file_path: &ObjectPath,
     compression: Option<parquet::basic::Compression>,
     max_row_group_size: Option<usize>,
+    deduplicate: Option<bool>,
 ) -> anyhow::Result<()> {
     if file_paths.len() <= 1 {
         return Ok(());
     }
 
     let mut all_batches: Vec<RecordBatch> = Vec::new();
+    let mut schema_with_metadata: Option<Arc<arrow::datatypes::Schema>> = None;
 
     // Read all files from object store
     for path in &file_paths {
-        let data = object_store.get(path).await?.bytes().await?;
+        let result: object_store::GetResult = object_store.get(path).await?;
+        let data = result.bytes().await?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(data)?;
+
+        // Capture the schema from the first file's builder; it includes the Arrow
+        // schema-level metadata (e.g. bar_type, instrument_id) restored from the
+        // Parquet ARROW:schema key_value_metadata entry.  Individual RecordBatch
+        // objects returned by the reader have this metadata stripped, so we need
+        // to preserve it separately and re-apply it when writing the combined file.
+        if schema_with_metadata.is_none() {
+            schema_with_metadata = Some(builder.schema().clone());
+        }
+
         let mut reader = builder.build()?;
 
         for batch in reader.by_ref() {
@@ -187,13 +344,31 @@ pub async fn combine_parquet_files_from_object_store(
         }
     }
 
+    // Re-apply the preserved schema metadata to all collected batches so that
+    // write_batches_to_object_store (which uses batches[0].schema()) can encode
+    // the correct Arrow schema metadata into the combined output file.
+    if let Some(schema) = &schema_with_metadata {
+        all_batches = all_batches
+            .into_iter()
+            .map(|batch| RecordBatch::try_new(schema.clone(), batch.columns().to_vec()))
+            .collect::<Result<_, _>>()?;
+    }
+
+    // Deduplicate rows if requested
+    let batches_to_write = if deduplicate.unwrap_or(false) {
+        deduplicate_record_batches(&all_batches)?
+    } else {
+        all_batches
+    };
+
     // Write combined batches to new location
     write_batches_to_object_store(
-        &all_batches,
+        &batches_to_write,
         object_store.clone(),
         new_file_path,
         compression,
         max_row_group_size,
+        None,
     )
     .await?;
 
@@ -212,10 +387,6 @@ pub async fn combine_parquet_files_from_object_store(
 /// # Errors
 ///
 /// Returns an error if the file cannot be read, metadata parsing fails, or the column is missing or has no statistics.
-///
-/// # Panics
-///
-/// Panics if the Parquet metadata's min/max unwrap operations fail unexpectedly.
 pub async fn min_max_from_parquet_metadata(
     file_path: &str,
     storage_options: Option<AHashMap<String, String>>,
@@ -236,17 +407,14 @@ pub async fn min_max_from_parquet_metadata(
 /// # Errors
 ///
 /// Returns an error if the file cannot be read, metadata parsing fails, or the column is missing or has no statistics.
-///
-/// # Panics
-///
-/// Panics if the Parquet metadata's min/max unwrap operations fail unexpectedly.
 pub async fn min_max_from_parquet_metadata_object_store(
     object_store: Arc<dyn ObjectStore>,
     file_path: &ObjectPath,
     column_name: &str,
 ) -> anyhow::Result<(u64, u64)> {
     // Download the parquet file from object store
-    let data = object_store.get(file_path).await?.bytes().await?;
+    let result: object_store::GetResult = object_store.get(file_path).await?;
+    let data = result.bytes().await?;
     let reader = SerializedFileReader::new(data)?;
 
     let metadata = reader.metadata();
@@ -267,16 +435,14 @@ pub async fn min_max_from_parquet_metadata_object_store(
                     if let Statistics::Int64(int64_stats) = stats {
                         // Extract min value if available
                         if let Some(&min_value) = int64_stats.min_opt()
-                            && (overall_min_value.is_none()
-                                || min_value < overall_min_value.unwrap())
+                            && overall_min_value.is_none_or(|overall_min| min_value < overall_min)
                         {
                             overall_min_value = Some(min_value);
                         }
 
                         // Extract max value if available
                         if let Some(&max_value) = int64_stats.max_opt()
-                            && (overall_max_value.is_none()
-                                || max_value > overall_max_value.unwrap())
+                            && overall_max_value.is_none_or(|overall_max| max_value > overall_max)
                         {
                             overall_max_value = Some(max_value);
                         }
@@ -294,7 +460,14 @@ pub async fn min_max_from_parquet_metadata_object_store(
 
     // Return the min/max pair if both are available
     if let (Some(min), Some(max)) = (overall_min_value, overall_max_value) {
-        Ok((min as u64, max as u64))
+        Ok((
+            u64::try_from(min).map_err(|_| {
+                anyhow::anyhow!("Negative minimum value {min} for column '{column_name}'")
+            })?,
+            u64::try_from(max).map_err(|_| {
+                anyhow::anyhow!("Negative maximum value {max} for column '{column_name}'")
+            })?,
+        ))
     } else {
         anyhow::bail!(
             "Column '{column_name}' not found or has no Int64 statistics in any row group."
@@ -320,14 +493,36 @@ pub async fn min_max_from_parquet_metadata_object_store(
 ///   - For Azure: `account_name`, `account_key`, `sas_token`, etc.
 ///
 /// Returns a tuple of (`ObjectStore`, `base_path`, `normalized_uri`)
-#[allow(unused_variables)]
+///
+/// # Errors
+///
+/// Returns an error if the object store URI cannot be normalized or the
+/// backend cannot be created.
 pub fn create_object_store_from_path(
     path: &str,
     storage_options: Option<AHashMap<String, String>>,
 ) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
+    let location = create_object_store_location_from_path(path, storage_options)?;
+    Ok((
+        location.object_store,
+        location.base_path,
+        location.original_uri,
+    ))
+}
+
+// `storage_options` is only consumed by the cloud-feature arms,
+// so keep the allow scoped to the no-cloud build.
+#[cfg_attr(
+    not(feature = "cloud"),
+    allow(unused_variables, clippy::needless_pass_by_value)
+)]
+pub(crate) fn create_object_store_location_from_path(
+    path: &str,
+    storage_options: Option<AHashMap<String, String>>,
+) -> anyhow::Result<ObjectStoreLocation> {
     let uri = normalize_path_to_uri(path);
 
-    match uri.as_str() {
+    let (object_store, base_path, original_uri) = match uri.as_str() {
         #[cfg(feature = "cloud")]
         s if s.starts_with("s3://") => create_s3_store(&uri, storage_options),
         #[cfg(feature = "cloud")]
@@ -355,7 +550,24 @@ pub fn create_object_store_from_path(
         }
         s if s.starts_with("file://") => create_local_store(&uri, true),
         _ => create_local_store(&uri, false), // Fallback: assume local path
-    }
+    }?;
+
+    let kind = Url::parse(&original_uri)
+        .ok()
+        .filter(|url| is_remote_uri_scheme(url.scheme()))
+        .map(|_| {
+            remote_store_root_url(&original_uri)
+                .map(|store_root_url| ObjectStoreLocationKind::Remote { store_root_url })
+        })
+        .transpose()?
+        .unwrap_or(ObjectStoreLocationKind::Local);
+
+    Ok(ObjectStoreLocation {
+        object_store,
+        base_path,
+        original_uri,
+        kind,
+    })
 }
 
 /// Normalizes a path to URI format for consistent object store usage.
@@ -387,7 +599,8 @@ pub fn normalize_path_to_uri(path: &str) -> String {
             path_to_file_uri(path)
         } else {
             // Relative path - make it absolute first
-            let absolute_path = std::env::current_dir().unwrap().join(path);
+            let absolute_path = std::env::current_dir()
+                .map_or_else(|_| std::path::PathBuf::from(path), |cwd| cwd.join(path));
             path_to_file_uri(&absolute_path.to_string_lossy())
         }
     }
@@ -439,18 +652,37 @@ fn path_to_file_uri(path: &str) -> String {
     }
 }
 
+/// Converts a file:// URI to a native path for the current platform.
+/// On Windows, "file:///C:/x/y" becomes "C:\x\y" so LocalFileSystem and std::fs work correctly.
+#[cfg(windows)]
+pub(crate) fn file_uri_to_native_path(uri: &str) -> String {
+    let without_scheme = uri
+        .strip_prefix("file://")
+        .or_else(|| uri.strip_prefix("file:"))
+        .unwrap_or(uri);
+    // Strip leading slash so "/C:/x/y" -> "C:/x/y", then use native separators
+    let without_leading = without_scheme.trim_start_matches('/');
+    without_leading.replace('/', "\\")
+}
+
+/// Converts a file:// URI to a path string for Unix (no-op; `object_store` accepts slash paths).
+#[cfg(not(windows))]
+pub(crate) fn file_uri_to_native_path(uri: &str) -> String {
+    uri.strip_prefix("file://").unwrap_or(uri).to_string()
+}
+
 /// Helper function to create local file system object store
 fn create_local_store(
     uri: &str,
     is_file_uri: bool,
 ) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
     let path = if is_file_uri {
-        uri.strip_prefix("file://").unwrap_or(uri)
+        file_uri_to_native_path(uri)
     } else {
-        uri
+        uri.to_string()
     };
 
-    let local_store = object_store::local::LocalFileSystem::new_with_prefix(path)?;
+    let local_store = object_store::local::LocalFileSystem::new_with_prefix(&path)?;
     Ok((Arc::new(local_store), String::new(), uri.to_string()))
 }
 
@@ -685,8 +917,11 @@ fn create_http_store(
     uri: &str,
     storage_options: Option<AHashMap<String, String>>,
 ) -> anyhow::Result<(Arc<dyn ObjectStore>, String, String)> {
-    let (url, path) = parse_url_and_path(uri)?;
-    let base_url = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
+    let (_, path) = parse_url_and_path(uri)?;
+    let base_url = remote_store_root_url(uri)?
+        .as_str()
+        .trim_end_matches('/')
+        .to_string();
 
     let builder = object_store::http::HttpBuilder::new().with_url(base_url);
 
@@ -724,6 +959,10 @@ fn extract_host(url: &url::Url, error_msg: &str) -> anyhow::Result<String> {
 mod tests {
     #[cfg(feature = "cloud")]
     use ahash::AHashMap;
+    use arrow::{
+        array::Int64Array,
+        datatypes::{DataType, Field, Schema},
+    };
     use rstest::rstest;
 
     use super::*;
@@ -831,11 +1070,91 @@ mod tests {
 
     #[rstest]
     #[cfg(feature = "cloud")]
+    fn test_remote_store_root_url_preserves_authority() {
+        let https_root = remote_store_root_url("https://example.com:9000/base/path").unwrap();
+        assert_eq!(
+            https_root.as_str().trim_end_matches('/'),
+            "https://example.com:9000"
+        );
+
+        let abfs_root =
+            remote_store_root_url("abfs://container@account.dfs.core.windows.net/base/path")
+                .unwrap();
+        assert_eq!(
+            abfs_root.as_str().trim_end_matches('/'),
+            "abfs://container@account.dfs.core.windows.net"
+        );
+
+        let full_uri = remote_full_uri(
+            "https://example.com:9000/base/path",
+            "base/path/data/%5E/file.parquet",
+        )
+        .unwrap();
+        assert_eq!(
+            full_uri,
+            "https://example.com:9000/base/path/data/%5E/file.parquet"
+        );
+
+        let location = create_object_store_location_from_path("s3://test-bucket/path", None)
+            .expect("S3 location should be created");
+        assert_eq!(location.base_path, "path");
+        assert_eq!(
+            location
+                .store_root_url()
+                .expect("S3 should be remote")
+                .as_str()
+                .trim_end_matches('/'),
+            "s3://test-bucket"
+        );
+    }
+
+    #[rstest]
+    #[cfg(feature = "cloud")]
     fn test_extract_host() {
         let url = url::Url::parse("s3://test-bucket/path").unwrap();
         let result = extract_host(&url, "Test error");
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "test-bucket");
+    }
+
+    #[tokio::test]
+    async fn test_min_max_from_parquet_metadata_rejects_negative_int64_statistics() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(temp_dir.path()).unwrap(),
+        );
+        let object_path = ObjectPath::from("negative_stats.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts_init",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![-2_i64, -1_i64]))],
+        )
+        .unwrap();
+
+        write_batches_to_object_store(
+            &[batch],
+            object_store.clone(),
+            &object_path,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let error =
+            min_max_from_parquet_metadata_object_store(object_store, &object_path, "ts_init")
+                .await
+                .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Negative minimum value -2 for column 'ts_init'"
+        );
     }
 
     #[rstest]

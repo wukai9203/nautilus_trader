@@ -19,12 +19,12 @@
 //! in this file.
 
 use ahash::AHashMap;
+use indexmap::IndexMap;
 use nautilus_core::{
     UnixNanos,
     correctness::{FAILED, check_equal},
     datetime::secs_to_nanos_unchecked,
 };
-use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -39,7 +39,7 @@ use crate::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
 )]
 pub struct BaseAccount {
     pub id: AccountId,
@@ -48,15 +48,16 @@ pub struct BaseAccount {
     pub calculate_account_state: bool,
     pub events: Vec<AccountState>,
     pub commissions: AHashMap<Currency, Money>,
-    pub balances: AHashMap<Currency, AccountBalance>,
-    pub balances_starting: AHashMap<Currency, Money>,
+    pub balances: IndexMap<Currency, AccountBalance>,
+    pub balances_starting: IndexMap<Currency, Money>,
 }
 
 impl BaseAccount {
     /// Creates a new [`BaseAccount`] instance.
+    #[must_use]
     pub fn new(event: AccountState, calculate_account_state: bool) -> Self {
-        let mut balances_starting: AHashMap<Currency, Money> = AHashMap::new();
-        let mut balances: AHashMap<Currency, AccountBalance> = AHashMap::new();
+        let mut balances_starting: IndexMap<Currency, Money> = IndexMap::new();
+        let mut balances: IndexMap<Currency, AccountBalance> = IndexMap::new();
         event.balances.iter().for_each(|balance| {
             balances_starting.insert(balance.currency, balance.total);
             balances.insert(balance.currency, *balance);
@@ -101,7 +102,7 @@ impl BaseAccount {
     }
 
     #[must_use]
-    pub fn base_balances_total(&self) -> AHashMap<Currency, Money> {
+    pub fn base_balances_total(&self) -> IndexMap<Currency, Money> {
         self.balances
             .iter()
             .map(|(currency, balance)| (*currency, balance.total))
@@ -123,7 +124,7 @@ impl BaseAccount {
     }
 
     #[must_use]
-    pub fn base_balances_free(&self) -> AHashMap<Currency, Money> {
+    pub fn base_balances_free(&self) -> IndexMap<Currency, Money> {
         self.balances
             .iter()
             .map(|(currency, balance)| (*currency, balance.free))
@@ -145,7 +146,7 @@ impl BaseAccount {
     }
 
     #[must_use]
-    pub fn base_balances_locked(&self) -> AHashMap<Currency, Money> {
+    pub fn base_balances_locked(&self) -> IndexMap<Currency, Money> {
         self.balances
             .iter()
             .map(|(currency, balance)| (*currency, balance.locked))
@@ -160,9 +161,9 @@ impl BaseAccount {
     /// Updates the account balances with the provided list of `AccountBalance` instances.
     ///
     /// Note: This method does NOT validate negative balances. Derived account types
-    /// (CashAccount, MarginAccount) should perform their own validation in apply():
-    /// - MarginAccount: allows negative balances (normal for margin trading)
-    /// - CashAccount: rejects negative unless `allow_borrowing` is true
+    /// (`CashAccount`, `MarginAccount`) should perform their own validation in `apply()`:
+    /// - `MarginAccount`: allows negative balances (normal for margin trading)
+    /// - `CashAccount`: rejects negative unless `allow_borrowing` is true
     pub fn update_balances(&mut self, balances: &[AccountBalance]) {
         for balance in balances {
             self.balances.insert(balance.currency, *balance);
@@ -225,8 +226,7 @@ impl BaseAccount {
 
         // Guarantee ≥ 1 event
         if retained_events.is_empty() && !self.events.is_empty() {
-            // SAFETY: events was already checked not empty
-            retained_events.push(self.events.last().unwrap().clone());
+            retained_events.push(self.events.last().expect("events not empty").clone());
         }
 
         self.events = retained_events;
@@ -236,14 +236,11 @@ impl BaseAccount {
     ///
     /// # Errors
     ///
-    /// This function never returns an error (TBD).
+    /// Returns an error if the locked amount cannot be represented in the target currency.
     ///
-    /// # Panics
-    ///
-    /// Panics if `side` is not [`OrderSide::Buy`] or [`OrderSide::Sell`].
     pub fn base_calculate_balance_locked(
         &mut self,
-        instrument: InstrumentAny,
+        instrument: &InstrumentAny,
         side: OrderSide,
         quantity: Quantity,
         price: Price,
@@ -253,21 +250,22 @@ impl BaseAccount {
             .base_currency()
             .unwrap_or(instrument.quote_currency());
         let quote_currency = instrument.quote_currency();
-        let notional: f64 = match side {
+        let amount = match side {
             OrderSide::Buy => instrument
                 .calculate_notional_value(quantity, price, use_quote_for_inverse)
-                .as_f64(),
-            OrderSide::Sell => quantity.as_f64(),
-            _ => anyhow::bail!("Invalid `OrderSide` in `base_calculate_balance_locked`: {side}"),
+                .as_decimal(),
+            OrderSide::Sell => quantity.as_decimal(),
+            OrderSide::NoOrderSide => {
+                anyhow::bail!("Invalid `OrderSide` in `base_calculate_balance_locked`: {side}")
+            }
         };
 
-        // Handle inverse
         if instrument.is_inverse() && !use_quote_for_inverse.unwrap_or(false) {
-            Ok(Money::new(notional, base_currency))
+            Ok(Money::from_decimal(amount, base_currency)?)
         } else if side == OrderSide::Buy {
-            Ok(Money::new(notional, quote_currency))
+            Ok(Money::from_decimal(amount, quote_currency)?)
         } else if side == OrderSide::Sell {
-            Ok(Money::new(notional, base_currency))
+            Ok(Money::from_decimal(amount, base_currency)?)
         } else {
             anyhow::bail!("Invalid `OrderSide` in `base_calculate_balance_locked`: {side}")
         }
@@ -284,48 +282,37 @@ impl BaseAccount {
     ///
     /// # Errors
     ///
-    /// This function never returns an error (TBD).
+    /// Returns an error if a PnL amount cannot be represented in the target currency.
     ///
-    /// # Panics
-    ///
-    /// Panics if `fill.order_side` is neither [`OrderSide::Buy`] nor [`OrderSide::Sell`].
     pub fn base_calculate_pnls(
         &self,
-        instrument: InstrumentAny,
-        fill: OrderFilled,
+        instrument: &InstrumentAny,
+        fill: &OrderFilled,
         _position: Option<Position>,
     ) -> anyhow::Result<Vec<Money>> {
-        let mut pnls: AHashMap<Currency, Money> = AHashMap::new();
+        let mut pnls: IndexMap<Currency, Money> = IndexMap::new();
         let base_currency = instrument.base_currency();
 
         // No quantity capping (betting accounts cap to position qty, cash accounts don't)
         let fill_qty = fill.last_qty;
-        let fill_qty_value = fill_qty.as_f64();
-
         let notional = instrument.calculate_notional_value(fill_qty, fill.last_px, None);
 
         if fill.order_side == OrderSide::Buy {
             if let (Some(base_currency_value), None) = (base_currency, self.base_currency) {
                 pnls.insert(
                     base_currency_value,
-                    Money::new(fill_qty_value, base_currency_value),
+                    Money::from_decimal(fill_qty.as_decimal(), base_currency_value)?,
                 );
             }
-            pnls.insert(
-                notional.currency,
-                Money::new(-notional.as_f64(), notional.currency),
-            );
+            pnls.insert(notional.currency, -notional);
         } else if fill.order_side == OrderSide::Sell {
             if let (Some(base_currency_value), None) = (base_currency, self.base_currency) {
                 pnls.insert(
                     base_currency_value,
-                    Money::new(-fill_qty_value, base_currency_value),
+                    -Money::from_decimal(fill_qty.as_decimal(), base_currency_value)?,
                 );
             }
-            pnls.insert(
-                notional.currency,
-                Money::new(notional.as_f64(), notional.currency),
-            );
+            pnls.insert(notional.currency, notional);
         } else {
             anyhow::bail!(
                 "Invalid `OrderSide` in base_calculate_pnls: {}",
@@ -337,16 +324,17 @@ impl BaseAccount {
 
     /// Calculates commission fees for a filled order.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if `liquidity_side` is invalid, or if the commission cannot be represented
+    /// in the target currency.
+    ///
     /// # Panics
     ///
-    /// Panics if instrument fees cannot be converted to f64, or if base currency is unavailable for inverse instruments.
-    #[allow(
-        clippy::missing_errors_doc,
-        reason = "Error conditions documented inline"
-    )]
+    /// Panics if the instrument is inverse and does not have a base currency.
     pub fn base_calculate_commission(
         &self,
-        instrument: InstrumentAny,
+        instrument: &InstrumentAny,
         last_qty: Quantity,
         last_px: Price,
         liquidity_side: LiquiditySide,
@@ -358,19 +346,23 @@ impl BaseAccount {
         );
         let notional = instrument
             .calculate_notional_value(last_qty, last_px, use_quote_for_inverse)
-            .as_f64();
-        let commission = if liquidity_side == LiquiditySide::Maker {
-            notional * instrument.maker_fee().to_f64().unwrap()
-        } else if liquidity_side == LiquiditySide::Taker {
-            notional * instrument.taker_fee().to_f64().unwrap()
-        } else {
-            anyhow::bail!("Invalid `LiquiditySide`: {liquidity_side}");
+            .as_decimal();
+        let commission = match liquidity_side {
+            LiquiditySide::Maker => notional * instrument.maker_fee(),
+            LiquiditySide::Taker => notional * instrument.taker_fee(),
+            LiquiditySide::NoLiquiditySide => {
+                anyhow::bail!("Invalid `LiquiditySide`: {liquidity_side}")
+            }
         };
-        if instrument.is_inverse() && !use_quote_for_inverse.unwrap_or(false) {
-            Ok(Money::new(commission, instrument.base_currency().unwrap()))
+
+        let currency = if instrument.is_inverse() && !use_quote_for_inverse.unwrap_or(false) {
+            instrument
+                .base_currency()
+                .expect("inverse instrument without base_currency")
         } else {
-            Ok(Money::new(commission, instrument.quote_currency()))
-        }
+            instrument.quote_currency()
+        };
+        Ok(Money::from_decimal(commission, currency)?)
     }
 }
 

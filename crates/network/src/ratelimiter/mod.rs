@@ -173,7 +173,26 @@ where
     #[must_use]
     pub fn new_with_quota(base_quota: Option<Quota>, keyed_quotas: Vec<(K, Quota)>) -> Self {
         let clock = MonotonicClock {};
-        let start = MonotonicClock::now(&clock);
+        Self::new_with_clock(base_quota, keyed_quotas, clock)
+    }
+}
+
+impl<K, C> RateLimiter<K, C>
+where
+    K: Eq + Hash,
+    C: Clock,
+{
+    /// Creates a new rate limiter with an explicit clock.
+    ///
+    /// The base quota applies to all keys that do not have specific quotas.
+    /// Keyed quotas override the base quota for specific keys.
+    #[must_use]
+    pub fn new_with_clock(
+        base_quota: Option<Quota>,
+        keyed_quotas: Vec<(K, Quota)>,
+        clock: C,
+    ) -> Self {
+        let start = clock.now();
         let gcra: DashMap<_, _> = keyed_quotas
             .into_iter()
             .map(|(k, q)| (k, Gcra::new(q)))
@@ -232,7 +251,7 @@ where
                     break;
                 }
                 Err(e) => {
-                    tokio::time::sleep(e.wait_time_from(self.clock.now())).await;
+                    self.clock.sleep(e.wait_time_from(self.clock.now())).await;
                 }
             }
         }
@@ -241,24 +260,40 @@ where
     /// Waits until all specified keys are ready (not rate-limited).
     ///
     /// If no keys are provided, this function returns immediately.
+    /// Uses fast paths for 0-2 keys to avoid stream scheduling overhead.
     pub async fn await_keys_ready(&self, keys: Option<&[K]>) {
         let Some(keys) = keys else {
             return;
         };
 
-        let tasks = keys.iter().map(|key| self.until_key_ready(key));
-
-        futures::stream::iter(tasks)
-            .for_each_concurrent(None, |key_future| async move {
-                key_future.await;
-            })
-            .await;
+        match keys.len() {
+            0 => {}
+            1 => self.until_key_ready(&keys[0]).await,
+            2 => {
+                tokio::join!(
+                    self.until_key_ready(&keys[0]),
+                    self.until_key_ready(&keys[1]),
+                );
+            }
+            _ => {
+                let tasks = keys.iter().map(|key| self.until_key_ready(key));
+                futures::stream::iter(tasks)
+                    .for_each_concurrent(None, |key_future| async move {
+                        key_future.await;
+                    })
+                    .await;
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZeroU32, time::Duration};
+    use std::{
+        num::NonZeroU32,
+        sync::atomic::{AtomicU32, Ordering},
+        time::Duration,
+    };
 
     use dashmap::DashMap;
     use rstest::rstest;
@@ -266,7 +301,8 @@ mod tests {
     use super::{
         DashMapStateStore, RateLimiter,
         clock::{Clock, FakeRelativeClock},
-        gcra::Gcra,
+        gcra::{Gcra, StateSnapshot},
+        nanos::Nanos,
         quota::Quota,
     };
 
@@ -274,7 +310,7 @@ mod tests {
         let clock = FakeRelativeClock::default();
         let start = clock.now();
         let gcra = DashMap::new();
-        let base_quota = Quota::per_second(NonZeroU32::new(2).unwrap());
+        let base_quota = Quota::per_second(NonZeroU32::new(2).unwrap()).unwrap();
         RateLimiter {
             default_gcra: Some(Gcra::new(base_quota)),
             state: DashMapStateStore::new(),
@@ -282,6 +318,22 @@ mod tests {
             clock,
             start,
         }
+    }
+
+    #[rstest]
+    fn test_enormous_quota_denies_after_burst() {
+        // Regression: a period beyond ~584 years panicked in Gcra::new; with
+        // clamping it must admit the burst and then deny, not admit everything
+        let quota = Quota::with_period(Duration::MAX)
+            .unwrap()
+            .allow_burst(NonZeroU32::new(u32::MAX).unwrap());
+        let clock = FakeRelativeClock::default();
+        let limiter: RateLimiter<String, FakeRelativeClock> =
+            RateLimiter::new_with_clock(Some(quota), vec![], clock);
+
+        let key = "key".to_string();
+        assert!(limiter.check_key(&key).is_ok());
+        assert!(limiter.check_key(&key).is_err());
     }
 
     #[rstest]
@@ -307,7 +359,7 @@ mod tests {
         // Add new key quota pair
         mock_limiter.add_quota_for_key(
             "custom".to_string(),
-            Quota::per_second(NonZeroU32::new(1).unwrap()),
+            Quota::per_second(NonZeroU32::new(1).unwrap()).unwrap(),
         );
 
         // Check custom quota
@@ -326,11 +378,11 @@ mod tests {
 
         mock_limiter.add_quota_for_key(
             "key1".to_string(),
-            Quota::per_second(NonZeroU32::new(1).unwrap()),
+            Quota::per_second(NonZeroU32::new(1).unwrap()).unwrap(),
         );
         mock_limiter.add_quota_for_key(
             "key2".to_string(),
-            Quota::per_second(NonZeroU32::new(3).unwrap()),
+            Quota::per_second(NonZeroU32::new(3).unwrap()).unwrap(),
         );
 
         // Test key1
@@ -368,7 +420,7 @@ mod tests {
 
         mock_limiter.add_quota_for_key(
             "per_second".to_string(),
-            Quota::per_second(NonZeroU32::new(2).unwrap()),
+            Quota::per_second(NonZeroU32::new(2).unwrap()).unwrap(),
         );
         mock_limiter.add_quota_for_key(
             "per_minute".to_string(),
@@ -411,34 +463,189 @@ mod tests {
     }
 
     #[rstest]
+    fn test_remaining_burst_capacity_zero_t() {
+        let snapshot = StateSnapshot::new(
+            Nanos::from(0u64),
+            Nanos::from(1_000_000u64),
+            Nanos::from(0u64),
+            Nanos::from(0u64),
+        );
+        assert_eq!(snapshot.remaining_burst_capacity(), 0);
+    }
+
+    #[rstest]
+    fn test_per_second_returns_none_on_zero_replenish_interval() {
+        assert!(Quota::per_second(NonZeroU32::new(u32::MAX).unwrap()).is_none());
+    }
+
+    #[rstest]
+    fn test_per_minute_accepts_max_burst() {
+        let quota = Quota::per_minute(NonZeroU32::new(u32::MAX).unwrap());
+        assert!(quota.replenish_interval().as_nanos() > 0);
+    }
+
+    #[rstest]
+    fn test_per_hour_accepts_max_burst() {
+        let quota = Quota::per_hour(NonZeroU32::new(u32::MAX).unwrap());
+        assert!(quota.replenish_interval().as_nanos() > 0);
+    }
+
+    mod property_tests {
+        use proptest::prelude::*;
+        use rstest::rstest;
+
+        use crate::ratelimiter::{gcra::StateSnapshot, nanos::Nanos};
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                failure_persistence: Some(Box::new(
+                    proptest::test_runner::FileFailurePersistence::WithSource("ratelimiter")
+                )),
+                ..ProptestConfig::default()
+            })]
+
+            // Full u64 domain: the historical overflow lived above the narrowed one-hour range
+            #[rstest]
+            fn remaining_burst_capacity_never_panics(
+                t in proptest::num::u64::ANY,
+                tau in proptest::num::u64::ANY,
+                time_of_measurement in proptest::num::u64::ANY,
+                tat in proptest::num::u64::ANY,
+            ) {
+                let snapshot = StateSnapshot::new(
+                    Nanos::from(t),
+                    Nanos::from(tau),
+                    Nanos::from(time_of_measurement),
+                    Nanos::from(tat),
+                );
+
+                let _ = snapshot.remaining_burst_capacity();
+            }
+
+            // Operators must saturate across the full u64 domain (a wrapped TAT admits everything)
+            #[rstest]
+            fn nanos_operators_never_panic(a in proptest::num::u64::ANY, b in proptest::num::u64::ANY) {
+                let na = Nanos::from(a);
+                let nb = Nanos::from(b);
+
+                prop_assert_eq!((na + nb).as_u64(), a.saturating_add(b));
+                prop_assert_eq!((na * b).as_u64(), a.saturating_mul(b));
+                prop_assert_eq!(na.saturating_sub(nb).as_u64(), a.saturating_sub(b));
+            }
+        }
+    }
+
+    #[rstest]
     fn test_gcra_boundary_exact_replenishment() {
         // Test GCRA boundary condition where t0 equals earliest_time exactly.
         // This exercises the saturating_sub edge case deterministically without sleeps.
         let mock_limiter = initialize_mock_rate_limiter();
         let key = "boundary_test".to_string();
 
-        // Consume entire burst capacity (2 requests)
         assert!(mock_limiter.check_key(&key).is_ok());
         assert!(mock_limiter.check_key(&key).is_ok());
-
-        // Next request should be rate-limited
         assert!(mock_limiter.check_key(&key).is_err());
 
         // Advance clock by exactly one replenish interval (500ms for 2 req/sec)
-        let quota = Quota::per_second(NonZeroU32::new(2).unwrap());
+        let quota = Quota::per_second(NonZeroU32::new(2).unwrap()).unwrap();
         let replenish_interval = quota.replenish_interval();
         mock_limiter.advance_clock(replenish_interval);
 
-        // At the exact boundary (t0 == earliest_time), request should be allowed
         assert!(
             mock_limiter.check_key(&key).is_ok(),
             "Request at exact replenish boundary should be allowed"
         );
-
-        // But the next immediate request should be denied (burst exhausted again)
         assert!(
             mock_limiter.check_key(&key).is_err(),
             "Immediate follow-up should be rate-limited"
+        );
+    }
+
+    #[rstest]
+    fn test_per_second_boundary_exact_limit() {
+        // 1_000_000_000ns / 1_000_000_000 = 1ns per replenish, the exact boundary
+        let quota = Quota::per_second(NonZeroU32::new(1_000_000_000).unwrap()).unwrap();
+        assert_eq!(quota.replenish_interval().as_nanos(), 1);
+    }
+
+    #[rstest]
+    fn test_per_second_returns_none_above_one_billion() {
+        // 1_000_000_000ns / 1_000_000_001 rounds to 0ns
+        assert!(Quota::per_second(NonZeroU32::new(1_000_000_001).unwrap()).is_none());
+    }
+
+    #[rstest]
+    fn test_burst_size_replenished_in_truncation() {
+        // 100_000_000_000ns * u32::MAX overflows u64, `as u64` silently truncates
+        let quota = Quota::with_period(Duration::from_secs(100))
+            .unwrap()
+            .allow_burst(NonZeroU32::new(u32::MAX).unwrap());
+
+        let replenished_in = quota.burst_size_replenished_in();
+        let full: u128 = 100_000_000_000u128 * u128::from(u32::MAX);
+        let truncated = full as u64;
+
+        assert_eq!(replenished_in, Duration::from_nanos(truncated));
+        assert_ne!(
+            full,
+            u128::from(truncated),
+            "Truncation should have occurred"
+        );
+    }
+
+    #[rstest]
+    #[should_panic(expected = "t cannot be zero")]
+    fn test_from_gcra_parameters_panics_on_zero_t() {
+        let _ = Quota::from_gcra_parameters(Nanos::from(0u64), Nanos::from(100u64));
+    }
+
+    #[rstest]
+    #[should_panic(expected = "tau/t results in zero burst capacity")]
+    fn test_from_gcra_parameters_panics_on_zero_division() {
+        // tau=1, t=2 → integer division yields 0
+        let _ = Quota::from_gcra_parameters(Nanos::from(2u64), Nanos::from(1u64));
+    }
+
+    #[rstest]
+    #[should_panic(expected = "tau/t exceeds u32::MAX")]
+    fn test_from_gcra_parameters_panics_on_overflow() {
+        let _ = Quota::from_gcra_parameters(Nanos::from(1u64), Nanos::from(u64::MAX));
+    }
+
+    #[rstest]
+    fn test_concurrent_check_key_respects_burst() {
+        let rate = 10u32;
+        let clock = FakeRelativeClock::default();
+        let start = clock.now();
+        let limiter = RateLimiter {
+            default_gcra: Some(Gcra::new(
+                Quota::per_second(NonZeroU32::new(rate).unwrap()).unwrap(),
+            )),
+            state: DashMapStateStore::new(),
+            gcra: DashMap::new(),
+            clock,
+            start,
+        };
+
+        let accepted = AtomicU32::new(0);
+        let num_threads = 50;
+
+        // Clock is frozen: no replenishment occurs
+        std::thread::scope(|s| {
+            for _ in 0..num_threads {
+                s.spawn(|| {
+                    if limiter.check_key(&"hot_key".to_string()).is_ok() {
+                        accepted.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        let total = accepted.load(Ordering::Relaxed);
+        assert!(total >= 1, "At least one request should be accepted");
+        assert!(
+            total <= rate,
+            "Accepted {total} but burst capacity is {rate}"
         );
     }
 }

@@ -31,7 +31,7 @@ use tokio_tungstenite::{
 #[non_exhaustive]
 #[derive(Clone)]
 #[allow(dead_code)]
-pub enum Connector {
+pub(crate) enum Connector {
     /// No TLS connection.
     Plain,
     /// TLS connection using `rustls`.
@@ -40,7 +40,7 @@ pub enum Connector {
 
 mod encryption {
 
-    pub mod rustls {
+    pub(super) mod rustls {
         use std::{convert::TryFrom, sync::Arc};
 
         use nautilus_cryptography::tls::create_tls_config;
@@ -52,7 +52,7 @@ mod encryption {
             tungstenite::{Error, error::TlsError, stream::Mode},
         };
 
-        pub async fn wrap_stream<S>(
+        pub(crate) async fn wrap_stream<S>(
             socket: S,
             domain: String,
             mode: Mode,
@@ -83,7 +83,7 @@ mod encryption {
         }
     }
 
-    pub mod plain {
+    pub(super) mod plain {
         use tokio::io::{AsyncRead, AsyncWrite};
         use tokio_tungstenite::{
             MaybeTlsStream,
@@ -93,7 +93,14 @@ mod encryption {
             },
         };
 
-        pub async fn wrap_stream<S>(socket: S, mode: Mode) -> Result<MaybeTlsStream<S>, Error>
+        #[expect(
+            clippy::unused_async,
+            reason = "signature mirrors the rustls variant which is genuinely async"
+        )]
+        pub(crate) async fn wrap_stream<S>(
+            socket: S,
+            mode: Mode,
+        ) -> Result<MaybeTlsStream<S>, Error>
         where
             S: 'static + AsyncRead + AsyncWrite + Send + Unpin,
         {
@@ -105,7 +112,7 @@ mod encryption {
     }
 }
 
-pub async fn tcp_tls<S>(
+pub(crate) async fn tcp_tls<S>(
     request: &Request,
     mode: Mode,
     stream: S,
@@ -133,7 +140,6 @@ where
 /// # Errors
 ///
 /// Returns an error if the request URI has no host component.
-#[allow(clippy::result_large_err)]
 fn domain(request: &Request) -> Result<String, Error> {
     match request.uri().host() {
         // rustls expects IPv6 addresses without the surrounding [] brackets
@@ -146,14 +152,17 @@ fn domain(request: &Request) -> Result<String, Error> {
     }
 }
 
-pub fn create_tls_config_from_certs_dir(
+pub(crate) fn create_tls_config_from_certs_dir(
     certs_dir: &Path,
     require_client_auth: bool,
 ) -> anyhow::Result<rustls::ClientConfig> {
     install_cryptographic_provider();
 
     if !certs_dir.is_dir() {
-        anyhow::bail!("Certificate path is not a directory: {certs_dir:?}");
+        anyhow::bail!(
+            "Certificate path is not a directory: {}",
+            certs_dir.display()
+        );
     }
 
     let mut all_certs: Vec<(std::path::PathBuf, Vec<CertificateDer<'static>>)> = Vec::new();
@@ -161,15 +170,19 @@ pub fn create_tls_config_from_certs_dir(
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    for entry in std::fs::read_dir(certs_dir)? {
-        let entry = entry?;
+    // Sort entries for deterministic cert/key selection across platforms
+    let mut entries: Vec<_> = std::fs::read_dir(certs_dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|e| e.path());
+
+    for entry in entries {
         let path = entry.path();
 
         if client_key.is_none()
             && let Ok(key) = load_private_key(&path)
         {
             client_key = Some(key);
-            continue;
+            // No early continue: a combined PEM carries the certificate alongside
+            // the key, so this file is still scanned for certificates below.
         }
 
         if let Ok(certs) = load_certs(&path)
@@ -179,10 +192,32 @@ pub fn create_tls_config_from_certs_dir(
         }
     }
 
-    // If key found, first cert becomes client cert; otherwise all certs are CA roots
-    let client_cert = if client_key.is_some() && !all_certs.is_empty() {
-        let (_, cert) = all_certs.remove(0);
-        Some(cert)
+    // If key found, find the matching client cert by trial validation
+    let client_cert = if let Some(ref key) = client_key
+        && !all_certs.is_empty()
+    {
+        let mut matched = None;
+
+        for i in 0..all_certs.len() {
+            let test_config = rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_client_auth_cert(all_certs[i].1.clone(), key.clone_key());
+
+            if test_config.is_ok() {
+                let (path, cert) = all_certs.remove(i);
+                log::debug!("Matched client certificate from {}", path.display());
+                matched = Some(cert);
+                break;
+            }
+        }
+
+        if matched.is_none() {
+            log::warn!(
+                "Private key found but no matching client certificate in {}",
+                certs_dir.display()
+            );
+        }
+        matched
     } else {
         None
     };
@@ -190,7 +225,7 @@ pub fn create_tls_config_from_certs_dir(
     for (path, certs) in all_certs {
         for cert in certs {
             if let Err(e) = root_store.add(cert) {
-                log::warn!("Invalid certificate in {path:?}: {e}");
+                log::warn!("Invalid certificate in {}: {e}", path.display());
             }
         }
     }
@@ -203,12 +238,14 @@ pub fn create_tls_config_from_certs_dir(
 
     if require_client_auth {
         anyhow::bail!(
-            "Client certificate or private key missing in {certs_dir:?} but client auth required",
+            "Client certificate or private key missing in {} but client auth required",
+            certs_dir.display(),
         );
     }
 
     log::debug!(
-        "No TLS client certificate/key pair found in {certs_dir:?}; proceeding without client authentication"
+        "No TLS client certificate/key pair found in {}; proceeding without client authentication",
+        certs_dir.display(),
     );
 
     Ok(builder.with_no_client_auth())
@@ -228,7 +265,13 @@ fn load_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
         return Ok(key.into());
     }
 
-    anyhow::bail!("No valid private key found in {path:?}");
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    if let Some(key) = rustls_pemfile::ec_private_keys(&mut reader).find_map(Result::ok) {
+        return Ok(key.into());
+    }
+
+    anyhow::bail!("No valid private key found in {}", path.display());
 }
 
 fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
@@ -288,6 +331,49 @@ R/mOrHN4JnUw91q5QdKxbsHGHR+pFl662Yc7pewJ8FloxoFxD6igZG/1TdpdK4ii
 zhxL/14wqaVBwUW6/RNRr9hz6MkFFC8Uced5obScy8kOI0bMbeIC4ftNGG9pUdms
 3BSW8BRUdXasnBkWIg==
 -----END CERTIFICATE-----";
+
+    fn generate_client_key_and_cert() -> (String, String) {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        (key_pair.serialize_pem(), cert.pem())
+    }
+
+    #[rstest]
+    fn test_combined_key_and_cert_pem_enables_client_auth() {
+        // Regression: a combined PEM (key + certificate in one file) used to
+        // have its certificate skipped, silently dropping client auth
+        let (key_pem, cert_pem) = generate_client_key_and_cert();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let combined_path = temp_dir.path().join("client.pem");
+        std::fs::write(&combined_path, format!("{key_pem}{cert_pem}")).unwrap();
+
+        let result = create_tls_config_from_certs_dir(temp_dir.path(), true);
+
+        assert!(
+            result.is_ok(),
+            "Combined key+cert PEM should satisfy client auth: {:?}",
+            result.err()
+        );
+    }
+
+    #[rstest]
+    fn test_separate_key_and_cert_files_enable_client_auth() {
+        let (key_pem, cert_pem) = generate_client_key_and_cert();
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("key.pem"), key_pem).unwrap();
+        std::fs::write(temp_dir.path().join("cert.pem"), cert_pem).unwrap();
+
+        let result = create_tls_config_from_certs_dir(temp_dir.path(), true);
+
+        assert!(
+            result.is_ok(),
+            "Separate key and cert files should satisfy client auth: {:?}",
+            result.err()
+        );
+    }
 
     #[rstest]
     fn test_ca_only_directory_succeeds() {

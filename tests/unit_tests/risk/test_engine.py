@@ -65,6 +65,7 @@ from nautilus_trader.model.objects import AccountBalance
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.orders import LimitOrder
 from nautilus_trader.model.orders.list import OrderList
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.risk.engine import RiskEngine
@@ -1059,6 +1060,104 @@ class TestRiskEngineWithCashAccount:
         # Assert
         assert order.status == OrderStatus.INITIALIZED
         assert self.exec_engine.command_count == 1  # Command reaches engine
+
+    def test_submit_order_when_negative_price_for_commodity_then_allows(self):
+        # Arrange
+        self.exec_engine.start()
+
+        commodity = TestInstrumentProvider.commodity()
+        self.cache.add_instrument(commodity)
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        # Prepare market
+        quote = TestDataStubs.quote_tick(instrument=commodity)
+        self.cache.add_quote_tick(quote)
+
+        order = strategy.order_factory.limit(
+            commodity.id,
+            OrderSide.BUY,
+            Quantity.from_int(1),
+            Price.from_str("-5.00"),  # Negative price is valid for spot commodities
+        )
+
+        submit_order = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=None,
+            order=order,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order)
+
+        # Assert
+        assert order.status == OrderStatus.INITIALIZED
+        assert self.exec_engine.command_count == 1  # Command reaches engine
+
+    @pytest.mark.parametrize(
+        ("instrument", "quantity", "expected_status", "expected_commands"),
+        [
+            (TestInstrumentProvider.commodity(), Quantity.from_int(1), OrderStatus.INITIALIZED, 1),
+            (_AUDUSD_SIM, Quantity.from_int(100_000), OrderStatus.DENIED, 0),
+        ],
+    )
+    def test_submit_order_when_zero_price_then_denies_unless_negative_prices_allowed(
+        self,
+        instrument,
+        quantity,
+        expected_status,
+        expected_commands,
+    ):
+        # Arrange
+        self.exec_engine.start()
+
+        self.cache.add_instrument(instrument)
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        # Prepare market
+        quote = TestDataStubs.quote_tick(instrument=instrument)
+        self.cache.add_quote_tick(quote)
+
+        order = strategy.order_factory.limit(
+            instrument.id,
+            OrderSide.BUY,
+            quantity,
+            Price.from_str("0.00"),  # Zero price shares the negative price gate
+        )
+
+        submit_order = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=None,
+            order=order,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order)
+
+        # Assert
+        assert order.status == expected_status
+        assert self.exec_engine.command_count == expected_commands
 
     def test_submit_order_when_invalid_trigger_price_then_denies(self):
         # Arrange
@@ -2074,7 +2173,7 @@ class TestRiskEngineWithCashAccount:
         assert order.status == OrderStatus.DENIED
         assert self.exec_engine.command_count == 0
 
-    def test_submit_order_with_quote_quantity_validates_against_effective_quantity(self):
+    def test_submit_order_with_quote_quantity_skips_min_max_quantity_check(self):
         # Arrange - Create BTCUSDT instrument with max_quantity = 83 BTC
         btc_usdt = CurrencyPair(
             instrument_id=InstrumentId(
@@ -2129,9 +2228,9 @@ class TestRiskEngineWithCashAccount:
         )
 
         # Create order with quote_quantity = 100 USDT
-        # Effective quantity: 100 USDT / $100,000 = 0.001 BTC
-        # Should be ALLOWED since 0.001 < 83 BTC max_quantity
-        # Before fix: Would compare 100 > 83 and incorrectly DENY
+        # Base-quantity bounds (min/max_quantity) are skipped for quote quantities;
+        # the venue is authoritative, so this order passes risk regardless of
+        # what the converted base quantity would be.
         order = strategy.order_factory.market(
             btc_usdt.id,
             OrderSide.BUY,
@@ -2151,11 +2250,11 @@ class TestRiskEngineWithCashAccount:
         # Act
         self.risk_engine.execute(submit_order)
 
-        # Assert - Order should be allowed (effective quantity 0.001 BTC < 83 BTC)
+        # Assert
         assert order.status == OrderStatus.INITIALIZED
         assert self.exec_engine.command_count == 1
 
-    def test_submit_order_with_quote_quantity_exceeds_max_after_conversion(self):
+    def test_submit_order_with_quote_quantity_does_not_deny_on_base_max_quantity(self):
         # Arrange - Create BTCUSDT instrument with max_quantity = 0.5 BTC (small limit)
         btc_usdt = CurrencyPair(
             instrument_id=InstrumentId(
@@ -2210,8 +2309,8 @@ class TestRiskEngineWithCashAccount:
         )
 
         # Create order with quote_quantity = 100,000 USDT
-        # Effective quantity: 100,000 USDT / $100,000 = 1 BTC
-        # Should be DENIED since 1 > 0.5 BTC max_quantity
+        # Converted base quantity (1 BTC) would exceed max_quantity (0.5 BTC), but
+        # base-quantity bounds do not apply to quote-denominated orders.
         order = strategy.order_factory.market(
             btc_usdt.id,
             OrderSide.BUY,
@@ -2231,7 +2330,162 @@ class TestRiskEngineWithCashAccount:
         # Act
         self.risk_engine.execute(submit_order)
 
-        # Assert - Order should be denied (effective quantity 1 BTC > 0.5 BTC)
+        # Assert
+        assert order.status == OrderStatus.INITIALIZED
+        assert self.exec_engine.command_count == 1
+
+    def test_submit_order_with_quote_quantity_does_not_deny_on_base_min_quantity(self):
+        # Arrange - Instrument carries a large base `min_quantity` (e.g. 5 shares),
+        # but a small quote order whose converted base quantity is below it should
+        # still be allowed. Mirrors the Polymarket scenario from #3874.
+        btc_usdt = CurrencyPair(
+            instrument_id=InstrumentId(
+                symbol=Symbol("BTCUSDT"),
+                venue=self.venue,
+            ),
+            raw_symbol=Symbol("BTCUSDT"),
+            base_currency=BTC,
+            quote_currency=USDT,
+            price_precision=1,
+            size_precision=6,
+            price_increment=Price(0.1, precision=1),
+            size_increment=Quantity(0.000001, precision=6),
+            lot_size=Quantity(0.000001, precision=6),
+            max_quantity=None,
+            min_quantity=Quantity(5, precision=6),
+            max_notional=None,
+            min_notional=Money(1, USDT),
+            max_price=None,
+            min_price=None,
+            margin_init=Decimal("0.1"),
+            margin_maint=Decimal("0.1"),
+            maker_fee=Decimal("-0.00005"),
+            taker_fee=Decimal("0.00015"),
+            ts_event=0,
+            ts_init=0,
+        )
+        self.cache.add_instrument(btc_usdt)
+
+        quote = QuoteTick(
+            instrument_id=btc_usdt.id,
+            bid_price=Price(99999.9, precision=1),
+            ask_price=Price(100000.0, precision=1),
+            bid_size=Quantity(1.0, precision=6),
+            ask_size=Quantity(1.0, precision=6),
+            ts_event=0,
+            ts_init=0,
+        )
+        self.cache.add_quote_tick(quote)
+
+        self.exec_engine.start()
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        # 10 USDT at $100k/BTC -> 0.0001 BTC, well under min_quantity of 5.
+        order = strategy.order_factory.market(
+            btc_usdt.id,
+            OrderSide.BUY,
+            Quantity.from_int(10),
+            quote_quantity=True,
+        )
+
+        submit_order = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=None,
+            order=order,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order)
+
+        # Assert
+        assert order.status == OrderStatus.INITIALIZED
+        assert self.exec_engine.command_count == 1
+
+    def test_submit_order_with_quote_quantity_still_enforces_min_notional(self):
+        # Arrange - Base-quantity bounds are skipped for quote-denominated orders,
+        # but `min_notional` still applies.
+        btc_usdt = CurrencyPair(
+            instrument_id=InstrumentId(
+                symbol=Symbol("BTCUSDT"),
+                venue=self.venue,
+            ),
+            raw_symbol=Symbol("BTCUSDT"),
+            base_currency=BTC,
+            quote_currency=USDT,
+            price_precision=1,
+            size_precision=6,
+            price_increment=Price(0.1, precision=1),
+            size_increment=Quantity(0.000001, precision=6),
+            lot_size=Quantity(0.000001, precision=6),
+            max_quantity=None,
+            min_quantity=None,
+            max_notional=None,
+            min_notional=Money(10, USDT),
+            max_price=None,
+            min_price=None,
+            margin_init=Decimal("0.1"),
+            margin_maint=Decimal("0.1"),
+            maker_fee=Decimal("-0.00005"),
+            taker_fee=Decimal("0.00015"),
+            ts_event=0,
+            ts_init=0,
+        )
+        self.cache.add_instrument(btc_usdt)
+
+        quote = QuoteTick(
+            instrument_id=btc_usdt.id,
+            bid_price=Price(99999.9, precision=1),
+            ask_price=Price(100000.0, precision=1),
+            bid_size=Quantity(1.0, precision=6),
+            ask_size=Quantity(1.0, precision=6),
+            ts_event=0,
+            ts_init=0,
+        )
+        self.cache.add_quote_tick(quote)
+
+        self.exec_engine.start()
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        # 1 USDT quote quantity, below the 10 USDT minimum notional.
+        order = strategy.order_factory.market(
+            btc_usdt.id,
+            OrderSide.BUY,
+            Quantity.from_int(1),
+            quote_quantity=True,
+        )
+
+        submit_order = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=None,
+            order=order,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order)
+
+        # Assert
         assert order.status == OrderStatus.DENIED
         assert self.exec_engine.command_count == 0
 
@@ -2592,6 +2846,113 @@ class TestRiskEngineWithCashAccount:
         assert stop_loss.status == OrderStatus.DENIED
         assert take_profit.status == OrderStatus.DENIED
         assert self.risk_engine.command_count == 1  # <-- Command never reaches engine
+
+    def test_submit_order_list_denies_when_non_representative_instrument_missing(self):
+        # Arrange: only the representative instrument is registered; the second
+        # instrument is intentionally missing from the cache.
+        self.exec_engine.start()
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        order_a = strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        order_b = strategy.order_factory.market(
+            _GBPUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        order_list = OrderList(
+            order_list_id=OrderListId("L-MISS-001"),
+            orders=[order_a, order_b],
+        )
+
+        submit_order_list = SubmitOrderList(
+            self.trader_id,
+            strategy.id,
+            order_list,
+            UUID4(),
+            self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order_list)
+
+        # Assert
+        assert order_a.status == OrderStatus.DENIED
+        assert order_b.status == OrderStatus.DENIED
+        assert "no instrument found" in order_a.last_event.reason
+        assert str(_GBPUSD_SIM.id) in order_a.last_event.reason
+
+    def test_submit_order_list_check_order_uses_each_orders_own_instrument(self):
+        # Arrange: both instruments registered; the second order's price violates
+        # its OWN instrument's precision but would be valid against the representative
+        # (which doesn't apply, since check_order must use each order's instrument).
+        self.exec_engine.start()
+        self.cache.add_instrument(_GBPUSD_SIM)
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        order_a = strategy.order_factory.limit(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+            Price.from_str("0.50000"),  # valid 5-dp
+        )
+        # Build the bad-precision order directly to bypass the order_factory's
+        # precision validation; the risk engine is the layer under test.
+        bad_price = Price.from_str("1.000001")  # 6-dp, violates GBP/USD 5-dp
+        assert bad_price.precision > _GBPUSD_SIM.price_precision
+        order_b = LimitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            instrument_id=_GBPUSD_SIM.id,
+            client_order_id=ClientOrderId("O-PREC-002"),
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100_000),
+            price=bad_price,
+            time_in_force=TimeInForce.GTC,
+            init_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        order_list = OrderList(
+            order_list_id=OrderListId("L-PREC-001"),
+            orders=[order_a, order_b],
+        )
+
+        submit_order_list = SubmitOrderList(
+            self.trader_id,
+            strategy.id,
+            order_list,
+            UUID4(),
+            self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order_list)
+
+        # Assert: only order_b is denied (price precision); order_a remains INITIALIZED
+        assert order_b.status == OrderStatus.DENIED
+        assert "price" in order_b.last_event.reason.lower()
+        assert order_a.status != OrderStatus.DENIED
 
     def test_submit_order_list_buys_when_trading_reducing_then_denies_orders(self):
         # Arrange
@@ -3059,6 +3420,144 @@ class TestRiskEngineWithCashAccount:
         # Assert
         assert self.exec_client.calls == ["_start", "submit_order", "modify_order"]
         assert self.risk_engine.command_count == 2
+        assert self.exec_engine.command_count == 2
+
+    def test_modify_order_when_negative_price_for_commodity_then_allows(self):
+        # Arrange
+        commodity = TestInstrumentProvider.commodity()
+        exec_client = MockExecutionClient(
+            client_id=ClientId(commodity.id.venue.value),
+            venue=commodity.id.venue,
+            account_type=AccountType.CASH,
+            base_currency=USD,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.portfolio.update_account(TestEventStubs.cash_account_state(AccountId("NYMEX-001")))
+        self.exec_engine.register_client(exec_client)
+
+        self.cache.add_instrument(commodity)
+
+        self.exec_engine.start()
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        # Prepare market
+        quote = TestDataStubs.quote_tick(instrument=commodity)
+        self.cache.add_quote_tick(quote)
+
+        order = strategy.order_factory.limit(
+            commodity.id,
+            OrderSide.BUY,
+            Quantity.from_int(1),
+            Price.from_str("5.00"),
+        )
+
+        submit = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=None,
+            order=order,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        modify = ModifyOrder(
+            self.trader_id,
+            strategy.id,
+            order.instrument_id,
+            order.client_order_id,
+            VenueOrderId("1"),
+            order.quantity,
+            Price.from_str("-5.00"),  # Negative price is valid for spot commodities
+            None,
+            UUID4(),
+            self.clock.timestamp_ns(),
+        )
+
+        self.risk_engine.execute(submit)
+
+        # Act
+        self.risk_engine.execute(modify)
+
+        # Assert
+        assert exec_client.calls == ["_start", "submit_order", "modify_order"]
+        assert self.risk_engine.command_count == 2
+        assert self.exec_engine.command_count == 2
+
+    def test_modify_order_when_risk_bypassed_sends_to_execution_engine(self):
+        # Arrange
+        self.msgbus.deregister("RiskEngine.execute", self.risk_engine.execute)
+        self.msgbus.deregister("RiskEngine.process", self.risk_engine.process)
+
+        risk_engine = RiskEngine(
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            config=RiskEngineConfig(bypass=True),
+        )
+
+        self.exec_engine.start()
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        # Prepare market
+        quote = TestDataStubs.quote_tick(instrument=_AUDUSD_SIM)
+        self.cache.add_quote_tick(quote)
+
+        order = strategy.order_factory.limit(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+            Price.from_str("1.00010"),
+        )
+
+        submit = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=None,
+            order=order,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        modify = ModifyOrder(
+            self.trader_id,
+            strategy.id,
+            order.instrument_id,
+            order.client_order_id,
+            VenueOrderId("1"),
+            order.quantity,
+            Price.from_str("-1.00010"),  # <- would be denied without bypass
+            None,
+            UUID4(),
+            self.clock.timestamp_ns(),
+        )
+
+        risk_engine.execute(submit)
+
+        # Act
+        risk_engine.execute(modify)
+
+        # Assert
+        assert self.exec_client.calls == ["_start", "submit_order", "modify_order"]
+        assert risk_engine.command_count == 2
         assert self.exec_engine.command_count == 2
 
     def test_modify_order_for_emulated_order_then_sends_to_emulator(self):

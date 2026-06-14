@@ -3,13 +3,43 @@
 
 from . import _libnautilus
 from . import adapters
+from . import analysis
+from . import backtest
+from . import common
 from . import core
+from . import cryptography
+from . import data
+from . import execution
+from . import indicators
 from . import infrastructure
+from . import live
 from . import model
+from . import network
+from . import persistence
+from . import portfolio
+from . import risk
+from . import serialization
+from . import testkit
+from . import trading
 
 __all__ = [
     "adapters",
+    "analysis",
+    "backtest",
+    "common",
     "core",
+    "cryptography",
+    "data",
+    "execution",
+    "indicators",
     "infrastructure",
+    "live",
     "model",
+    "network",
+    "persistence",
+    "portfolio",
+    "risk",
+    "serialization",
+    "testkit",
+    "trading",
 ]

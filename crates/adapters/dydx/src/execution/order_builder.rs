@@ -26,7 +26,7 @@
 //!
 //! The builder produces `cosmrs::Any` messages ready for transaction building.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use chrono::{DateTime, Duration, Utc};
 use cosmrs::Any;
@@ -53,7 +53,10 @@ use crate::{
     proto::{
         ToAny,
         dydxprotocol::{
-            clob::{MsgCancelOrder, MsgPlaceOrder, OrderId, msg_cancel_order::GoodTilOneof},
+            clob::{
+                MsgBatchCancel, MsgCancelOrder, MsgPlaceOrder, OrderBatch, OrderId,
+                msg_cancel_order::GoodTilOneof,
+            },
             subaccounts::SubaccountId,
         },
     },
@@ -101,7 +104,7 @@ impl OrderMessageBuilder {
 
     /// Returns the maximum duration (in seconds) for short-term orders.
     ///
-    /// Computed as: `SHORT_TERM_ORDER_MAXIMUM_LIFETIME (20 blocks) × seconds_per_block`
+    /// Computed as: `SHORT_TERM_ORDER_MAXIMUM_LIFETIME (40 blocks) × seconds_per_block`
     ///
     /// Uses dynamic block time from `BlockTimeMonitor` when available,
     /// falling back to 500ms/block when insufficient samples.
@@ -219,7 +222,7 @@ impl OrderMessageBuilder {
     /// # Errors
     ///
     /// Returns an error if market parameters cannot be retrieved or order building fails.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn build_limit_order(
         &self,
         instrument_id: InstrumentId,
@@ -472,6 +475,50 @@ impl OrderMessageBuilder {
             .collect()
     }
 
+    /// Builds a `MsgBatchCancel` message for batch-cancelling short-term orders.
+    ///
+    /// Groups orders by `clob_pair_id` and creates a single `MsgBatchCancel` message
+    /// that cancels all listed short-term orders in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if market parameters cannot be retrieved for any instrument.
+    pub fn build_batch_cancel_short_term(
+        &self,
+        orders: &[(InstrumentId, u32)],
+        block_height: u32,
+    ) -> Result<Any, DydxError> {
+        // Group client_ids by clob_pair_id
+        let mut clob_groups: HashMap<u32, Vec<u32>> = HashMap::new();
+
+        for (instrument_id, client_order_id) in orders {
+            let market_params = self.get_market_params(*instrument_id)?;
+            clob_groups
+                .entry(market_params.clob_pair_id)
+                .or_default()
+                .push(*client_order_id);
+        }
+
+        let short_term_cancels: Vec<OrderBatch> = clob_groups
+            .into_iter()
+            .map(|(clob_pair_id, client_ids)| OrderBatch {
+                clob_pair_id,
+                client_ids,
+            })
+            .collect();
+
+        let msg = MsgBatchCancel {
+            subaccount_id: Some(SubaccountId {
+                owner: self.wallet_address.clone(),
+                number: self.subaccount_number,
+            }),
+            short_term_cancels,
+            good_til_block: block_height + SHORT_TERM_ORDER_MAXIMUM_LIFETIME,
+        };
+
+        Ok(msg.to_any())
+    }
+
     /// Builds a cancel-and-replace batch for order modification.
     ///
     /// Returns `[MsgCancelOrder, MsgPlaceOrder]` as a single atomic transaction.
@@ -494,7 +541,7 @@ impl OrderMessageBuilder {
     /// # Errors
     ///
     /// Returns an error if cancellation or replacement order fails to build.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn build_cancel_and_replace(
         &self,
         instrument_id: InstrumentId,
@@ -558,7 +605,7 @@ impl OrderMessageBuilder {
     /// # Errors
     ///
     /// Returns an error if market parameters cannot be retrieved or order building fails.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn build_conditional_order(
         &self,
         instrument_id: InstrumentId,
@@ -622,6 +669,7 @@ impl OrderMessageBuilder {
 
         // Apply time-in-force for limit orders
         let effective_tif = time_in_force.unwrap_or(TimeInForce::Gtc);
+
         if matches!(
             order_type,
             ConditionalOrderType::StopLimit | ConditionalOrderType::TakeProfitLimit
@@ -650,7 +698,7 @@ impl OrderMessageBuilder {
     /// # Errors
     ///
     /// Returns an error if the conditional order fails to build.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn build_stop_market_order(
         &self,
         instrument_id: InstrumentId,
@@ -683,7 +731,7 @@ impl OrderMessageBuilder {
     /// # Errors
     ///
     /// Returns an error if the conditional order fails to build.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn build_stop_limit_order(
         &self,
         instrument_id: InstrumentId,
@@ -719,7 +767,7 @@ impl OrderMessageBuilder {
     /// # Errors
     ///
     /// Returns an error if the conditional order fails to build.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn build_take_profit_market_order(
         &self,
         instrument_id: InstrumentId,
@@ -752,7 +800,7 @@ impl OrderMessageBuilder {
     /// # Errors
     ///
     /// Returns an error if the conditional order fails to build.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn build_take_profit_limit_order(
         &self,
         instrument_id: InstrumentId,
@@ -800,7 +848,7 @@ impl OrderMessageBuilder {
         Ok(OrderMarketParams {
             atomic_resolution: market.atomic_resolution,
             clob_pair_id: market.clob_pair_id,
-            oracle_price: Some(market.oracle_price),
+            oracle_price: market.oracle_price,
             quantum_conversion_exponent: market.quantum_conversion_exponent,
             step_base_quantums: market.step_base_quantums,
             subticks_per_tick: market.subticks_per_tick,

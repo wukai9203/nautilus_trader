@@ -13,255 +13,67 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Builder fee approval and verification functionality.
+//! Builder fee approval and revocation for Hyperliquid.
 //!
-//! Note: Hyperliquid uses non-standard EIP-712 type names with colons
-//! (e.g., "HyperliquidTransaction:ApproveBuilderFee") which cannot be
-//! represented using alloy's `sol!` macro. The struct hash is computed
-//! manually while the domain uses alloy's `Eip712Domain`.
+//! Hyperliquid rejects orders that carry a builder address from a wallet that has
+//! never approved a builder fee, even when the order fee is zero. This module signs
+//! the one-time EIP-712 `ApproveBuilderFee` action at a 0% max fee rate, enabling
+//! the zero-fee Nautilus builder attribution without ever charging a fee.
+//!
+//! Revocation signs the same action at the same 0% rate: it caps any previously
+//! approved builder fee at zero (for example, an approval from a version that
+//! charged builder fees).
+//!
+//! The action must be signed by the master wallet's private key; agent (API)
+//! wallets cannot sign `ApproveBuilderFee`.
 
 use std::{
     collections::HashMap,
+    env,
     io::{self, Write},
     str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread,
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
+use alloy::{
+    signers::{SignerSync, local::PrivateKeySigner},
+    sol_types::eip712_domain,
+};
 use alloy_primitives::{Address, B256, keccak256};
-use alloy_signer::SignerSync;
-use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::Eip712Domain;
 use nautilus_network::http::{HttpClient, Method};
 use serde::{Deserialize, Serialize};
 
-use super::consts::{
-    NAUTILUS_BUILDER_FEE_ADDRESS, NAUTILUS_BUILDER_FEE_TENTHS_BP, exchange_url, info_url,
+use super::{
+    consts::{HYPERLIQUID_CHAIN_ID, NAUTILUS_BUILDER_ADDRESS, exchange_url},
+    enums::HyperliquidEnvironment,
 };
-use crate::{common::credential::EvmPrivateKey, http::error::Result};
+use crate::{
+    common::credential::EvmPrivateKey,
+    http::{
+        error::{Error, Result},
+        models::{HyperliquidSignature, RESPONSE_STATUS_OK},
+    },
+};
 
-/// Builder fee approval rate (0.01% = 1 basis point).
-const APPROVAL_FEE_RATE: &str = "0.01%";
-
-/// Hyperliquid signing chain ID (0x66eee = 421614 decimal).
-const HYPERLIQUID_CHAIN_ID: u64 = 421614;
-
-/// Information about the Nautilus builder fee configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BuilderFeeInfo {
-    /// The builder address that receives fees.
-    pub address: String,
-    /// Fee rate for perpetuals in basis points.
-    pub perp_rate_bps: u32,
-    /// Fee rate for spot in basis points.
-    pub spot_rate_bps: u32,
-    /// The approval rate required (covers both products).
-    pub approval_rate: String,
-}
-
-impl Default for BuilderFeeInfo {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BuilderFeeInfo {
-    /// Creates builder fee info from the hardcoded constants.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            address: NAUTILUS_BUILDER_FEE_ADDRESS.to_string(),
-            perp_rate_bps: NAUTILUS_BUILDER_FEE_TENTHS_BP / 10, // Convert tenths to bps
-            spot_rate_bps: NAUTILUS_BUILDER_FEE_TENTHS_BP / 10,
-            approval_rate: APPROVAL_FEE_RATE.to_string(),
-        }
-    }
-
-    /// Prints the builder fee configuration to stdout.
-    pub fn print(&self) {
-        let separator = "=".repeat(60);
-
-        println!("{separator}");
-        println!("NautilusTrader Hyperliquid Builder Fee Configuration");
-        println!("{separator}");
-        println!();
-        println!("Builder address: {}", self.address);
-        println!();
-        let bp_label = |n: u32| {
-            if n == 1 {
-                "basis point"
-            } else {
-                "basis points"
-            }
-        };
-        println!("Fee rates charged per fill:");
-        println!(
-            "  - Perpetuals: {:.2}% ({} {})",
-            self.perp_rate_bps as f64 / 100.0,
-            self.perp_rate_bps,
-            bp_label(self.perp_rate_bps)
-        );
-        println!(
-            "  - Spot sells: {:.2}% ({} {})",
-            self.spot_rate_bps as f64 / 100.0,
-            self.spot_rate_bps,
-            bp_label(self.spot_rate_bps)
-        );
-        println!();
-        println!("These fees are charged in addition to Hyperliquid's standard fees.");
-        println!();
-        println!("This is at the low end of ecosystem norms.");
-        println!("Hyperliquid allows up to 0.1% (10 bps) for perps and 1% (100 bps) for spot.");
-        println!();
-        println!("Source: crates/adapters/hyperliquid/src/common/consts.rs");
-        println!("{separator}");
-    }
-}
+// Zero max fee rate: approval enables attribution without ever permitting a
+// charge, revocation caps any previously approved rate at zero.
+const ZERO_FEE_RATE: &str = "0%";
 
 /// Result of a builder fee approval request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuilderFeeApprovalResult {
-    /// Whether the approval was successful.
+    /// Whether the request was successful.
     pub success: bool,
     /// The status returned by Hyperliquid.
     pub status: String,
     /// Optional response message or error details.
     pub message: Option<String>,
-    /// The wallet address that made the approval.
+    /// The wallet address that made the request.
     pub wallet_address: String,
-    /// The builder address that was approved.
+    /// The builder address.
     pub builder_address: String,
     /// Whether this was on testnet.
     pub is_testnet: bool,
-}
-
-/// Approves the Nautilus builder fee for a wallet.
-///
-/// This signs an EIP-712 `ApproveBuilderFee` action and submits it to Hyperliquid.
-/// The approval allows NautilusTrader to include builder fees on orders for this wallet.
-///
-/// # Arguments
-///
-/// * `private_key` - The EVM private key (hex string with or without 0x prefix)
-/// * `is_testnet` - Whether to use testnet or mainnet
-///
-/// # Returns
-///
-/// The result of the approval request.
-///
-/// # Errors
-///
-/// Returns an error if the private key is invalid, signing fails, or the HTTP request fails.
-///
-/// # Panics
-///
-/// Panics if the JSON response structure is unexpected.
-pub async fn approve_builder_fee(
-    private_key: &str,
-    is_testnet: bool,
-) -> Result<BuilderFeeApprovalResult> {
-    let pk = EvmPrivateKey::new(private_key.to_string())?;
-    let wallet_address = derive_address(&pk)?;
-
-    let nonce = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|e| crate::http::error::Error::transport(format!("Time error: {e}")))?
-        .as_millis() as u64;
-
-    let signature = sign_approve_builder_fee(&pk, is_testnet, nonce, APPROVAL_FEE_RATE)?;
-
-    let action = serde_json::json!({
-        "type": "approveBuilderFee",
-        "hyperliquidChain": if is_testnet { "Testnet" } else { "Mainnet" },
-        "signatureChainId": "0x66eee",
-        "maxFeeRate": APPROVAL_FEE_RATE,
-        "builder": NAUTILUS_BUILDER_FEE_ADDRESS,
-        "nonce": nonce,
-    });
-
-    let payload = serde_json::json!({
-        "action": action,
-        "nonce": nonce,
-        "signature": signature,
-    });
-
-    let url = exchange_url(is_testnet);
-    let client =
-        HttpClient::new(HashMap::new(), vec![], vec![], None, None, None).map_err(|e| {
-            crate::http::error::Error::transport(format!("Failed to create client: {e}"))
-        })?;
-
-    let body_bytes = serde_json::to_vec(&payload)
-        .map_err(|e| crate::http::error::Error::transport(format!("Failed to serialize: {e}")))?;
-
-    let headers = HashMap::from([("Content-Type".to_string(), "application/json".to_string())]);
-    let response = client
-        .request(
-            Method::POST,
-            url.to_string(),
-            None,
-            Some(headers),
-            Some(body_bytes),
-            None,
-            None,
-        )
-        .await
-        .map_err(|e| crate::http::error::Error::transport(format!("HTTP request failed: {e}")))?;
-
-    if !response.status.is_success() {
-        let body_str = String::from_utf8_lossy(&response.body);
-        return Err(crate::http::error::Error::transport(format!(
-            "HTTP {} from {url}: {}",
-            response.status.as_u16(),
-            if body_str.is_empty() {
-                "(empty response)"
-            } else {
-                &body_str
-            }
-        )));
-    }
-
-    let response_json: serde_json::Value = serde_json::from_slice(&response.body).map_err(|e| {
-        let body_str = String::from_utf8_lossy(&response.body);
-        crate::http::error::Error::transport(format!(
-            "Failed to parse JSON response from {url}: {e}. Body: {}",
-            if body_str.is_empty() {
-                "(empty)"
-            } else if body_str.len() > 200 {
-                &body_str[..200]
-            } else {
-                &body_str
-            }
-        ))
-    })?;
-
-    let status = response_json
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let success = status == "ok";
-    let message = response_json.get("response").map(|v: &serde_json::Value| {
-        if v.is_string() {
-            v.as_str().unwrap().to_string()
-        } else {
-            v.to_string()
-        }
-    });
-
-    Ok(BuilderFeeApprovalResult {
-        success,
-        status,
-        message,
-        wallet_address,
-        builder_address: NAUTILUS_BUILDER_FEE_ADDRESS.to_string(),
-        is_testnet,
-    })
 }
 
 /// Approves the Nautilus builder fee using environment variables.
@@ -271,55 +83,128 @@ pub async fn approve_builder_fee(
 /// - Mainnet: `HYPERLIQUID_PK`
 ///
 /// Set `HYPERLIQUID_TESTNET=true` to use testnet.
-///
-/// Prints progress and results to stdout.
-///
-/// # Arguments
-///
-/// * `non_interactive` - If true, skip confirmation prompt
-///
-/// # Returns
-///
-/// `true` if approval succeeded, `false` otherwise.
 pub async fn approve_from_env(non_interactive: bool) -> bool {
-    let is_testnet = std::env::var("HYPERLIQUID_TESTNET").is_ok_and(|v| v.to_lowercase() == "true");
-
-    let env_var = if is_testnet {
-        "HYPERLIQUID_TESTNET_PK"
-    } else {
-        "HYPERLIQUID_PK"
+    let is_testnet = testnet_from_env();
+    let Some(private_key) = private_key_from_env(is_testnet) else {
+        return false;
     };
-
-    let private_key = match std::env::var(env_var) {
-        Ok(pk) => pk,
-        Err(_) => {
-            println!("Error: {env_var} environment variable not set");
-            return false;
-        }
-    };
-
-    let info = BuilderFeeInfo::new();
     let network = if is_testnet { "testnet" } else { "mainnet" };
 
-    println!("Approving Nautilus builder fee on {network}");
-    println!("Builder address: {}", info.address);
-    println!(
-        "Approval rate: {} (1 basis point, covers perps and spot sells)",
-        info.approval_rate
-    );
+    println!("Approving Nautilus builder attribution on {network}");
+    println!("Builder address: {NAUTILUS_BUILDER_ADDRESS}");
+    println!("Max fee rate: {ZERO_FEE_RATE} (attribution only, no fees are charged)");
     println!();
-    println!("This is at the low end of ecosystem norms.");
-    println!("Hyperliquid allows up to 0.1% (10 bps) for perps and 1% (100 bps) for spot.");
+    println!("This signs a one-time ApproveBuilderFee action so orders can carry the");
+    println!("Nautilus builder address. The action must be signed by the master wallet.");
     println!();
 
-    if !non_interactive && !wait_for_confirmation("Press Enter to approve or Ctrl+C to cancel... ")
+    if !non_interactive
+        && !wait_for_confirmation("Press Enter to approve or Ctrl+C to cancel... ").await
     {
         return false;
     }
 
     println!("Approving builder fee...");
 
-    match approve_builder_fee(&private_key, is_testnet).await {
+    report_result(
+        approve_builder_fee(&private_key, is_testnet).await,
+        "Builder fee approved successfully.",
+        "Approval may have failed. Check the response above.",
+    )
+}
+
+/// Revokes the Nautilus builder fee using environment variables.
+///
+/// Reads private key from environment:
+/// - Testnet: `HYPERLIQUID_TESTNET_PK`
+/// - Mainnet: `HYPERLIQUID_PK`
+///
+/// Set `HYPERLIQUID_TESTNET=true` to use testnet.
+pub async fn revoke_from_env(non_interactive: bool) -> bool {
+    let is_testnet = testnet_from_env();
+    let Some(private_key) = private_key_from_env(is_testnet) else {
+        return false;
+    };
+    let network = if is_testnet { "testnet" } else { "mainnet" };
+
+    println!("Revoking Nautilus builder fee on {network}");
+    println!("Builder address: {NAUTILUS_BUILDER_ADDRESS}");
+    println!();
+
+    if !non_interactive
+        && !wait_for_confirmation("Press Enter to revoke or Ctrl+C to cancel... ").await
+    {
+        return false;
+    }
+
+    println!("Revoking builder fee...");
+
+    report_result(
+        revoke_builder_fee(&private_key, is_testnet).await,
+        "Builder fee revoked successfully.",
+        "Revocation may have failed. Check the response above.",
+    )
+}
+
+/// Approves the Nautilus builder fee for a wallet.
+///
+/// This signs an EIP-712 `ApproveBuilderFee` action with a 0% max fee rate and
+/// submits it to Hyperliquid, permitting the zero-fee builder attribution.
+///
+/// # Errors
+///
+/// Returns an error if the private key is invalid, signing fails, or the
+/// request cannot be submitted.
+pub async fn approve_builder_fee(
+    private_key: &str,
+    is_testnet: bool,
+) -> Result<BuilderFeeApprovalResult> {
+    submit_builder_fee_update(private_key, is_testnet).await
+}
+
+/// Revokes the Nautilus builder fee approval for a wallet.
+///
+/// This signs an EIP-712 `ApproveBuilderFee` action with a 0% max fee rate and
+/// submits it to Hyperliquid, capping any previously approved builder fee at
+/// zero so no fee can be charged.
+///
+/// # Errors
+///
+/// Returns an error if the private key is invalid, signing fails, or the
+/// request cannot be submitted.
+pub async fn revoke_builder_fee(
+    private_key: &str,
+    is_testnet: bool,
+) -> Result<BuilderFeeApprovalResult> {
+    submit_builder_fee_update(private_key, is_testnet).await
+}
+
+fn testnet_from_env() -> bool {
+    env::var("HYPERLIQUID_TESTNET").is_ok_and(|v| v.to_lowercase() == "true" || v == "1")
+}
+
+fn private_key_from_env(is_testnet: bool) -> Option<String> {
+    let env_var = if is_testnet {
+        "HYPERLIQUID_TESTNET_PK"
+    } else {
+        "HYPERLIQUID_PK"
+    };
+
+    match env::var(env_var) {
+        Ok(pk) => Some(pk),
+        Err(_) => {
+            println!("Error: {env_var} environment variable not set");
+            None
+        }
+    }
+}
+
+fn report_result(
+    result: Result<BuilderFeeApprovalResult>,
+    success_msg: &str,
+    failure_msg: &str,
+) -> bool {
+    match result {
         Ok(result) => {
             println!();
             println!("Wallet address: {}", result.wallet_address);
@@ -330,15 +215,9 @@ pub async fn approve_from_env(non_interactive: bool) -> bool {
             println!();
 
             if result.success {
-                println!("Builder fee approved successfully!");
-                println!("You can now trade on Hyperliquid via NautilusTrader.");
-                println!();
-                println!("To verify approval status at any time, run:");
-                println!(
-                    "  python nautilus_trader/adapters/hyperliquid/scripts/builder_fee_verify.py"
-                );
+                println!("{success_msg}");
             } else {
-                println!("Approval may have failed. Check the response above.");
+                println!("{failure_msg}");
             }
 
             result.success
@@ -350,48 +229,20 @@ pub async fn approve_from_env(non_interactive: bool) -> bool {
     }
 }
 
-/// Revoke fee rate (0% effectively blocks the builder).
-const REVOKE_FEE_RATE: &str = "0%";
-
-/// Revokes the Nautilus builder fee approval for a wallet.
-///
-/// This signs an EIP-712 `ApproveBuilderFee` action with a 0% rate and submits
-/// it to Hyperliquid, effectively revoking the builder's permission.
-///
-/// # Arguments
-///
-/// * `private_key` - The EVM private key (hex string with or without 0x prefix)
-/// * `is_testnet` - Whether to use testnet or mainnet
-///
-/// # Returns
-///
-/// The result of the revoke request.
-///
-/// # Panics
-///
-/// Panics if the response contains invalid JSON structure.
-pub async fn revoke_builder_fee(
+async fn submit_builder_fee_update(
     private_key: &str,
     is_testnet: bool,
 ) -> Result<BuilderFeeApprovalResult> {
-    let pk = EvmPrivateKey::new(private_key.to_string())?;
+    let pk = EvmPrivateKey::new(private_key)?;
     let wallet_address = derive_address(&pk)?;
 
     let nonce = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|e| crate::http::error::Error::transport(format!("Time error: {e}")))?
+        .map_err(|e| Error::transport(format!("Time error: {e}")))?
         .as_millis() as u64;
 
-    let signature = sign_approve_builder_fee(&pk, is_testnet, nonce, REVOKE_FEE_RATE)?;
-
-    let action = serde_json::json!({
-        "type": "approveBuilderFee",
-        "hyperliquidChain": if is_testnet { "Testnet" } else { "Mainnet" },
-        "signatureChainId": "0x66eee",
-        "maxFeeRate": REVOKE_FEE_RATE,
-        "builder": NAUTILUS_BUILDER_FEE_ADDRESS,
-        "nonce": nonce,
-    });
+    let signature = sign_approve_builder_fee(&pk, is_testnet, nonce, ZERO_FEE_RATE)?;
+    let action = build_approval_action(is_testnet, nonce);
 
     let payload = serde_json::json!({
         "action": action,
@@ -399,14 +250,18 @@ pub async fn revoke_builder_fee(
         "signature": signature,
     });
 
-    let url = exchange_url(is_testnet);
-    let client =
-        HttpClient::new(HashMap::new(), vec![], vec![], None, None, None).map_err(|e| {
-            crate::http::error::Error::transport(format!("Failed to create client: {e}"))
-        })?;
+    let environment = if is_testnet {
+        HyperliquidEnvironment::Testnet
+    } else {
+        HyperliquidEnvironment::Mainnet
+    };
+    let url = exchange_url(environment);
+
+    let client = HttpClient::new(HashMap::new(), vec![], vec![], None, Some(60), None)
+        .map_err(|e| Error::transport(format!("Failed to create client: {e}")))?;
 
     let body_bytes = serde_json::to_vec(&payload)
-        .map_err(|e| crate::http::error::Error::transport(format!("Failed to serialize: {e}")))?;
+        .map_err(|e| Error::transport(format!("Failed to serialize: {e}")))?;
 
     let headers = HashMap::from([("Content-Type".to_string(), "application/json".to_string())]);
     let response = client
@@ -420,11 +275,11 @@ pub async fn revoke_builder_fee(
             None,
         )
         .await
-        .map_err(|e| crate::http::error::Error::transport(format!("HTTP request failed: {e}")))?;
+        .map_err(|e| Error::transport(format!("HTTP request failed: {e}")))?;
 
     if !response.status.is_success() {
         let body_str = String::from_utf8_lossy(&response.body);
-        return Err(crate::http::error::Error::transport(format!(
+        return Err(Error::transport(format!(
             "HTTP {} from {url}: {}",
             response.status.as_u16(),
             if body_str.is_empty() {
@@ -437,14 +292,13 @@ pub async fn revoke_builder_fee(
 
     let response_json: serde_json::Value = serde_json::from_slice(&response.body).map_err(|e| {
         let body_str = String::from_utf8_lossy(&response.body);
-        crate::http::error::Error::transport(format!(
+        let preview: String = body_str.chars().take(200).collect();
+        Error::transport(format!(
             "Failed to parse JSON response from {url}: {e}. Body: {}",
-            if body_str.is_empty() {
+            if preview.is_empty() {
                 "(empty)"
-            } else if body_str.len() > 200 {
-                &body_str[..200]
             } else {
-                &body_str
+                &preview
             }
         ))
     })?;
@@ -455,13 +309,10 @@ pub async fn revoke_builder_fee(
         .unwrap_or("unknown")
         .to_string();
 
-    let success = status == "ok";
-    let message = response_json.get("response").map(|v: &serde_json::Value| {
-        if v.is_string() {
-            v.as_str().unwrap().to_string()
-        } else {
-            v.to_string()
-        }
+    let success = status == RESPONSE_STATUS_OK;
+    let message = response_json.get("response").map(|v| match v.as_str() {
+        Some(s) => s.to_string(),
+        None => v.to_string(),
     });
 
     Ok(BuilderFeeApprovalResult {
@@ -469,292 +320,20 @@ pub async fn revoke_builder_fee(
         status,
         message,
         wallet_address,
-        builder_address: NAUTILUS_BUILDER_FEE_ADDRESS.to_string(),
+        builder_address: NAUTILUS_BUILDER_ADDRESS.to_string(),
         is_testnet,
     })
 }
 
-/// Revokes the Nautilus builder fee using environment variables.
-///
-/// Reads private key from environment:
-/// - Testnet: `HYPERLIQUID_TESTNET_PK`
-/// - Mainnet: `HYPERLIQUID_PK`
-///
-/// Set `HYPERLIQUID_TESTNET=true` to use testnet.
-///
-/// Prints progress and results to stdout.
-///
-/// # Arguments
-///
-/// * `non_interactive` - If true, skip confirmation prompt
-///
-/// # Returns
-///
-/// `true` if revocation succeeded, `false` otherwise.
-pub async fn revoke_from_env(non_interactive: bool) -> bool {
-    let is_testnet = std::env::var("HYPERLIQUID_TESTNET").is_ok_and(|v| v.to_lowercase() == "true");
-
-    let env_var = if is_testnet {
-        "HYPERLIQUID_TESTNET_PK"
-    } else {
-        "HYPERLIQUID_PK"
-    };
-
-    let private_key = match std::env::var(env_var) {
-        Ok(pk) => pk,
-        Err(_) => {
-            println!("Error: {env_var} environment variable not set");
-            return false;
-        }
-    };
-
-    let network = if is_testnet { "testnet" } else { "mainnet" };
-
-    println!("Revoking Nautilus builder fee on {network}");
-    println!("Builder address: {NAUTILUS_BUILDER_FEE_ADDRESS}");
-    println!();
-    println!("WARNING: After revoking, you will not be able to trade on");
-    println!("Hyperliquid via NautilusTrader until you re-approve.");
-    println!();
-
-    if !non_interactive && !wait_for_confirmation("Press Enter to revoke or Ctrl+C to cancel... ") {
-        return false;
-    }
-
-    println!("Revoking builder fee...");
-
-    match revoke_builder_fee(&private_key, is_testnet).await {
-        Ok(result) => {
-            println!();
-            println!("Wallet address: {}", result.wallet_address);
-            println!("Status: {}", result.status);
-            if let Some(msg) = &result.message {
-                println!("Response: {msg}");
-            }
-            println!();
-
-            if result.success {
-                println!("Builder fee revoked successfully.");
-                println!("You will need to re-approve to trade via NautilusTrader.");
-            } else {
-                println!("Revocation may have failed. Check the response above.");
-            }
-
-            result.success
-        }
-        Err(e) => {
-            println!("Error: {e}");
-            false
-        }
-    }
-}
-
-/// Result of a builder fee verification query.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BuilderFeeVerifyResult {
-    /// The wallet address that was checked.
-    pub wallet_address: String,
-    /// The builder address that was checked.
-    pub builder_address: String,
-    /// The approved fee rate as a string (e.g., "1%"), or None if not approved.
-    pub approved_rate: Option<String>,
-    /// The required fee rate for NautilusTrader.
-    pub required_rate: String,
-    /// Whether the approval is sufficient.
-    pub is_approved: bool,
-    /// Whether this was on testnet.
-    pub is_testnet: bool,
-}
-
-/// Verifies builder fee approval status for a wallet.
-///
-/// Queries the Hyperliquid `maxBuilderFee` info endpoint to check if the
-/// wallet has approved the Nautilus builder fee at the required rate.
-///
-/// # Arguments
-///
-/// * `wallet_address` - The wallet address to check (hex string with 0x prefix)
-/// * `is_testnet` - Whether to use testnet or mainnet
-///
-/// # Returns
-///
-/// The verification result including approval status.
-pub async fn verify_builder_fee(
-    wallet_address: &str,
-    is_testnet: bool,
-) -> Result<BuilderFeeVerifyResult> {
-    let url = info_url(is_testnet);
-    let client =
-        HttpClient::new(HashMap::new(), vec![], vec![], None, None, None).map_err(|e| {
-            crate::http::error::Error::transport(format!("Failed to create client: {e}"))
-        })?;
-
-    let payload = serde_json::json!({
-        "type": "maxBuilderFee",
-        "user": wallet_address,
-        "builder": NAUTILUS_BUILDER_FEE_ADDRESS,
-    });
-
-    let body_bytes = serde_json::to_vec(&payload)
-        .map_err(|e| crate::http::error::Error::transport(format!("Failed to serialize: {e}")))?;
-
-    let headers = HashMap::from([("Content-Type".to_string(), "application/json".to_string())]);
-    let response = client
-        .request(
-            Method::POST,
-            url.to_string(),
-            None,
-            Some(headers),
-            Some(body_bytes),
-            None,
-            None,
-        )
-        .await
-        .map_err(|e| crate::http::error::Error::transport(format!("HTTP request failed: {e}")))?;
-
-    if !response.status.is_success() {
-        let body_str = String::from_utf8_lossy(&response.body);
-        return Err(crate::http::error::Error::transport(format!(
-            "HTTP {} from {url}: {}",
-            response.status.as_u16(),
-            if body_str.is_empty() {
-                "(empty response)"
-            } else {
-                &body_str
-            }
-        )));
-    }
-
-    // API returns fee in tenths of basis points (e.g., 1000 = 1%) or "null"
-    let response_text = String::from_utf8_lossy(&response.body).trim().to_string();
-    let approved_tenths_bp: Option<u32> = if response_text == "null" {
-        None
-    } else {
-        response_text.parse().ok()
-    };
-
-    let approved_rate = approved_tenths_bp.map(|tenths| {
-        let bps = tenths as f64 / 10.0;
-        let percent = bps / 100.0;
-        format!("{percent}%")
-    });
-    let is_approved = approved_tenths_bp.is_some_and(|tenths| tenths >= 10);
-
-    Ok(BuilderFeeVerifyResult {
-        wallet_address: wallet_address.to_string(),
-        builder_address: NAUTILUS_BUILDER_FEE_ADDRESS.to_string(),
-        approved_rate,
-        required_rate: APPROVAL_FEE_RATE.to_string(),
-        is_approved,
-        is_testnet,
+fn build_approval_action(is_testnet: bool, nonce: u64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "approveBuilderFee",
+        "hyperliquidChain": if is_testnet { "Testnet" } else { "Mainnet" },
+        "signatureChainId": format!("{HYPERLIQUID_CHAIN_ID:#x}"),
+        "maxFeeRate": ZERO_FEE_RATE,
+        "builder": NAUTILUS_BUILDER_ADDRESS,
+        "nonce": nonce,
     })
-}
-
-/// Verifies builder fee approval using an optional wallet address or environment variables.
-///
-/// If `wallet_address` is provided, uses it directly. Otherwise reads private key
-/// from environment to derive wallet address:
-/// - Testnet: `HYPERLIQUID_TESTNET_PK`
-/// - Mainnet: `HYPERLIQUID_PK`
-///
-/// Set `HYPERLIQUID_TESTNET=true` to use testnet.
-///
-/// Prints verification results to stdout.
-///
-/// # Returns
-///
-/// `true` if builder fee is approved at the required rate, `false` otherwise.
-pub async fn verify_from_env_or_address(wallet_address: Option<String>) -> bool {
-    let is_testnet = std::env::var("HYPERLIQUID_TESTNET").is_ok_and(|v| v.to_lowercase() == "true");
-
-    let wallet_address = match wallet_address {
-        Some(addr) => addr,
-        None => {
-            // Fall back to deriving from private key
-            let env_var = if is_testnet {
-                "HYPERLIQUID_TESTNET_PK"
-            } else {
-                "HYPERLIQUID_PK"
-            };
-
-            let private_key = match std::env::var(env_var) {
-                Ok(pk) => pk,
-                Err(_) => {
-                    println!("Error: No wallet address provided and {env_var} not set");
-                    return false;
-                }
-            };
-
-            let pk = match EvmPrivateKey::new(private_key) {
-                Ok(pk) => pk,
-                Err(e) => {
-                    println!("Error: Invalid private key: {e}");
-                    return false;
-                }
-            };
-
-            match derive_address(&pk) {
-                Ok(addr) => addr,
-                Err(e) => {
-                    println!("Error: Failed to derive address: {e}");
-                    return false;
-                }
-            }
-        }
-    };
-
-    let network = if is_testnet { "testnet" } else { "mainnet" };
-    let separator = "=".repeat(60);
-
-    println!("{separator}");
-    println!("Hyperliquid Builder Fee Verification");
-    println!("{separator}");
-    println!();
-    println!("Checking approval status on {network}...");
-    println!();
-
-    match verify_builder_fee(&wallet_address, is_testnet).await {
-        Ok(result) => {
-            println!("Wallet:   {}", result.wallet_address);
-            println!("Builder:  {}", result.builder_address);
-            println!("Network:  {network}");
-            println!(
-                "Approved: {}",
-                result.approved_rate.as_deref().unwrap_or("(none)")
-            );
-            println!();
-
-            if result.is_approved {
-                println!("Status: APPROVED");
-                println!();
-                println!(
-                    "NautilusTrader charges 0.01% (1 basis point) per fill (perps and spot sells)."
-                );
-                println!("This is at the low end of ecosystem norms.");
-                println!(
-                    "(Hyperliquid allows up to 0.1% (10 bps) for perps and 1% (100 bps) for spot)"
-                );
-                println!();
-                println!("You can trade on Hyperliquid via NautilusTrader.");
-            } else {
-                println!("Status: NOT APPROVED");
-                println!();
-                println!("Run the approval script:");
-                println!(
-                    "  python nautilus_trader/adapters/hyperliquid/scripts/builder_fee_approve.py"
-                );
-                println!();
-                println!("See: docs/integrations/hyperliquid.md#approving-builder-fees");
-            }
-
-            println!("{separator}");
-            result.is_approved
-        }
-        Err(e) => {
-            println!("Error: {e}");
-            false
-        }
-    }
 }
 
 fn sign_approve_builder_fee(
@@ -762,148 +341,109 @@ fn sign_approve_builder_fee(
     is_testnet: bool,
     nonce: u64,
     fee_rate: &str,
-) -> Result<serde_json::Value> {
-    // EIP-712 domain separator hash (using alloy's Eip712Domain)
-    let domain_hash = compute_domain_hash();
+) -> Result<HyperliquidSignature> {
+    let signing_hash = approval_signing_hash(is_testnet, nonce, fee_rate)?;
 
-    // Struct type hash for HyperliquidTransaction:ApproveBuilderFee
+    let key_hex = pk.as_hex();
+    let key_hex = key_hex.strip_prefix("0x").unwrap_or(key_hex);
+
+    let signer = PrivateKeySigner::from_str(key_hex)
+        .map_err(|e| Error::auth(format!("Failed to create signer: {e}")))?;
+
+    let signature = signer
+        .sign_hash_sync(&signing_hash)
+        .map_err(|e| Error::auth(format!("Failed to sign: {e}")))?;
+
+    let r = format!("0x{:064x}", signature.r());
+    let s = format!("0x{:064x}", signature.s());
+    let v = if signature.v() { 28u64 } else { 27u64 };
+
+    Ok(HyperliquidSignature::new(r, s, v))
+}
+
+fn approval_signing_hash(is_testnet: bool, nonce: u64, fee_rate: &str) -> Result<B256> {
+    let domain = eip712_domain! {
+        name: "HyperliquidSignTransaction",
+        version: "1",
+        chain_id: HYPERLIQUID_CHAIN_ID,
+        verifying_contract: Address::ZERO,
+    };
+    let domain_hash = domain.hash_struct();
+
+    // Struct type hash for HyperliquidTransaction:ApproveBuilderFee, the colon in
+    // the type name rules out the alloy sol! macro, so the encoding is hand-rolled.
     let type_hash = keccak256(
         b"HyperliquidTransaction:ApproveBuilderFee(string hyperliquidChain,string maxFeeRate,address builder,uint64 nonce)",
     );
 
-    // Hash the message fields
     let chain_str = if is_testnet { "Testnet" } else { "Mainnet" };
     let chain_hash = keccak256(chain_str.as_bytes());
     let fee_rate_hash = keccak256(fee_rate.as_bytes());
 
-    // Parse builder address
-    let builder_addr = Address::from_str(NAUTILUS_BUILDER_FEE_ADDRESS).map_err(|e| {
-        crate::http::error::Error::transport(format!("Invalid builder address: {e}"))
-    })?;
+    let builder_addr = Address::from_str(NAUTILUS_BUILDER_ADDRESS)
+        .map_err(|e| Error::transport(format!("Invalid builder address: {e}")))?;
 
-    // Encode the struct hash
     let mut struct_data = Vec::with_capacity(32 * 5);
     struct_data.extend_from_slice(type_hash.as_slice());
     struct_data.extend_from_slice(chain_hash.as_slice());
     struct_data.extend_from_slice(fee_rate_hash.as_slice());
 
-    // Address is padded to 32 bytes (left-padded with zeros)
+    // Address left-padded to 32 bytes
     let mut addr_bytes = [0u8; 32];
     addr_bytes[12..].copy_from_slice(builder_addr.as_slice());
     struct_data.extend_from_slice(&addr_bytes);
 
-    // Nonce is uint64, padded to 32 bytes (left-padded with zeros)
+    // Nonce as uint64, left-padded to 32 bytes
     let mut nonce_bytes = [0u8; 32];
     nonce_bytes[24..].copy_from_slice(&nonce.to_be_bytes());
     struct_data.extend_from_slice(&nonce_bytes);
 
     let struct_hash = keccak256(&struct_data);
 
-    // Create final EIP-712 hash: \x19\x01 + domain_hash + struct_hash
+    // EIP-712 hash: \x19\x01 + domain_hash + struct_hash
     let mut final_data = Vec::with_capacity(66);
     final_data.extend_from_slice(b"\x19\x01");
-    final_data.extend_from_slice(&domain_hash);
+    final_data.extend_from_slice(domain_hash.as_slice());
     final_data.extend_from_slice(struct_hash.as_slice());
 
-    let signing_hash = keccak256(&final_data);
-
-    // Sign the hash
-    let key_hex = pk.as_hex();
-    let key_hex = key_hex.strip_prefix("0x").unwrap_or(key_hex);
-
-    let signer = PrivateKeySigner::from_str(key_hex).map_err(|e| {
-        crate::http::error::Error::transport(format!("Failed to create signer: {e}"))
-    })?;
-
-    let hash_b256 = B256::from(signing_hash);
-    let signature = signer
-        .sign_hash_sync(&hash_b256)
-        .map_err(|e| crate::http::error::Error::transport(format!("Failed to sign: {e}")))?;
-
-    // Format signature as {r, s, v} for Hyperliquid
-    let r = format!("0x{:064x}", signature.r());
-    let s = format!("0x{:064x}", signature.s());
-    let v = if signature.v() { 28u8 } else { 27u8 };
-
-    Ok(serde_json::json!({
-        "r": r,
-        "s": s,
-        "v": v,
-    }))
-}
-
-fn get_eip712_domain() -> Eip712Domain {
-    Eip712Domain {
-        name: Some("HyperliquidSignTransaction".into()),
-        version: Some("1".into()),
-        chain_id: Some(alloy_primitives::U256::from(HYPERLIQUID_CHAIN_ID)),
-        verifying_contract: Some(Address::ZERO),
-        salt: None,
-    }
-}
-
-fn compute_domain_hash() -> [u8; 32] {
-    *get_eip712_domain().hash_struct()
+    Ok(keccak256(&final_data))
 }
 
 fn derive_address(pk: &EvmPrivateKey) -> Result<String> {
     let key_hex = pk.as_hex();
     let key_hex = key_hex.strip_prefix("0x").unwrap_or(key_hex);
 
-    let signer = PrivateKeySigner::from_str(key_hex).map_err(|e| {
-        crate::http::error::Error::transport(format!("Failed to create signer: {e}"))
-    })?;
+    let signer = PrivateKeySigner::from_str(key_hex)
+        .map_err(|e| Error::auth(format!("Failed to create signer: {e}")))?;
 
     Ok(format!("{:#x}", signer.address()))
 }
 
-fn wait_for_confirmation(prompt: &str) -> bool {
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let cancelled_clone = cancelled.clone();
-
-    if ctrlc::set_handler(move || {
-        cancelled_clone.store(true, Ordering::SeqCst);
-    })
-    .is_err()
-    {
-        // Handler already set, continue without it
-    }
-
+async fn wait_for_confirmation(prompt: &str) -> bool {
     print!("{prompt}");
     io::stdout().flush().ok();
 
-    // Spawn thread to read stdin so we can check for ctrlc
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
+    let stdin_read = tokio::task::spawn_blocking(|| {
         let mut input = String::new();
-        let result = io::stdin().read_line(&mut input);
-        let _ = tx.send(result);
+        io::stdin().read_line(&mut input)
     });
 
-    // Wait for either input or ctrlc
-    loop {
-        if cancelled.load(Ordering::SeqCst) {
-            println!();
-            println!("Aborted.");
-            return false;
-        }
-
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(0) | Err(_)) => {
+    tokio::select! {
+        result = stdin_read => match result {
+            Ok(Ok(0) | Err(_)) | Err(_) => {
                 println!();
                 println!("Aborted.");
-                return false;
+                false
             }
             Ok(Ok(_)) => {
                 println!();
-                return true;
+                true
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                println!();
-                println!("Aborted.");
-                return false;
-            }
+        },
+        _ = tokio::signal::ctrl_c() => {
+            println!();
+            println!("Aborted.");
+            false
         }
     }
 }
@@ -914,52 +454,65 @@ mod tests {
 
     use super::*;
 
+    // Well-known development key (hardhat/anvil account 0)
+    const TEST_PK: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const TEST_ADDRESS: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+
     #[rstest]
-    fn test_builder_fee_info() {
-        let info = BuilderFeeInfo::new();
-        assert_eq!(info.address, NAUTILUS_BUILDER_FEE_ADDRESS);
-        assert_eq!(info.perp_rate_bps, 1); // 0.01%
-        assert_eq!(info.spot_rate_bps, 1); // 0.01%
-        assert_eq!(info.approval_rate, "0.01%");
+    fn test_derive_address_known_key() {
+        let pk = EvmPrivateKey::new(TEST_PK).unwrap();
+
+        let address = derive_address(&pk).unwrap();
+
+        assert_eq!(address, TEST_ADDRESS);
     }
 
     #[rstest]
-    fn test_derive_address() {
-        let pk = EvmPrivateKey::new(
-            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
-        )
-        .unwrap();
-        let addr = derive_address(&pk).unwrap();
-        assert!(addr.starts_with("0x"));
-        assert_eq!(addr.len(), 42);
+    fn test_build_approval_action_payload() {
+        let action = build_approval_action(false, 1_700_000_000_000);
+
+        assert_eq!(action["type"], "approveBuilderFee");
+        assert_eq!(action["hyperliquidChain"], "Mainnet");
+        assert_eq!(action["signatureChainId"], "0x66eee");
+        assert_eq!(action["maxFeeRate"], "0%");
+        assert_eq!(action["builder"], NAUTILUS_BUILDER_ADDRESS);
+        assert_eq!(action["nonce"], 1_700_000_000_000_u64);
     }
 
     #[rstest]
-    fn test_compute_domain_hash() {
-        let hash = compute_domain_hash();
-        assert_eq!(hash.len(), 32);
+    fn test_build_approval_action_testnet_chain() {
+        let action = build_approval_action(true, 1);
+
+        assert_eq!(action["hyperliquidChain"], "Testnet");
     }
 
     #[rstest]
-    fn test_sign_approve_builder_fee() {
-        let pk = EvmPrivateKey::new(
-            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string(),
-        )
-        .unwrap();
-        let nonce = 1640995200000u64;
+    fn test_sign_approve_builder_fee_recovers_signer() {
+        let pk = EvmPrivateKey::new(TEST_PK).unwrap();
+        let nonce = 1_700_000_000_000;
 
-        let signature = sign_approve_builder_fee(&pk, false, nonce, APPROVAL_FEE_RATE).unwrap();
+        let signature = sign_approve_builder_fee(&pk, false, nonce, ZERO_FEE_RATE).unwrap();
 
-        assert!(signature.get("r").is_some());
-        assert!(signature.get("s").is_some());
-        assert!(signature.get("v").is_some());
+        let signing_hash = approval_signing_hash(false, nonce, ZERO_FEE_RATE).unwrap();
+        let signer = PrivateKeySigner::from_str(TEST_PK.strip_prefix("0x").unwrap()).unwrap();
+        let direct = signer.sign_hash_sync(&signing_hash).unwrap();
+        let recovered = direct.recover_address_from_prehash(&signing_hash).unwrap();
 
-        let r = signature["r"].as_str().unwrap();
-        let s = signature["s"].as_str().unwrap();
+        assert_eq!(signature.r, format!("0x{:064x}", direct.r()));
+        assert_eq!(signature.s, format!("0x{:064x}", direct.s()));
+        assert_eq!(signature.v, if direct.v() { 28 } else { 27 });
+        assert_eq!(format!("{recovered:#x}"), TEST_ADDRESS);
+    }
 
-        assert!(r.starts_with("0x"));
-        assert!(s.starts_with("0x"));
-        assert_eq!(r.len(), 66); // 0x + 64 hex chars
-        assert_eq!(s.len(), 66);
+    #[rstest]
+    fn test_approval_signing_hash_varies_with_inputs() {
+        let base = approval_signing_hash(false, 1, ZERO_FEE_RATE).unwrap();
+
+        assert_ne!(base, approval_signing_hash(true, 1, ZERO_FEE_RATE).unwrap());
+        assert_ne!(
+            base,
+            approval_signing_hash(false, 2, ZERO_FEE_RATE).unwrap()
+        );
+        assert_ne!(base, approval_signing_hash(false, 1, "0.001%").unwrap());
     }
 }

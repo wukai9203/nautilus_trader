@@ -15,8 +15,7 @@
 
 use std::fmt::{Debug, Display};
 
-use derive_builder::Builder;
-use nautilus_core::{UUID4, UnixNanos, serialization::from_bool_as_u8};
+use nautilus_core::{UUID4, UnixNanos};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
@@ -36,12 +35,15 @@ use crate::{
 
 /// Represents an event where an order has been canceled at the trading venue.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Builder)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[cfg_attr(any(test, feature = "stubs"), builder(default))]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct OrderCanceled {
     /// The trader ID associated with the event.
@@ -59,17 +61,20 @@ pub struct OrderCanceled {
     /// UNIX timestamp (nanoseconds) when the event was initialized.
     pub ts_init: UnixNanos,
     /// If the event was generated during reconciliation.
-    #[serde(deserialize_with = "from_bool_as_u8")]
-    pub reconciliation: u8, // TODO: Change to bool once Cython removed
+    pub reconciliation: bool,
     /// The venue order ID associated with the event.
     pub venue_order_id: Option<VenueOrderId>,
     /// The account ID associated with the event.
     pub account_id: Option<AccountId>,
+    /// The causation ID associated with the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl OrderCanceled {
     /// Creates a new [`OrderCanceled`] instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         trader_id: TraderId,
         strategy_id: StrategyId,
@@ -90,9 +95,10 @@ impl OrderCanceled {
             event_id,
             ts_event,
             ts_init,
-            reconciliation: u8::from(reconciliation),
+            reconciliation,
             venue_order_id,
             account_id,
+            causation_id: None,
         }
     }
 }
@@ -144,7 +150,7 @@ impl OrderEvent for OrderCanceled {
         self.event_id
     }
 
-    fn kind(&self) -> &str {
+    fn type_name(&self) -> &'static str {
         stringify!(OrderCanceled)
     }
 
@@ -310,4 +316,16 @@ impl OrderEvent for OrderCanceled {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_serialization_roundtrip() {
+        let original = OrderCanceled::default();
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: OrderCanceled = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, deserialized);
+    }
+}

@@ -217,7 +217,7 @@ def test_unregistered_strategy_properties():
     strategy = Strategy()
     assert strategy.trader_id is None
     assert strategy.strategy_id is not None
-    assert strategy.state() == ComponentState.PreInitialized
+    assert strategy.state() == ComponentState.PRE_INITIALIZED
     assert not strategy.is_ready()
     assert not strategy.is_running()
     assert not strategy.is_stopped()
@@ -273,7 +273,7 @@ def test_modify_order_signature():
     strategy = Strategy()
     sig = inspect.signature(strategy.modify_order)
     params = list(sig.parameters.keys())
-    assert "order" in params
+    assert "client_order_id" in params
     assert "quantity" in params
     assert "price" in params
     assert "trigger_price" in params
@@ -290,7 +290,7 @@ def test_cancel_order_signature():
     sig = inspect.signature(strategy.cancel_order)
 
     params = list(sig.parameters.keys())
-    assert "order" in params
+    assert "client_order_id" in params
     assert "client_id" in params
 
 

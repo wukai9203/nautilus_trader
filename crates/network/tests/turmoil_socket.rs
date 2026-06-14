@@ -13,20 +13,85 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Turmoil integration tests for the SocketClient.
+//! Turmoil integration tests for the `SocketClient`.
 //!
 //! These tests use turmoil's network simulation to test the actual production
-//! SocketClient code under various network conditions.
+//! `SocketClient` code under various network conditions.
 
 #![cfg(feature = "turmoil")]
 
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use nautilus_network::socket::{SocketClient, SocketConfig};
 use rstest::{fixture, rstest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::stream::Mode;
-use turmoil::{Builder, net};
+use turmoil::net;
+
+mod common;
+
+use common::turmoil::{seeded_builder, seeded_builder_with_duration, stressed_builder};
+
+// 2-second budget in simulated time, covering reconnect timings across these tests.
+const POLL_ITERS: u32 = 200;
+const POLL_STEP: Duration = Duration::from_millis(10);
+const BASIC_CONNECT_SEED: u64 = 0x51C0_0001;
+const RECONNECTION_SEED: u64 = 0x51C0_0002;
+const NETWORK_PARTITION_SEED: u64 = 0x51C0_0003;
+const CLOSE_DURING_RECONNECT_SEED: u64 = 0x51C0_0004;
+const CLOSE_DURING_BACKOFF_SEED: u64 = 0x51C0_0005;
+
+async fn wait_for<F>(mut condition: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    for _ in 0..POLL_ITERS {
+        if condition() {
+            return true;
+        }
+        tokio::time::sleep(POLL_STEP).await;
+    }
+    false
+}
+
+type ReceivedMessages = Arc<Mutex<Vec<String>>>;
+
+fn attach_message_capture(config: &mut SocketConfig, received: &ReceivedMessages) {
+    let received = Arc::clone(received);
+    config.message_handler = Some(Arc::new(move |data: &[u8]| {
+        received
+            .lock()
+            .expect("mutex poisoned")
+            .push(String::from_utf8_lossy(data).to_string());
+    }));
+}
+
+fn captured_messages(received: &ReceivedMessages) -> Vec<String> {
+    received.lock().expect("mutex poisoned").clone()
+}
+
+async fn echo_once_then_drop_server() -> Result<(), Box<dyn std::error::Error>> {
+    let listener = net::TcpListener::bind("0.0.0.0:8080").await?;
+
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+
+        tokio::spawn(async move {
+            let mut buffer = vec![0; 1024];
+            if let Ok(n) = stream.read(&mut buffer).await
+                && n > 0
+            {
+                if !buffer.starts_with(b"close\r\n") {
+                    let _ = stream.write_all(&buffer[..n]).await;
+                }
+                let _ = stream.shutdown().await;
+            }
+        });
+    }
+}
 
 /// Default test socket configuration.
 #[fixture]
@@ -44,6 +109,7 @@ fn socket_config() -> SocketConfig {
         reconnect_jitter_ms: Some(10),
         connection_max_retries: None,
         reconnect_max_attempts: None,
+        idle_timeout_ms: None,
         certs_dir: None,
     }
 }
@@ -59,7 +125,7 @@ async fn echo_server() -> Result<(), Box<dyn std::error::Error>> {
 
                 loop {
                     match stream.read(&mut buffer).await {
-                        Ok(0) => break,
+                        Ok(0) | Err(_) => break,
                         Ok(n) => {
                             // Check for termination message
                             if buffer.starts_with(b"close\r\n") {
@@ -71,7 +137,6 @@ async fn echo_server() -> Result<(), Box<dyn std::error::Error>> {
                                 break;
                             }
                         }
-                        Err(_) => break,
                     }
                 }
             });
@@ -81,7 +146,11 @@ async fn echo_server() -> Result<(), Box<dyn std::error::Error>> {
 
 #[rstest]
 fn test_turmoil_real_socket_basic_connect(socket_config: SocketConfig) {
-    let mut sim = Builder::new().build();
+    let mut socket_config = socket_config;
+    let received = Arc::new(Mutex::new(Vec::new()));
+    attach_message_capture(&mut socket_config, &received);
+
+    let mut sim = seeded_builder(BASIC_CONNECT_SEED).build();
 
     sim.host("server", echo_server);
 
@@ -93,22 +162,20 @@ fn test_turmoil_real_socket_basic_connect(socket_config: SocketConfig) {
         // Verify client is active
         assert!(client.is_active(), "Client should be active after connect");
 
-        // Send a test message
         client
             .send_bytes(b"hello".to_vec())
             .await
             .expect("Should send data");
+        assert!(
+            wait_for(|| captured_messages(&received) == ["hello"]).await,
+            "Client should receive echoed hello"
+        );
 
-        // Wait a bit
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Send close message
         client
             .send_bytes(b"close".to_vec())
             .await
             .expect("Should send close");
 
-        // Close the client
         client.close().await;
         assert!(client.is_closed(), "Client should be closed");
 
@@ -122,8 +189,10 @@ fn test_turmoil_real_socket_basic_connect(socket_config: SocketConfig) {
 fn test_turmoil_real_socket_reconnection(mut socket_config: SocketConfig) {
     socket_config.reconnect_timeout_ms = Some(5_000);
     socket_config.reconnect_delay_initial_ms = Some(100);
+    let received = Arc::new(Mutex::new(Vec::new()));
+    attach_message_capture(&mut socket_config, &received);
 
-    let mut sim = Builder::new().build();
+    let mut sim = seeded_builder(RECONNECTION_SEED).build();
 
     // Server that accepts one connection, closes it, then accepts another
     sim.host("server", || async {
@@ -131,33 +200,27 @@ fn test_turmoil_real_socket_reconnection(mut socket_config: SocketConfig) {
 
         // Accept first connection
         if let Ok((mut stream, _)) = listener.accept().await {
-            // Read one message
             let mut buffer = vec![0; 1024];
             let _ = stream.read(&mut buffer).await;
-            // Echo it back
             let _ = stream.write_all(b"first\r\n").await;
-            // Close the connection
             drop(stream);
         }
 
-        // Wait a bit before accepting second connection
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Accept second connection and run echo server
+        // Accept second connection and run echo loop
         if let Ok((mut stream, _)) = listener.accept().await {
             let mut buffer = vec![0; 1024];
             loop {
                 match stream.read(&mut buffer).await {
-                    Ok(0) => break,
+                    Ok(0) | Err(_) => break,
                     Ok(n) => {
                         if buffer.starts_with(b"close\r\n") {
                             break;
                         }
+
                         if stream.write_all(&buffer[..n]).await.is_err() {
                             break;
                         }
                     }
-                    Err(_) => break,
                 }
             }
         }
@@ -170,23 +233,35 @@ fn test_turmoil_real_socket_reconnection(mut socket_config: SocketConfig) {
             .await
             .expect("Should connect");
 
-        // Send first message
         client
             .send_bytes(b"first_msg".to_vec())
             .await
             .expect("Should send first message");
+        assert!(
+            wait_for(|| captured_messages(&received) == ["first"]).await,
+            "Client should receive first message before reconnect"
+        );
 
-        // Wait for server to close connection
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Server closes after echoing; wait for the client to cycle through
+        // reconnection and return to an active state before the next send.
+        assert!(
+            wait_for(|| client.is_reconnecting() || !client.is_active()).await,
+            "Client should observe server disconnect"
+        );
+        assert!(
+            wait_for(|| client.is_active()).await,
+            "Client should reconnect after server close"
+        );
 
-        // Client should detect disconnection and attempt reconnection
-        // Send another message after reconnection
         client
             .send_bytes(b"second_msg".to_vec())
             .await
             .expect("Should send second message after reconnect");
+        assert!(
+            wait_for(|| captured_messages(&received) == ["first", "second_msg"]).await,
+            "Client should receive post-reconnect echo"
+        );
 
-        // Close
         client.send_bytes(b"close".to_vec()).await.ok();
         client.close().await;
 
@@ -199,8 +274,10 @@ fn test_turmoil_real_socket_reconnection(mut socket_config: SocketConfig) {
 #[rstest]
 fn test_turmoil_real_socket_network_partition(mut socket_config: SocketConfig) {
     socket_config.reconnect_timeout_ms = Some(3_000);
+    let received = Arc::new(Mutex::new(Vec::new()));
+    attach_message_capture(&mut socket_config, &received);
 
-    let mut sim = Builder::new().build();
+    let mut sim = seeded_builder(NETWORK_PARTITION_SEED).build();
 
     sim.host("server", echo_server);
 
@@ -209,35 +286,186 @@ fn test_turmoil_real_socket_network_partition(mut socket_config: SocketConfig) {
             .await
             .expect("Should connect");
 
-        // Send message before partition
         client
             .send_bytes(b"before_partition".to_vec())
             .await
             .expect("Should send before partition");
+        assert!(
+            wait_for(|| captured_messages(&received) == ["before_partition"]).await,
+            "Client should receive echoed before_partition"
+        );
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Create network partition
         turmoil::partition("client", "server");
-
-        // Wait a bit
         tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Repair partition
         turmoil::repair("client", "server");
 
-        // Wait for reconnection
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Either the connection survived the partition or reconnect restored it;
+        // poll until the client is active again before sending.
+        assert!(
+            wait_for(|| client.is_active()).await,
+            "Client should be active after partition repair"
+        );
 
-        // Should be able to send after repair
         client
             .send_bytes(b"after_partition".to_vec())
             .await
             .expect("Should send after partition repair");
+        assert!(
+            wait_for(|| {
+                captured_messages(&received) == ["before_partition", "after_partition"]
+            })
+            .await,
+            "Client should receive echoed after_partition"
+        );
 
-        // Close
         client.send_bytes(b"close".to_vec()).await.ok();
         client.close().await;
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[rstest]
+fn test_turmoil_real_socket_close_during_reconnect(mut socket_config: SocketConfig) {
+    socket_config.reconnect_timeout_ms = Some(5_000);
+    socket_config.reconnect_delay_initial_ms = Some(100);
+
+    let mut sim = seeded_builder(CLOSE_DURING_RECONNECT_SEED).build();
+
+    sim.host("server", echo_server);
+
+    sim.client("client", async move {
+        let client = SocketClient::connect(socket_config, None, None, None)
+            .await
+            .expect("Should connect");
+
+        assert!(client.is_active(), "Client should be active after connect");
+
+        turmoil::partition("client", "server");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        client.close().await;
+
+        assert!(
+            client.is_closed(),
+            "Client should be closed after close during reconnect"
+        );
+        assert!(
+            !client.is_active(),
+            "Client should not be active after close"
+        );
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[rstest]
+fn test_turmoil_real_socket_disconnect_during_backoff(mut socket_config: SocketConfig) {
+    socket_config.reconnect_timeout_ms = Some(1_000);
+    socket_config.reconnect_delay_initial_ms = Some(10_000); // Long backoff
+    socket_config.reconnect_delay_max_ms = Some(10_000);
+    socket_config.reconnect_backoff_factor = Some(1.0);
+    socket_config.reconnect_jitter_ms = Some(0);
+
+    let mut sim =
+        seeded_builder_with_duration(CLOSE_DURING_BACKOFF_SEED, Duration::from_secs(30)).build();
+
+    sim.host("server", echo_server);
+
+    sim.client("client", async move {
+        let client = SocketClient::connect(socket_config, None, None, None)
+            .await
+            .expect("Should connect");
+
+        assert!(client.is_active());
+
+        // Partition to force reconnect
+        turmoil::partition("client", "server");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Client should be reconnecting; reconnect attempt fails, enters 10s backoff
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        let start = tokio::time::Instant::now();
+        client.close().await;
+        let elapsed = start.elapsed();
+
+        assert!(client.is_closed(), "Client should be closed");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "Close should interrupt backoff, took {elapsed:?}"
+        );
+
+        Ok(())
+    });
+
+    sim.run().unwrap();
+}
+
+#[rstest]
+#[case::seed_a(0x51C0_1001)]
+#[case::seed_b(0x51C0_1002)]
+#[case::seed_c(0x51C0_1003)]
+fn test_turmoil_socket_repeated_drops_preserve_message_order(
+    mut socket_config: SocketConfig,
+    #[case] seed: u64,
+) {
+    socket_config.reconnect_timeout_ms = Some(5_000);
+    socket_config.reconnect_delay_initial_ms = Some(25);
+    socket_config.reconnect_delay_max_ms = Some(100);
+    socket_config.reconnect_backoff_factor = Some(1.0);
+    socket_config.reconnect_jitter_ms = Some(0);
+    let received = Arc::new(Mutex::new(Vec::new()));
+    attach_message_capture(&mut socket_config, &received);
+
+    let mut sim = stressed_builder(seed, Duration::from_secs(20)).build();
+
+    sim.host("server", echo_once_then_drop_server);
+
+    sim.client("client", async move {
+        let client = SocketClient::connect(socket_config, None, None, None)
+            .await
+            .expect("Should connect");
+
+        let expected = (0..6)
+            .map(|i| format!("drop-reconnect-{i}"))
+            .collect::<Vec<_>>();
+
+        for (index, msg) in expected.iter().enumerate() {
+            client
+                .send_bytes(msg.as_bytes().to_vec())
+                .await
+                .expect("Should enqueue message");
+
+            assert!(
+                wait_for(|| captured_messages(&received).len() == index + 1).await,
+                "Client should receive echoed message {index}"
+            );
+
+            if index + 1 < expected.len() {
+                assert!(
+                    wait_for(|| client.is_reconnecting() || !client.is_active()).await,
+                    "Client should observe drop after message {index}"
+                );
+                assert!(
+                    wait_for(|| client.is_active()).await,
+                    "Client should reconnect after message {index}"
+                );
+            }
+        }
+
+        assert_eq!(
+            captured_messages(&received),
+            expected,
+            "Repeated reconnects should preserve message order"
+        );
+
+        client.close().await;
+        assert!(client.is_closed(), "Client should close after scenario");
 
         Ok(())
     });

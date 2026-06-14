@@ -15,29 +15,67 @@
 
 //! Python bindings for the Hyperliquid WebSocket client.
 
+use std::time::Duration;
+
 use nautilus_common::live::get_runtime;
-use nautilus_core::python::to_pyruntime_err;
+use nautilus_core::python::{call_python_threadsafe, to_pyruntime_err, to_pyvalue_err};
 use nautilus_model::{
     data::{BarType, Data, OrderBookDeltas_API},
-    identifiers::{AccountId, ClientOrderId, InstrumentId},
-    python::{data::data_to_pycapsule, instruments::pyobject_to_instrument_any},
+    enums::{OrderSide, OrderType, TimeInForce},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
+    orders::OrderAny,
+    python::{
+        data::data_to_pycapsule, instruments::pyobject_to_instrument_any,
+        orders::pyobject_to_order_any,
+    },
+    types::{Price, Quantity},
 };
-use pyo3::{conversion::IntoPyObjectExt, exceptions::PyRuntimeError, prelude::*};
+use nautilus_network::websocket::TransportBackend;
+use pyo3::{conversion::IntoPyObjectExt, prelude::*};
 
-use crate::websocket::{
-    HyperliquidWebSocketClient,
-    messages::{ExecutionReport, NautilusWsMessage},
+use crate::{
+    common::enums::HyperliquidEnvironment,
+    http::client::HyperliquidHttpClient,
+    websocket::{
+        HyperliquidWebSocketClient,
+        messages::{ExecutionReport, NautilusWsMessage},
+    },
 };
+
+fn ws_data_to_pyobject(py: Python<'_>, data: Data) -> PyResult<Py<PyAny>> {
+    match data {
+        Data::Custom(custom) => Py::new(py, custom).map(|obj| obj.into_any()),
+        Data::OptionGreeks(greeks) => Py::new(py, greeks).map(|obj| obj.into_any()),
+        other => Ok(data_to_pycapsule(py, other)),
+    }
+}
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl HyperliquidWebSocketClient {
+    /// Hyperliquid WebSocket client following the BitMEX pattern.
+    ///
+    /// Orchestrates WebSocket connection and subscriptions using a command-based architecture,
+    /// where the inner FeedHandler owns the WebSocketClient and handles all I/O.
     #[new]
-    #[pyo3(signature = (url=None, testnet=false, account_id=None))]
-    fn py_new(url: Option<String>, testnet: bool, account_id: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (url=None, environment=HyperliquidEnvironment::Mainnet, account_id=None, proxy_url=None))]
+    fn py_new(
+        url: Option<String>,
+        environment: HyperliquidEnvironment,
+        account_id: Option<String>,
+        proxy_url: Option<String>,
+    ) -> Self {
         let account_id = account_id.map(|s| AccountId::from(s.as_str()));
-        Ok(Self::new(url, testnet, account_id))
+        Self::new(
+            url,
+            environment,
+            account_id,
+            TransportBackend::default(),
+            proxy_url,
+        )
     }
 
+    /// Returns the URL of this WebSocket client.
     #[getter]
     #[pyo3(name = "url")]
     #[must_use]
@@ -45,6 +83,7 @@ impl HyperliquidWebSocketClient {
         self.url().to_string()
     }
 
+    /// Returns true if the WebSocket is actively connected.
     #[pyo3(name = "is_active")]
     fn py_is_active(&self) -> bool {
         self.is_active()
@@ -55,6 +94,193 @@ impl HyperliquidWebSocketClient {
         !self.is_active()
     }
 
+    /// Sets the timeout for WebSocket post trading requests.
+    #[pyo3(name = "set_post_timeout")]
+    fn py_set_post_timeout(&mut self, timeout_secs: u64) {
+        self.set_post_timeout(Duration::from_secs(timeout_secs));
+    }
+
+    /// Submit an order through the Hyperliquid WebSocket post API.
+    ///
+    /// The HTTP client supplies signing credentials, builder attribution, and
+    /// cached instrument metadata. The action itself is sent over WebSocket.
+    #[pyo3(name = "submit_order", signature = (
+        signer,
+        instrument_id,
+        client_order_id,
+        order_side,
+        order_type,
+        quantity,
+        time_in_force,
+        price=None,
+        trigger_price=None,
+        post_only=false,
+        reduce_only=false,
+    ))]
+    #[expect(clippy::too_many_arguments)]
+    fn py_submit_order<'py>(
+        &self,
+        py: Python<'py>,
+        signer: &HyperliquidHttpClient,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        time_in_force: TimeInForce,
+        price: Option<Price>,
+        trigger_price: Option<Price>,
+        post_only: bool,
+        reduce_only: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let signer = signer.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .submit_order(
+                    &signer,
+                    instrument_id,
+                    client_order_id,
+                    order_side,
+                    order_type,
+                    quantity,
+                    time_in_force,
+                    price,
+                    trigger_price,
+                    post_only,
+                    reduce_only,
+                )
+                .await
+                .map_err(to_pyvalue_err)?;
+            Ok(())
+        })
+    }
+
+    /// Submit multiple orders through the Hyperliquid WebSocket post API.
+    #[pyo3(name = "submit_orders")]
+    fn py_submit_orders<'py>(
+        &self,
+        py: Python<'py>,
+        signer: &HyperliquidHttpClient,
+        orders: Vec<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let signer = signer.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let order_anys: Vec<OrderAny> = Python::attach(|py| {
+                orders
+                    .into_iter()
+                    .map(|order| pyobject_to_order_any(py, order))
+                    .collect::<PyResult<Vec<_>>>()
+                    .map_err(to_pyvalue_err)
+            })?;
+            let order_refs: Vec<&OrderAny> = order_anys.iter().collect();
+
+            client
+                .submit_orders(&signer, &order_refs)
+                .await
+                .map_err(to_pyvalue_err)?;
+            Ok(())
+        })
+    }
+
+    /// Cancel an order through the Hyperliquid WebSocket post API.
+    #[pyo3(name = "cancel_order", signature = (
+        signer,
+        instrument_id,
+        client_order_id=None,
+        venue_order_id=None,
+    ))]
+    fn py_cancel_order<'py>(
+        &self,
+        py: Python<'py>,
+        signer: &HyperliquidHttpClient,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let signer = signer.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .cancel_order(&signer, instrument_id, client_order_id, venue_order_id)
+                .await
+                .map_err(to_pyvalue_err)?;
+            Ok(())
+        })
+    }
+
+    /// Cancel multiple orders through one Hyperliquid WebSocket post action.
+    #[pyo3(name = "cancel_orders")]
+    fn py_cancel_orders<'py>(
+        &self,
+        py: Python<'py>,
+        signer: &HyperliquidHttpClient,
+        cancels: Vec<(InstrumentId, ClientOrderId, Option<VenueOrderId>)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let signer = signer.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .cancel_orders(&signer, &cancels)
+                .await
+                .map_err(to_pyvalue_err)
+        })
+    }
+
+    /// Modify an order through the Hyperliquid WebSocket post API.
+    #[pyo3(name = "modify_order")]
+    #[expect(clippy::too_many_arguments)]
+    fn py_modify_order<'py>(
+        &self,
+        py: Python<'py>,
+        signer: &HyperliquidHttpClient,
+        instrument_id: InstrumentId,
+        venue_order_id: VenueOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        price: Price,
+        quantity: Quantity,
+        trigger_price: Option<Price>,
+        reduce_only: bool,
+        post_only: bool,
+        time_in_force: TimeInForce,
+        client_order_id: Option<ClientOrderId>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let signer = signer.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .modify_order(
+                    &signer,
+                    instrument_id,
+                    venue_order_id,
+                    order_side,
+                    order_type,
+                    price,
+                    quantity,
+                    trigger_price,
+                    reduce_only,
+                    post_only,
+                    time_in_force,
+                    client_order_id,
+                )
+                .await
+                .map_err(to_pyvalue_err)?;
+            Ok(())
+        })
+    }
+
+    /// Caches spot fill coin mappings for instrument lookup.
+    ///
+    /// Hyperliquid WebSocket fills for spot use `@{pair_index}` format (e.g., `@107`),
+    /// while instruments are identified by full symbols (e.g., `HYPE-USDC-SPOT`).
+    /// This mapping allows the handler to look up instruments from spot fills.
     #[pyo3(name = "cache_spot_fill_coins")]
     fn py_cache_spot_fill_coins(&self, mapping: std::collections::HashMap<String, String>) {
         let ahash_mapping: ahash::AHashMap<ustr::Ustr, ustr::Ustr> = mapping
@@ -64,38 +290,74 @@ impl HyperliquidWebSocketClient {
         self.cache_spot_fill_coins(ahash_mapping);
     }
 
+    /// Cache the ordered instrument IDs required to normalize `allDexsAssetCtxs`.
+    #[pyo3(name = "cache_all_dex_asset_ctxs_instrument_ids")]
+    fn py_cache_all_dex_asset_ctxs_instrument_ids(
+        &self,
+        mapping: std::collections::HashMap<String, Vec<Option<InstrumentId>>>,
+    ) {
+        let ahash_mapping: ahash::AHashMap<ustr::Ustr, Vec<Option<InstrumentId>>> = mapping
+            .into_iter()
+            .map(|(dex, instrument_ids)| (ustr::Ustr::from(&dex), instrument_ids))
+            .collect();
+        self.cache_all_dex_asset_ctxs_instrument_ids(ahash_mapping);
+    }
+
+    /// Caches a venue CLOID to client_order_id mapping for order/fill resolution.
+    ///
+    /// This mapping allows WebSocket order status and fill reports to be resolved back to
+    /// the original client_order_id.
+    ///
+    /// This writes directly to a shared cache that the handler reads from, avoiding any
+    /// race conditions between caching and WebSocket message processing.
     #[pyo3(name = "cache_cloid_mapping")]
-    fn py_cache_cloid_mapping(&self, cloid: String, client_order_id: ClientOrderId) {
-        self.cache_cloid_mapping(ustr::Ustr::from(&cloid), client_order_id);
+    fn py_cache_cloid_mapping(&self, cloid: &str, client_order_id: ClientOrderId) {
+        self.cache_cloid_mapping(ustr::Ustr::from(cloid), client_order_id);
     }
 
+    /// Removes a cloid mapping from the cache.
+    ///
+    /// Called on terminal order state. The cache is FIFO-bounded so missed
+    /// removals self-evict (see GH-3972 cancel-replace drain).
     #[pyo3(name = "remove_cloid_mapping")]
-    fn py_remove_cloid_mapping(&self, cloid: String) {
-        self.remove_cloid_mapping(&ustr::Ustr::from(&cloid));
+    fn py_remove_cloid_mapping(&self, cloid: &str) {
+        self.remove_cloid_mapping(&ustr::Ustr::from(cloid));
     }
 
+    /// Clears all cloid mappings from the cache.
+    ///
+    /// Useful for cleanup during reconnection or shutdown.
     #[pyo3(name = "clear_cloid_cache")]
     fn py_clear_cloid_cache(&self) {
         self.clear_cloid_cache();
     }
 
+    /// Returns the number of cloid mappings in the cache.
     #[pyo3(name = "cloid_cache_len")]
     fn py_cloid_cache_len(&self) -> usize {
         self.cloid_cache_len()
     }
 
+    /// Looks up a client_order_id by its venue CLOID.
+    ///
+    /// Returns `Some(ClientOrderId)` if the mapping exists, `None` otherwise.
     #[pyo3(name = "get_cloid_mapping")]
-    fn py_get_cloid_mapping(&self, cloid: String) -> Option<ClientOrderId> {
-        self.get_cloid_mapping(&ustr::Ustr::from(&cloid))
+    fn py_get_cloid_mapping(&self, cloid: &str) -> Option<ClientOrderId> {
+        self.get_cloid_mapping(&ustr::Ustr::from(cloid))
     }
 
+    /// Establishes WebSocket connection and spawns the message handler.
     #[pyo3(name = "connect")]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_connect<'py>(
         &self,
         py: Python<'py>,
+        loop_: Py<PyAny>,
         instruments: Vec<Py<PyAny>>,
         callback: Py<PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let call_soon: Py<PyAny> = loop_.getattr(py, "call_soon_threadsafe")?;
+
         for inst in instruments {
             let inst_any = pyobject_to_instrument_any(py, inst)?;
             self.cache_instrument(inst_any);
@@ -119,20 +381,14 @@ impl HyperliquidWebSocketClient {
                                     Python::attach(|py| {
                                         for tick in trade_ticks {
                                             let py_obj = data_to_pycapsule(py, Data::Trade(tick));
-                                            if let Err(e) = callback.bind(py).call1((py_obj,)) {
-                                                log::error!(
-                                                    "Error calling Python callback: {e}"
-                                                );
-                                            }
+                                            call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                         }
                                     });
                                 }
                                 NautilusWsMessage::Quote(quote_tick) => {
                                     Python::attach(|py| {
                                         let py_obj = data_to_pycapsule(py, Data::Quote(quote_tick));
-                                        if let Err(e) = callback.bind(py).call1((py_obj,)) {
-                                            log::error!("Error calling Python callback: {e}");
-                                        }
+                                        call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                     });
                                 }
                                 NautilusWsMessage::Deltas(deltas) => {
@@ -141,17 +397,19 @@ impl HyperliquidWebSocketClient {
                                             py,
                                             Data::Deltas(OrderBookDeltas_API::new(deltas)),
                                         );
-                                        if let Err(e) = callback.bind(py).call1((py_obj,)) {
-                                            log::error!("Error calling Python callback: {e}");
-                                        }
+                                        call_python_threadsafe(py, &call_soon, &callback, py_obj);
+                                    });
+                                }
+                                NautilusWsMessage::Depth10(depth) => {
+                                    Python::attach(|py| {
+                                        let py_obj = data_to_pycapsule(py, Data::Depth10(depth));
+                                        call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                     });
                                 }
                                 NautilusWsMessage::Candle(bar) => {
                                     Python::attach(|py| {
                                         let py_obj = data_to_pycapsule(py, Data::Bar(bar));
-                                        if let Err(e) = callback.bind(py).call1((py_obj,)) {
-                                            log::error!("Error calling Python callback: {e}");
-                                        }
+                                        call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                     });
                                 }
                                 NautilusWsMessage::MarkPrice(mark_price) => {
@@ -160,9 +418,7 @@ impl HyperliquidWebSocketClient {
                                             py,
                                             Data::MarkPriceUpdate(mark_price),
                                         );
-                                        if let Err(e) = callback.bind(py).call1((py_obj,)) {
-                                            log::error!("Error calling Python callback: {e}");
-                                        }
+                                        call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                     });
                                 }
                                 NautilusWsMessage::IndexPrice(index_price) => {
@@ -171,17 +427,25 @@ impl HyperliquidWebSocketClient {
                                             py,
                                             Data::IndexPriceUpdate(index_price),
                                         );
-                                        if let Err(e) = callback.bind(py).call1((py_obj,)) {
-                                            log::error!("Error calling Python callback: {e}");
-                                        }
+                                        call_python_threadsafe(py, &call_soon, &callback, py_obj);
                                     });
                                 }
                                 NautilusWsMessage::FundingRate(funding_rate) => {
                                     Python::attach(|py| {
-                                        if let Ok(py_obj) = funding_rate.into_py_any(py)
-                                            && let Err(e) = callback.bind(py).call1((py_obj,))
-                                        {
-                                            log::error!("Error calling Python callback: {e}");
+                                        if let Ok(py_obj) = funding_rate.into_py_any(py) {
+                                            call_python_threadsafe(py, &call_soon, &callback, py_obj);
+                                        }
+                                    });
+                                }
+                                NautilusWsMessage::CustomData(data) => {
+                                    Python::attach(|py| match ws_data_to_pyobject(py, data) {
+                                        Ok(py_obj) => {
+                                            call_python_threadsafe(py, &call_soon, &callback, py_obj);
+                                        }
+                                        Err(e) => {
+                                            log::error!(
+                                                "Error converting CustomData to Python object: {e}"
+                                            );
                                         }
                                     });
                                 }
@@ -195,13 +459,10 @@ impl HyperliquidWebSocketClient {
                                                         order_report.venue_order_id,
                                                         order_report.order_status
                                                     );
+
                                                     match Py::new(py, order_report) {
                                                         Ok(py_obj) => {
-                                                            if let Err(e) =
-                                                                callback.bind(py).call1((py_obj,))
-                                                            {
-                                                                log::error!("Error calling Python callback: {e}");
-                                                            }
+                                                            call_python_threadsafe(py, &call_soon, &callback, py_obj.into_any());
                                                         }
                                                         Err(e) => {
                                                             log::error!("Error converting OrderStatusReport to Python: {e}");
@@ -216,13 +477,10 @@ impl HyperliquidWebSocketClient {
                                                         fill_report.last_qty,
                                                         fill_report.last_px
                                                     );
+
                                                     match Py::new(py, fill_report) {
                                                         Ok(py_obj) => {
-                                                            if let Err(e) =
-                                                                callback.bind(py).call1((py_obj,))
-                                                            {
-                                                                log::error!("Error calling Python callback: {e}");
-                                                            }
+                                                            call_python_threadsafe(py, &call_soon, &callback, py_obj.into_any());
                                                         }
                                                         Err(e) => {
                                                             log::error!("Error converting FillReport to Python: {e}");
@@ -260,13 +518,14 @@ impl HyperliquidWebSocketClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let start = std::time::Instant::now();
+
             loop {
                 if client.is_active() {
                     return Ok(());
                 }
 
                 if start.elapsed().as_secs_f64() >= timeout_secs {
-                    return Err(PyRuntimeError::new_err(format!(
+                    return Err(to_pyruntime_err(format!(
                         "WebSocket connection did not become active within {timeout_secs} seconds"
                     )));
                 }
@@ -282,12 +541,13 @@ impl HyperliquidWebSocketClient {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Err(e) = client.disconnect().await {
-                log::error!("Error on close: {e}");
+                log::warn!("Error on close: {e}");
             }
             Ok(())
         })
     }
 
+    /// Subscribe to trades for an instrument.
     #[pyo3(name = "subscribe_trades")]
     fn py_subscribe_trades<'py>(
         &self,
@@ -305,6 +565,7 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Unsubscribe from trades for an instrument.
     #[pyo3(name = "unsubscribe_trades")]
     fn py_unsubscribe_trades<'py>(
         &self,
@@ -322,6 +583,56 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Subscribe to all mid prices across markets.
+    #[pyo3(name = "subscribe_all_mids")]
+    fn py_subscribe_all_mids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_all_mids()
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Subscribe to aggregate asset contexts across all perp dexes.
+    #[pyo3(name = "subscribe_all_dexs_asset_ctxs")]
+    fn py_subscribe_all_dexs_asset_ctxs<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_all_dexs_asset_ctxs()
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Subscribe to all mid prices across markets, optionally scoped to a specific dex.
+    #[pyo3(name = "subscribe_all_mids_with_dex")]
+    fn py_subscribe_all_mids_with_dex<'py>(
+        &self,
+        py: Python<'py>,
+        dex: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_all_mids_with_dex(dex.as_deref())
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Subscribe to L2 order book for an instrument.
     #[pyo3(name = "subscribe_book")]
     fn py_subscribe_book<'py>(
         &self,
@@ -339,6 +650,7 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Unsubscribe from L2 order book for an instrument.
     #[pyo3(name = "unsubscribe_book")]
     fn py_unsubscribe_book<'py>(
         &self,
@@ -411,6 +723,7 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Subscribe to best bid/offer (BBO) quotes for an instrument.
     #[pyo3(name = "subscribe_quotes")]
     fn py_subscribe_quotes<'py>(
         &self,
@@ -428,6 +741,7 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Unsubscribe from quote ticks for an instrument.
     #[pyo3(name = "unsubscribe_quotes")]
     fn py_unsubscribe_quotes<'py>(
         &self,
@@ -445,6 +759,7 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Subscribe to candle/bar data for a specific coin and interval.
     #[pyo3(name = "subscribe_bars")]
     fn py_subscribe_bars<'py>(
         &self,
@@ -462,6 +777,7 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Unsubscribe from candle/bar data.
     #[pyo3(name = "unsubscribe_bars")]
     fn py_unsubscribe_bars<'py>(
         &self,
@@ -479,6 +795,56 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Unsubscribe from all mid prices across markets.
+    #[pyo3(name = "unsubscribe_all_mids")]
+    fn py_unsubscribe_all_mids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_all_mids()
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Unsubscribe from aggregate asset contexts across all perp dexes.
+    #[pyo3(name = "unsubscribe_all_dexs_asset_ctxs")]
+    fn py_unsubscribe_all_dexs_asset_ctxs<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_all_dexs_asset_ctxs()
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Unsubscribe from all mid prices across markets, optionally scoped to a specific dex.
+    #[pyo3(name = "unsubscribe_all_mids_with_dex")]
+    fn py_unsubscribe_all_mids_with_dex<'py>(
+        &self,
+        py: Python<'py>,
+        dex: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_all_mids_with_dex(dex.as_deref())
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Subscribe to order updates for a specific user address.
     #[pyo3(name = "subscribe_order_updates")]
     fn py_subscribe_order_updates<'py>(
         &self,
@@ -496,6 +862,7 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Subscribe to user events (fills, funding, liquidations) for a specific user address.
     #[pyo3(name = "subscribe_user_events")]
     fn py_subscribe_user_events<'py>(
         &self,
@@ -513,6 +880,10 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Subscribe to user fills for a specific user address.
+    ///
+    /// Note: This channel is redundant with `userEvents` which already includes fills.
+    /// Prefer using `subscribe_user_events` or `subscribe_all_user_channels` instead.
     #[pyo3(name = "subscribe_user_fills")]
     fn py_subscribe_user_fills<'py>(
         &self,
@@ -530,6 +901,7 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Subscribe to mark price updates for an instrument.
     #[pyo3(name = "subscribe_mark_prices")]
     fn py_subscribe_mark_prices<'py>(
         &self,
@@ -547,6 +919,7 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Unsubscribe from mark price updates for an instrument.
     #[pyo3(name = "unsubscribe_mark_prices")]
     fn py_unsubscribe_mark_prices<'py>(
         &self,
@@ -564,6 +937,7 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Subscribe to index/oracle price updates for an instrument.
     #[pyo3(name = "subscribe_index_prices")]
     fn py_subscribe_index_prices<'py>(
         &self,
@@ -581,6 +955,7 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Unsubscribe from index/oracle price updates for an instrument.
     #[pyo3(name = "unsubscribe_index_prices")]
     fn py_unsubscribe_index_prices<'py>(
         &self,
@@ -598,6 +973,7 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Subscribe to funding rate updates for an instrument.
     #[pyo3(name = "subscribe_funding_rates")]
     fn py_subscribe_funding_rates<'py>(
         &self,
@@ -615,6 +991,25 @@ impl HyperliquidWebSocketClient {
         })
     }
 
+    /// Subscribe to open interest updates for an instrument.
+    #[pyo3(name = "subscribe_open_interest")]
+    fn py_subscribe_open_interest<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .subscribe_open_interest(instrument_id)
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Unsubscribe from funding rate updates for an instrument.
     #[pyo3(name = "unsubscribe_funding_rates")]
     fn py_unsubscribe_funding_rates<'py>(
         &self,
@@ -626,6 +1021,24 @@ impl HyperliquidWebSocketClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client
                 .unsubscribe_funding_rates(instrument_id)
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Unsubscribe from open interest updates for an instrument.
+    #[pyo3(name = "unsubscribe_open_interest")]
+    fn py_unsubscribe_open_interest<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .unsubscribe_open_interest(instrument_id)
                 .await
                 .map_err(to_pyruntime_err)?;
             Ok(())

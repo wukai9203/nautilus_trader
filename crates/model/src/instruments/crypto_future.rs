@@ -16,8 +16,8 @@
 use std::hash::{Hash, Hasher};
 
 use nautilus_core::{
-    UnixNanos,
-    correctness::{FAILED, check_equal_u8},
+    Params, UnixNanos,
+    correctness::{CorrectnessResult, CorrectnessResultExt, FAILED, check_equal_u8},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -37,10 +37,14 @@ use crate::{
 
 /// Represents a deliverable futures contract instrument, with crypto assets as underlying and for settlement.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
 )]
 pub struct CryptoFuture {
     /// The instrument ID for the instrument.
@@ -91,6 +95,8 @@ pub struct CryptoFuture {
     pub max_price: Option<Price>,
     /// The minimum allowable quoted price.
     pub min_price: Option<Price>,
+    /// Additional instrument metadata as a JSON-serializable dictionary.
+    pub info: Option<Params>,
     /// UNIX timestamp (nanoseconds) when the data event occurred.
     pub ts_event: UnixNanos,
     /// UNIX timestamp (nanoseconds) when the data object was initialized.
@@ -100,13 +106,14 @@ pub struct CryptoFuture {
 impl CryptoFuture {
     /// Creates a new [`CryptoFuture`] instance with correctness checking.
     ///
-    /// # Notes
-    ///
-    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
     /// # Errors
     ///
     /// Returns an error if any input validation fails.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// # Notes
+    ///
+    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
+    #[expect(clippy::too_many_arguments)]
     pub fn new_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
@@ -132,9 +139,10 @@ impl CryptoFuture {
         margin_maint: Option<Decimal>,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
+        info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
-    ) -> anyhow::Result<Self> {
+    ) -> CorrectnessResult<Self> {
         check_equal_u8(
             price_precision,
             price_increment.precision,
@@ -149,6 +157,14 @@ impl CryptoFuture {
         )?;
         check_positive_price(price_increment, stringify!(price_increment))?;
         check_positive_quantity(size_increment, stringify!(size_increment))?;
+
+        if let Some(multiplier) = multiplier {
+            check_positive_quantity(multiplier, stringify!(multiplier))?;
+        }
+
+        if let Some(lot_size) = lot_size {
+            check_positive_quantity(lot_size, stringify!(lot_size))?;
+        }
 
         Ok(Self {
             id: instrument_id,
@@ -175,6 +191,7 @@ impl CryptoFuture {
             min_notional,
             max_price,
             min_price,
+            info,
             ts_event,
             ts_init,
         })
@@ -185,7 +202,8 @@ impl CryptoFuture {
     /// # Panics
     ///
     /// Panics if any parameter is invalid (see `new_checked`).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
@@ -211,6 +229,7 @@ impl CryptoFuture {
         margin_maint: Option<Decimal>,
         maker_fee: Option<Decimal>,
         taker_fee: Option<Decimal>,
+        info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
     ) -> Self {
@@ -239,10 +258,11 @@ impl CryptoFuture {
             margin_maint,
             maker_fee,
             taker_fee,
+            info,
             ts_event,
             ts_init,
         )
-        .expect(FAILED)
+        .expect_display(FAILED)
     }
 }
 
@@ -361,6 +381,22 @@ impl Instrument for CryptoFuture {
         self.ts_init
     }
 
+    fn margin_init(&self) -> Decimal {
+        self.margin_init
+    }
+
+    fn margin_maint(&self) -> Decimal {
+        self.margin_maint
+    }
+
+    fn maker_fee(&self) -> Decimal {
+        self.maker_fee
+    }
+
+    fn taker_fee(&self) -> Decimal {
+        self.taker_fee
+    }
+
     fn strike_price(&self) -> Option<Price> {
         None
     }
@@ -386,11 +422,117 @@ impl Instrument for CryptoFuture {
 mod tests {
     use rstest::rstest;
 
-    use crate::instruments::{CryptoFuture, stubs::*};
+    use crate::{
+        enums::{AssetClass, InstrumentClass},
+        identifiers::{InstrumentId, Symbol},
+        instruments::{CryptoFuture, Instrument, stubs::*},
+        types::{Currency, Price, Quantity},
+    };
 
     #[rstest]
-    fn test_equality(crypto_future_btcusdt: CryptoFuture) {
-        let cloned = crypto_future_btcusdt;
-        assert_eq!(crypto_future_btcusdt, cloned);
+    fn test_trait_accessors(crypto_future_btcusdt: CryptoFuture) {
+        assert_eq!(
+            crypto_future_btcusdt.id(),
+            InstrumentId::from("ETHUSDT-123.BINANCE")
+        );
+        assert_eq!(
+            crypto_future_btcusdt.asset_class(),
+            AssetClass::Cryptocurrency
+        );
+        assert_eq!(
+            crypto_future_btcusdt.instrument_class(),
+            InstrumentClass::Future
+        );
+        assert_eq!(crypto_future_btcusdt.quote_currency(), Currency::USDT());
+        assert_eq!(
+            crypto_future_btcusdt.settlement_currency(),
+            Currency::USDT()
+        );
+        assert!(!crypto_future_btcusdt.is_inverse());
+        assert_eq!(crypto_future_btcusdt.price_precision(), 2);
+        assert_eq!(crypto_future_btcusdt.size_precision(), 6);
+        assert!(crypto_future_btcusdt.activation_ns().is_some());
+        assert!(crypto_future_btcusdt.expiration_ns().is_some());
+    }
+
+    #[rstest]
+    fn test_new_checked_price_precision_mismatch() {
+        let result = CryptoFuture::new_checked(
+            InstrumentId::from("TEST.BINANCE"),
+            Symbol::from("TEST"),
+            Currency::BTC(),
+            Currency::USDT(),
+            Currency::USDT(),
+            false,
+            0.into(),
+            0.into(),
+            4, // mismatch
+            6,
+            Price::from("0.01"),
+            Quantity::from("0.000001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    #[case::zero_multiplier(Some(Quantity::from("0")), None)]
+    #[case::zero_lot_size(None, Some(Quantity::from("0")))]
+    fn test_new_checked_rejects_non_positive_sizing(
+        #[case] multiplier: Option<Quantity>,
+        #[case] lot_size: Option<Quantity>,
+    ) {
+        let result = CryptoFuture::new_checked(
+            InstrumentId::from("TEST.BINANCE"),
+            Symbol::from("TEST"),
+            Currency::BTC(),
+            Currency::USDT(),
+            Currency::USDT(),
+            false,
+            0.into(),
+            0.into(),
+            2,
+            6,
+            Price::from("0.01"),
+            Quantity::from("0.000001"),
+            multiplier,
+            lot_size,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        );
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("not positive"), "{error}");
+    }
+
+    #[rstest]
+    fn test_serialization_roundtrip(crypto_future_btcusdt: CryptoFuture) {
+        let json = serde_json::to_string(&crypto_future_btcusdt).unwrap();
+        let deserialized: CryptoFuture = serde_json::from_str(&json).unwrap();
+        assert_eq!(crypto_future_btcusdt, deserialized);
     }
 }

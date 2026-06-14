@@ -21,7 +21,7 @@
 //! Usage:
 //! ```bash
 //! # Test against testnet (default)
-//! DYDX_PRIVATE_KEY="your hex private key" cargo run --bin dydx-ws-exec -p nautilus-dydx
+//! DYDX_TESTNET_PRIVATE_KEY="your hex private key" cargo run --bin dydx-ws-exec -p nautilus-dydx
 //!
 //! # Test against mainnet
 //! DYDX_PRIVATE_KEY="your hex private key" \
@@ -36,10 +36,14 @@
 use std::{env, time::Duration};
 
 use nautilus_dydx::{
-    common::consts::{DYDX_TESTNET_HTTP_URL, DYDX_TESTNET_WS_URL},
+    common::{
+        consts::{DYDX_TESTNET_HTTP_URL, DYDX_TESTNET_WS_URL},
+        credential::credential_env_vars,
+        enums::DydxNetwork,
+    },
     execution::wallet::Wallet,
     http::client::DydxHttpClient,
-    websocket::{NautilusWsMessage, client::DydxWebSocketClient},
+    websocket::{DydxWsOutputMessage, client::DydxWebSocketClient},
 };
 
 const DEFAULT_SUBACCOUNT: u32 = 0;
@@ -57,8 +61,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(DEFAULT_SUBACCOUNT);
 
+    let network = if is_mainnet {
+        DydxNetwork::Mainnet
+    } else {
+        DydxNetwork::Testnet
+    };
+    let (pk_var, _) = credential_env_vars(network);
     let private_key =
-        env::var("DYDX_PRIVATE_KEY").expect("DYDX_PRIVATE_KEY environment variable not set");
+        env::var(pk_var).map_err(|_| format!("{pk_var} environment variable not set"))?;
 
     let ws_url = if is_mainnet {
         env::var("DYDX_WS_URL").unwrap_or_else(|_| "wss://indexer.dydx.trade/v4/ws".to_string())
@@ -86,14 +96,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Wallet address: {wallet_address}");
     log::info!("");
 
-    let http_client =
-        DydxHttpClient::new(Some(http_url.clone()), Some(30), None, !is_mainnet, None)?;
+    let http_client = DydxHttpClient::new(Some(http_url.clone()), 30, None, network, None)?;
 
     log::info!("Fetching instruments from HTTP API...");
     let instruments = http_client.request_instruments(None, None, None).await?;
     log::info!("Fetched {} instruments", instruments.len());
 
-    let mut ws_client = DydxWebSocketClient::new_public(ws_url, Some(30));
+    let mut ws_client = DydxWebSocketClient::new_public(ws_url, Some(30), None);
     ws_client.cache_instruments(instruments);
     ws_client.connect().await?;
 
@@ -125,14 +134,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         log::debug!("[Event #{event_count}] {event:?}");
 
                         match event {
-                            NautilusWsMessage::Order(_) => {
-                                log::info!("[Event #{event_count}] Order status update received");
+                            DydxWsOutputMessage::SubaccountSubscribed(_) => {
+                                log::info!("[Event #{event_count}] Subaccount subscribed");
                             }
-                            NautilusWsMessage::Fill(_) => {
-                                log::info!("[Event #{event_count}] Fill update received");
-                            }
-                            NautilusWsMessage::Position(_) => {
-                                log::info!("[Event #{event_count}] Position update received");
+                            DydxWsOutputMessage::SubaccountsChannelData(ref data) => {
+                                let orders = data.contents.orders.as_ref().map_or(0, |o| o.len());
+                                let fills = data.contents.fills.as_ref().map_or(0, |f| f.len());
+                                log::info!("[Event #{event_count}] Channel data: {orders} order(s), {fills} fill(s)");
                             }
                             _ => {}
                         }

@@ -18,8 +18,8 @@
 //!
 //! The conversions are opinionated:
 //!
-//! * JSON is used as the interchange format for complex structures.
-//! * `ustr::Ustr` is preferred over `String` where possible for its performance benefits.
+//! - JSON is used as the interchange format for complex structures.
+//! - `ustr::Ustr` is preferred over `String` where possible for its performance benefits.
 //!
 //! All functions are `#[must_use]` and, unless otherwise noted, **assume** that the input pointer
 //! is non-null and points to a valid, *null-terminated* UTF-8 string.
@@ -34,7 +34,7 @@ use ustr::Ustr;
 
 use crate::{
     ffi::{abort_on_panic, string::cstr_as_str},
-    parsing::{min_increment_precision_from_str, precision_from_str},
+    string::parsing::{min_increment_precision_from_str, precision_from_str},
 };
 
 /// Convert a C bytes pointer into an owned `Vec<String>`.

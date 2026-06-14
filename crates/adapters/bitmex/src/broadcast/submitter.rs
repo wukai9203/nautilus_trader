@@ -55,7 +55,15 @@ use nautilus_model::{
 };
 use tokio::{sync::RwLock, task::JoinHandle, time::interval};
 
-use crate::{common::consts::BITMEX_HTTP_TESTNET_URL, http::client::BitmexHttpClient};
+use crate::{
+    common::{
+        consts::BITMEX_HTTP_TESTNET_URL,
+        enums::{BitmexEnvironment, BitmexPegPriceType},
+    },
+    http::{client::BitmexHttpClient, error::BitmexHttpError},
+};
+
+pub(crate) const DEFINITIVE_SUBMIT_REJECTION: &str = "DEFINITIVE_SUBMIT_REJECTION";
 
 /// Trait for order submission operations.
 ///
@@ -86,7 +94,7 @@ trait SubmitExecutor: Send + Sync {
     fn health_check(&self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>>;
 
     /// Submits a single order.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn submit_order(
         &self,
         instrument_id: InstrumentId,
@@ -105,6 +113,8 @@ trait SubmitExecutor: Send + Sync {
         reduce_only: bool,
         order_list_id: Option<OrderListId>,
         contingency_type: Option<ContingencyType>,
+        peg_price_type: Option<BitmexPegPriceType>,
+        peg_offset_value: Option<f64>,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderStatusReport>> + Send + '_>>;
 }
 
@@ -122,7 +132,6 @@ impl SubmitExecutor for BitmexHttpClient {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn submit_order(
         &self,
         instrument_id: InstrumentId,
@@ -141,6 +150,8 @@ impl SubmitExecutor for BitmexHttpClient {
         reduce_only: bool,
         order_list_id: Option<OrderListId>,
         contingency_type: Option<ContingencyType>,
+        peg_price_type: Option<BitmexPegPriceType>,
+        peg_offset_value: Option<f64>,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderStatusReport>> + Send + '_>> {
         Box::pin(async move {
             Self::submit_order(
@@ -161,6 +172,8 @@ impl SubmitExecutor for BitmexHttpClient {
                 reduce_only,
                 order_list_id,
                 contingency_type,
+                peg_price_type,
+                peg_offset_value,
             )
             .await
         })
@@ -178,22 +191,22 @@ pub struct SubmitBroadcasterConfig {
     pub api_secret: Option<String>,
     /// Base URL for BitMEX HTTP API.
     pub base_url: Option<String>,
-    /// If connecting to BitMEX testnet.
-    pub testnet: bool,
+    /// BitMEX environment (mainnet or testnet).
+    pub environment: BitmexEnvironment,
     /// Timeout in seconds for HTTP requests.
-    pub timeout_secs: Option<u64>,
+    pub timeout_secs: u64,
     /// Maximum number of retry attempts for failed requests.
-    pub max_retries: Option<u32>,
+    pub max_retries: u32,
     /// Initial delay in milliseconds between retry attempts.
-    pub retry_delay_ms: Option<u64>,
+    pub retry_delay_ms: u64,
     /// Maximum delay in milliseconds between retry attempts.
-    pub retry_delay_max_ms: Option<u64>,
+    pub retry_delay_max_ms: u64,
     /// Expiration window in milliseconds for signed requests.
-    pub recv_window_ms: Option<u64>,
+    pub recv_window_ms: u64,
     /// Maximum REST burst rate (requests per second).
-    pub max_requests_per_second: Option<u32>,
+    pub max_requests_per_second: u32,
     /// Maximum REST rolling rate (requests per minute).
-    pub max_requests_per_minute: Option<u32>,
+    pub max_requests_per_minute: u32,
     /// Interval in seconds between health check pings.
     pub health_check_interval_secs: u64,
     /// Timeout in seconds for health check requests.
@@ -215,17 +228,17 @@ impl Default for SubmitBroadcasterConfig {
             api_key: None,
             api_secret: None,
             base_url: None,
-            testnet: false,
-            timeout_secs: Some(60),
-            max_retries: None,
-            retry_delay_ms: Some(1_000),
-            retry_delay_max_ms: Some(5_000),
-            recv_window_ms: Some(10_000),
-            max_requests_per_second: Some(10),
-            max_requests_per_minute: Some(120),
+            environment: BitmexEnvironment::Mainnet,
+            timeout_secs: 60,
+            max_retries: 3,
+            retry_delay_ms: 1_000,
+            retry_delay_max_ms: 5_000,
+            recv_window_ms: 10_000,
+            max_requests_per_second: 10,
+            max_requests_per_minute: 120,
             health_check_interval_secs: 30,
             health_check_timeout_secs: 5,
-            expected_reject_patterns: vec![r"Duplicate clOrdID".to_string()],
+            expected_reject_patterns: vec!["Duplicate clOrdID".to_string()],
             proxy_urls: vec![],
         }
     }
@@ -311,7 +324,7 @@ impl TransportClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn submit_order(
         &self,
         instrument_id: InstrumentId,
@@ -330,6 +343,8 @@ impl TransportClient {
         reduce_only: bool,
         order_list_id: Option<OrderListId>,
         contingency_type: Option<ContingencyType>,
+        peg_price_type: Option<BitmexPegPriceType>,
+        peg_offset_value: Option<f64>,
     ) -> anyhow::Result<OrderStatusReport> {
         self.submit_count.fetch_add(1, Ordering::Relaxed);
 
@@ -352,6 +367,8 @@ impl TransportClient {
                 reduce_only,
                 order_list_id,
                 contingency_type,
+                peg_price_type,
+                peg_offset_value,
             )
             .await
         {
@@ -373,6 +390,10 @@ impl TransportClient {
 /// in parallel, short-circuits when the first successful acknowledgement is received,
 /// and handles expected rejection patterns (duplicate clOrdID) with appropriate log levels.
 #[cfg_attr(feature = "python", pyo3::pyclass)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitmex")
+)]
 #[derive(Debug)]
 pub struct SubmitBroadcaster {
     config: SubmitBroadcasterConfig,
@@ -394,11 +415,11 @@ impl SubmitBroadcaster {
     pub fn new(config: SubmitBroadcasterConfig) -> anyhow::Result<Self> {
         let mut transports = Vec::with_capacity(config.pool_size);
 
-        // Synthesize base_url when testnet is true but base_url is None
-        let base_url = if config.testnet && config.base_url.is_none() {
-            Some(BITMEX_HTTP_TESTNET_URL.to_string())
-        } else {
-            config.base_url.clone()
+        let base_url = match config.environment {
+            BitmexEnvironment::Testnet if config.base_url.is_none() => {
+                Some(BITMEX_HTTP_TESTNET_URL.to_string())
+            }
+            _ => config.base_url.clone(),
         };
 
         for i in 0..config.pool_size {
@@ -544,6 +565,7 @@ impl SubmitBroadcaster {
     {
         let mut errors = Vec::new();
         let mut all_duplicate_clordid = true;
+        let mut all_definitive_refusals = true;
 
         while !handles.is_empty() {
             let current_handles = std::mem::take(&mut handles);
@@ -563,9 +585,14 @@ impl SubmitBroadcaster {
                 Ok((client_id, Err(e))) => {
                     let error_msg = e.to_string();
                     let is_duplicate = error_msg.contains("Duplicate clOrdID");
+                    let is_definitive_refusal = is_definitive_submit_refusal(&e);
 
                     if !is_duplicate {
                         all_duplicate_clordid = false;
+                    }
+
+                    if !is_definitive_refusal {
+                        all_definitive_refusals = false;
                     }
 
                     if self.is_expected_reject(&error_msg) {
@@ -584,6 +611,7 @@ impl SubmitBroadcaster {
                 }
                 Err(e) => {
                     all_duplicate_clordid = false;
+                    all_definitive_refusals = false;
                     log::warn!("{operation} task join error: {e:?}");
                     errors.push(format!("Task panicked: {e:?}"));
                 }
@@ -601,6 +629,17 @@ impl SubmitBroadcaster {
                 operation.to_lowercase(),
             );
             anyhow::bail!("IDEMPOTENT_DUPLICATE: Order likely exists but confirmation was lost");
+        }
+
+        if all_definitive_refusals && !errors.is_empty() {
+            log::error!(
+                "All {} requests were refused by BitMEX: {errors:?} {params}",
+                operation.to_lowercase(),
+            );
+            anyhow::bail!(
+                "{DEFINITIVE_SUBMIT_REJECTION}: All {} requests were refused by BitMEX: {errors:?}",
+                operation.to_lowercase(),
+            );
         }
 
         log::error!(
@@ -624,7 +663,7 @@ impl SubmitBroadcaster {
     /// # Errors
     ///
     /// Returns an error if all submit requests fail or no healthy clients are available.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn broadcast_submit(
         &self,
         instrument_id: InstrumentId,
@@ -644,6 +683,8 @@ impl SubmitBroadcaster {
         order_list_id: Option<OrderListId>,
         contingency_type: Option<ContingencyType>,
         submit_tries: Option<usize>,
+        peg_price_type: Option<BitmexPegPriceType>,
+        peg_offset_value: Option<f64>,
     ) -> anyhow::Result<OrderStatusReport> {
         self.total_submits.fetch_add(1, Ordering::Relaxed);
 
@@ -681,6 +722,7 @@ impl SubmitBroadcaster {
         );
 
         let mut handles = Vec::new();
+
         for transport in healthy_transports {
             // All transports use the same client_order_id. If multiple succeed,
             // BitMEX rejects duplicates with "duplicate clOrdID" (expected rejection).
@@ -704,6 +746,8 @@ impl SubmitBroadcaster {
                         reduce_only,
                         order_list_id,
                         contingency_type,
+                        peg_price_type,
+                        peg_offset_value,
                     )
                     .await;
                 (client_id, result)
@@ -758,7 +802,7 @@ impl SubmitBroadcaster {
     }
 
     /// Caches an instrument in all HTTP clients in the pool.
-    pub fn cache_instrument(&self, instrument: InstrumentAny) {
+    pub fn cache_instrument(&self, instrument: &InstrumentAny) {
         for transport in self.transports.iter() {
             transport.executor.add_instrument(instrument.clone());
         }
@@ -794,6 +838,18 @@ impl SubmitBroadcaster {
             expected_rejects: Arc::new(AtomicU64::new(0)),
         }
     }
+}
+
+fn is_definitive_submit_refusal(err: &anyhow::Error) -> bool {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<BitmexHttpError>()
+            .is_some_and(|e| matches!(e, BitmexHttpError::BitmexError { .. }))
+    }) {
+        return true;
+    }
+
+    err.to_string().starts_with("Order rejected:")
 }
 
 /// Broadcaster metrics snapshot.
@@ -834,7 +890,7 @@ mod tests {
 
     /// Mock executor for testing.
     #[derive(Clone)]
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     struct MockExecutor {
         handler: Arc<
             dyn Fn() -> Pin<Box<dyn Future<Output = anyhow::Result<OrderStatusReport>> + Send>>
@@ -860,7 +916,6 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn submit_order(
             &self,
             _instrument_id: InstrumentId,
@@ -879,6 +934,8 @@ mod tests {
             _reduce_only: bool,
             _order_list_id: Option<OrderListId>,
             _contingency_type: Option<ContingencyType>,
+            _peg_price_type: Option<BitmexPegPriceType>,
+            _peg_offset_value: Option<f64>,
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderStatusReport>> + Send + '_>> {
             (self.handler)()
         }
@@ -973,6 +1030,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
 
@@ -1019,6 +1078,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
 
@@ -1060,6 +1121,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
 
@@ -1070,6 +1133,110 @@ mod tests {
                 .to_string()
                 .contains("All submit requests failed")
         );
+
+        let metrics = broadcaster.get_metrics_async().await;
+        assert_eq!(metrics.failed_submits, 1);
+        assert_eq!(metrics.successful_submits, 0);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_submit_all_bitmex_refusals_preserves_definitive_outcome() {
+        let transports = vec![
+            create_stub_transport("client-0", || async {
+                Err(anyhow::Error::new(BitmexHttpError::BitmexError {
+                    error_name: "HTTPError".to_string(),
+                    message: "Invalid price".to_string(),
+                }))
+            }),
+            create_stub_transport("client-1", || async {
+                Err(anyhow::Error::new(BitmexHttpError::BitmexError {
+                    error_name: "HTTPError".to_string(),
+                    message: "Invalid price".to_string(),
+                }))
+            }),
+        ];
+
+        let config = SubmitBroadcasterConfig::default();
+        let broadcaster = SubmitBroadcaster::new_with_transports(config, transports);
+
+        let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
+        let result = broadcaster
+            .broadcast_submit(
+                instrument_id,
+                ClientOrderId::from("O-REFUSED"),
+                OrderSide::Sell,
+                OrderType::Limit,
+                Quantity::new(50.0, 0),
+                TimeInForce::Gtc,
+                Some(Price::new(50000.0, 2)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        let err = result.unwrap_err().to_string();
+
+        assert!(err.starts_with(DEFINITIVE_SUBMIT_REJECTION));
+
+        let metrics = broadcaster.get_metrics_async().await;
+        assert_eq!(metrics.failed_submits, 1);
+        assert_eq!(metrics.successful_submits, 0);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_submit_mixed_refusal_and_network_failure_stays_ambiguous() {
+        let transports = vec![
+            create_stub_transport("client-0", || async {
+                Err(anyhow::Error::new(BitmexHttpError::BitmexError {
+                    error_name: "HTTPError".to_string(),
+                    message: "Invalid price".to_string(),
+                }))
+            }),
+            create_stub_transport("client-1", || async { anyhow::bail!("Connection refused") }),
+        ];
+
+        let config = SubmitBroadcasterConfig::default();
+        let broadcaster = SubmitBroadcaster::new_with_transports(config, transports);
+
+        let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
+        let result = broadcaster
+            .broadcast_submit(
+                instrument_id,
+                ClientOrderId::from("O-MIXED-FAILURE"),
+                OrderSide::Sell,
+                OrderType::Limit,
+                Quantity::from("50"),
+                TimeInForce::Gtc,
+                Some(Price::from("50000.00")),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        let err = result.unwrap_err().to_string();
+
+        assert!(err.starts_with("All submit requests failed"));
+        assert!(!err.starts_with(DEFINITIVE_SUBMIT_REJECTION));
 
         let metrics = broadcaster.get_metrics_async().await;
         assert_eq!(metrics.failed_submits, 1);
@@ -1105,6 +1272,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
 
@@ -1122,45 +1291,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_config() {
-        let config = SubmitBroadcasterConfig {
-            api_key: Some("test_key".to_string()),
-            api_secret: Some("test_secret".to_string()),
-            base_url: Some("https://test.example.com".to_string()),
-            ..Default::default()
-        };
+        let report = create_test_report("ORDER-1");
+        let transports: Vec<TransportClient> = (0..3)
+            .map(|i| {
+                let r = report.clone();
+                create_stub_transport(&format!("client-{i}"), move || {
+                    let r = r.clone();
+                    async move { Ok(r) }
+                })
+            })
+            .collect();
 
-        let broadcaster = SubmitBroadcaster::new(config);
-        assert!(broadcaster.is_ok());
-
-        let broadcaster = broadcaster.unwrap();
+        let config = SubmitBroadcasterConfig::default();
+        let broadcaster = SubmitBroadcaster::new_with_transports(config, transports);
         let metrics = broadcaster.get_metrics_async().await;
 
-        // Default pool_size is 3
         assert_eq!(metrics.total_clients, 3);
     }
 
     #[tokio::test]
     async fn test_broadcaster_lifecycle() {
-        let config = SubmitBroadcasterConfig {
-            pool_size: 2,
-            api_key: Some("test_key".to_string()),
-            api_secret: Some("test_secret".to_string()),
-            base_url: Some("https://test.example.com".to_string()),
-            testnet: false,
-            timeout_secs: Some(5),
-            max_retries: None,
-            retry_delay_ms: None,
-            retry_delay_max_ms: None,
-            recv_window_ms: None,
-            max_requests_per_second: None,
-            max_requests_per_minute: None,
-            health_check_interval_secs: 60,
-            health_check_timeout_secs: 1,
-            expected_reject_patterns: vec![],
-            proxy_urls: vec![],
-        };
+        let report = create_test_report("ORDER-1");
+        let transports: Vec<TransportClient> = (0..2)
+            .map(|i| {
+                let r = report.clone();
+                create_stub_transport(&format!("client-{i}"), move || {
+                    let r = r.clone();
+                    async move { Ok(r) }
+                })
+            })
+            .collect();
 
-        let broadcaster = SubmitBroadcaster::new(config).unwrap();
+        let config = SubmitBroadcasterConfig::default();
+        let broadcaster = SubmitBroadcaster::new_with_transports(config, transports);
 
         // Should not be running initially
         assert!(!broadcaster.running.load(Ordering::Relaxed));
@@ -1216,6 +1379,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
 
@@ -1227,18 +1392,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_broadcaster_creation_with_pool() {
-        let config = SubmitBroadcasterConfig {
-            pool_size: 4,
-            api_key: Some("test_key".to_string()),
-            api_secret: Some("test_secret".to_string()),
-            base_url: Some("https://test.example.com".to_string()),
-            ..Default::default()
-        };
+        let report = create_test_report("ORDER-1");
+        let transports: Vec<TransportClient> = (0..4)
+            .map(|i| {
+                let r = report.clone();
+                create_stub_transport(&format!("client-{i}"), move || {
+                    let r = r.clone();
+                    async move { Ok(r) }
+                })
+            })
+            .collect();
 
-        let broadcaster = SubmitBroadcaster::new(config);
-        assert!(broadcaster.is_ok());
-
-        let broadcaster = broadcaster.unwrap();
+        let config = SubmitBroadcasterConfig::default();
+        let broadcaster = SubmitBroadcaster::new_with_transports(config, transports);
         let metrics = broadcaster.get_metrics_async().await;
         assert_eq!(metrics.total_clients, 4);
     }
@@ -1275,6 +1441,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
 
@@ -1296,7 +1464,7 @@ mod tests {
             pool_size: 1,
             api_key: Some("test_key".to_string()),
             api_secret: Some("test_secret".to_string()),
-            testnet: true,
+            environment: BitmexEnvironment::Testnet,
             base_url: None,
             ..Default::default()
         };
@@ -1306,16 +1474,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clone_for_async() {
+    async fn test_constructor_honors_default_pool_size() {
         let config = SubmitBroadcasterConfig {
-            pool_size: 1,
             api_key: Some("test_key".to_string()),
             api_secret: Some("test_secret".to_string()),
-            base_url: Some("https://test.example.com".to_string()),
+            base_url: Some("http://127.0.0.1:19999".to_string()),
             ..Default::default()
         };
 
+        let expected_pool = config.pool_size;
         let broadcaster = SubmitBroadcaster::new(config).unwrap();
+        let metrics = broadcaster.get_metrics_async().await;
+
+        assert_eq!(metrics.total_clients, expected_pool);
+    }
+
+    #[tokio::test]
+    async fn test_clone_for_async() {
+        let report = create_test_report("ORDER-1");
+        let transports = vec![create_stub_transport("client-0", move || {
+            let r = report.clone();
+            async move { Ok(r) }
+        })];
+
+        let config = SubmitBroadcasterConfig::default();
+        let broadcaster = SubmitBroadcaster::new_with_transports(config, transports);
         let cloned = broadcaster.clone_for_async();
 
         // Verify they share the same atomics
@@ -1377,6 +1560,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
 
@@ -1390,15 +1575,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_initialization_and_health() {
-        let config = SubmitBroadcasterConfig {
-            pool_size: 2,
-            api_key: Some("test_key".to_string()),
-            api_secret: Some("test_secret".to_string()),
-            base_url: Some("https://test.example.com".to_string()),
-            ..Default::default()
-        };
+        let report = create_test_report("ORDER-1");
+        let transports: Vec<TransportClient> = (0..2)
+            .map(|i| {
+                let r = report.clone();
+                create_stub_transport(&format!("client-{i}"), move || {
+                    let r = r.clone();
+                    async move { Ok(r) }
+                })
+            })
+            .collect();
 
-        let broadcaster = SubmitBroadcaster::new(config).unwrap();
+        let config = SubmitBroadcasterConfig::default();
+        let broadcaster = SubmitBroadcaster::new_with_transports(config, transports);
         let metrics = broadcaster.get_metrics_async().await;
 
         assert_eq!(metrics.total_submits, 0);
@@ -1411,16 +1600,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check_task_lifecycle() {
-        let config = SubmitBroadcasterConfig {
-            pool_size: 2,
-            api_key: Some("test_key".to_string()),
-            api_secret: Some("test_secret".to_string()),
-            base_url: Some("https://test.example.com".to_string()),
-            health_check_interval_secs: 1,
-            ..Default::default()
-        };
+        let report = create_test_report("ORDER-1");
+        let transports: Vec<TransportClient> = (0..2)
+            .map(|i| {
+                let r = report.clone();
+                create_stub_transport(&format!("client-{i}"), move || {
+                    let r = r.clone();
+                    async move { Ok(r) }
+                })
+            })
+            .collect();
 
-        let broadcaster = SubmitBroadcaster::new(config).unwrap();
+        let config = SubmitBroadcasterConfig::default();
+        let broadcaster = SubmitBroadcaster::new_with_transports(config, transports);
 
         // Start should spawn health check task
         broadcaster.start().await.unwrap();
@@ -1474,6 +1666,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
 
@@ -1504,7 +1698,6 @@ mod tests {
                 Box::pin(async { Ok(()) })
             }
 
-            #[allow(clippy::too_many_arguments)]
             fn submit_order(
                 &self,
                 _instrument_id: InstrumentId,
@@ -1523,6 +1716,8 @@ mod tests {
                 _reduce_only: bool,
                 _order_list_id: Option<OrderListId>,
                 _contingency_type: Option<ContingencyType>,
+                _peg_price_type: Option<BitmexPegPriceType>,
+                _peg_offset_value: Option<f64>,
             ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderStatusReport>> + Send + '_>>
             {
                 // Capture the client_order_id
@@ -1597,6 +1792,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
 
@@ -1626,7 +1823,6 @@ mod tests {
                 Box::pin(async { Ok(()) })
             }
 
-            #[allow(clippy::too_many_arguments)]
             fn submit_order(
                 &self,
                 _instrument_id: InstrumentId,
@@ -1645,6 +1841,8 @@ mod tests {
                 _reduce_only: bool,
                 _order_list_id: Option<OrderListId>,
                 _contingency_type: Option<ContingencyType>,
+                _peg_price_type: Option<BitmexPegPriceType>,
+                _peg_offset_value: Option<f64>,
             ) -> Pin<Box<dyn Future<Output = anyhow::Result<OrderStatusReport>> + Send + '_>>
             {
                 // Capture the client_order_id
@@ -1658,6 +1856,7 @@ mod tests {
                 // (with concurrent execution, first success aborts others)
                 Box::pin(async move {
                     barrier.wait().await;
+
                     if should_succeed {
                         Ok(create_test_report("ORDER-1"))
                     } else {
@@ -1711,6 +1910,8 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
+                None,
                 None,
                 None,
                 None,
