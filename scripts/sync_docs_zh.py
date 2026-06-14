@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+# ruff: noqa: RUF001, RUF002, RUF003
+# 说明：本工具面向中文用户，docstring/help/输出含有意的中文全角标点，
+# 故在文件级忽略 RUF001/002/003（ambiguous-unicode）。不修改 upstream 的 pyproject.toml。
+"""
+docs_zh 增量同步工具。
+
+检测上游 ``docs/`` 变更、校验中文译文完整性、对照目录结构、推进同步状态。
+零第三方依赖（仅标准库）。供 ``/sync-docs-zh`` slash command 编排调用，也可独立运行。
+
+子命令：
+    detect           检测上游 docs 变更，输出待翻译清单
+    verify           校验中文译文完整性（行数/代码围栏/admonition/日韩文）
+    structure-check  对照 docs/docs_zh 三目录文件集，报缺译/多余
+    bump             推进 .sync-state 到给定 commit
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+GIT = shutil.which("git") or "git"
+DOCS_DIRS = ["docs/concepts", "docs/developer_guide", "docs/integrations"]
+SYNC_STATE = "docs_zh/.sync-state"
+SYNC_OVERRIDES = "docs_zh/.sync-overrides"
+
+
+def _run_git(args: list[str]) -> str:
+    """在仓库根运行 git，返回 stdout。"""
+    result = subprocess.run(  # noqa: S603 (safe - 命令固定为 git，无不可信输入)
+        [GIT, *args],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def _load_json(rel_path: str) -> dict:
+    """读取仓库内 JSON 文件；不存在时返回空 dict。"""
+    path = REPO_ROOT / rel_path
+    if not path.is_file():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _rename_map() -> dict[str, str]:
+    """从 .sync-overrides 构造 rename 类型的 en_new -> zh_new 映射。"""
+    overrides = _load_json(SYNC_OVERRIDES).get("overrides", [])
+    mapping: dict[str, str] = {}
+    for ov in overrides:
+        if ov.get("type") in ("rename", "map") and "en_new" in ov:
+            mapping[ov["en_new"]] = ov.get("zh_new", _default_zh(ov["en_new"]))
+    return mapping
+
+
+def _default_zh(en_path: str) -> str:
+    """默认映射 docs/X -> docs_zh/X。"""
+    return "docs_zh/" + en_path[len("docs/") :]
+
+
+def _count_lines(rel_path: str) -> int:
+    """统计文件行数（不存在返回 0）。"""
+    path = REPO_ROOT / rel_path
+    if not path.is_file():
+        return 0
+    return path.read_text(encoding="utf-8").count("\n")
+
+
+def cmd_detect(args: argparse.Namespace) -> int:
+    """检测 base..HEAD 间 docs/ 的变更，分为待翻译清单与结构异常。"""
+    base = args.base or _load_json(SYNC_STATE).get("upstream_commit")
+    if not base:
+        print(
+            "错误: 无法确定 diff 基准（.sync-state 缺 upstream_commit 且未给 --base）",
+            file=sys.stderr,
+        )
+        return 2
+
+    diff = _run_git(["diff", "--name-status", f"{base}..HEAD", "--", *DOCS_DIRS])
+    renames = _rename_map()
+    pending: list[dict] = []
+    anomalies: list[dict] = []
+
+    for line in diff.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        code = parts[0][0]
+        if code in ("A", "M"):
+            en = parts[1]
+            zh = renames.get(en, _default_zh(en))
+            pending.append(
+                {
+                    "en": en,
+                    "zh": zh,
+                    "exists": (REPO_ROOT / zh).is_file(),
+                    "en_lines": _count_lines(en),
+                    "status": "added" if code == "A" else "modified",
+                }
+            )
+        else:
+            # D（删除）/ R（改名）/ C（复制）等无法可靠自动映射 → 需人工确认
+            anomalies.append({"status_code": parts[0], "paths": parts[1:]})
+
+    if args.json:
+        payload = {"base": base, "pending": pending, "anomalies": anomalies}
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"基准 commit: {base}")
+    print(f"待翻译/更新: {len(pending)} 个文件")
+    for p in pending:
+        mode = "新建" if not p["exists"] else "更新"
+        print(f"  [{mode}] {p['en']} -> {p['zh']} ({p['en_lines']} 行)")
+    if anomalies:
+        print(f"\n⚠️ 结构异常（需人工确认映射，记入 .sync-overrides）: {len(anomalies)} 项")
+        for a in anomalies:
+            print(f"  {a['status_code']}: {' '.join(a['paths'])}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="docs_zh 增量同步工具")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_detect = sub.add_parser("detect", help="检测上游 docs 变更，输出待翻译清单")
+    p_detect.add_argument("--base", help="diff 基准 commit（默认取 .sync-state）")
+    p_detect.add_argument("--json", action="store_true", help="输出 JSON")
+    p_detect.set_defaults(func=cmd_detect)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
