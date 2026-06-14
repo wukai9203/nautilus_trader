@@ -1,5 +1,5 @@
 {
-  "upstream_commit": "11eeb0019a",
+  "upstream_commit": "98bd42f574",
   "upstream_ref": "upstream/develop",
   "synced_at": "2026-06-14",
   "comment": "记录 docs_zh 上次同步到的 upstream commit。sync_docs_zh.py detect 以此为 git diff 基准；同步完成后由 bump 推进。"
