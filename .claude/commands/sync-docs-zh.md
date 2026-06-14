@@ -35,9 +35,9 @@ argument-hint: "[--base <commit>] [--full]"
 
 1. 跑 `python3 scripts/sync_docs_zh.py detect --json`（`--full` 时改用 `structure-check` 的缺译清单）。
 2. 解析 `pending`（待翻译/更新清单）与 `anomalies`（结构异常）。
-3. **若 `anomalies` 非空 → 停止**，把改名/删除/新目录列给用户确认映射关系：
+3. **若 `anomalies` 非空 → 停止**，把删除/改名/复制（D/R/C）列给用户确认映射关系（新增文件——含新目录里的——是 A 状态，已自动进 `pending`，无需人工）：
    - 删除（D）：上游删了某英文文件 → 对应中文该删还是已被新结构取代？
-   - 改名/拆分：旧文件 → 新文件/目录的映射是什么？
+   - 改名/拆分（R，或表现为 D 旧 + A 新）：旧文件 → 新文件/目录的映射是什么？
    - 用户确认后写入 `docs_zh/.sync-overrides`（`type: rename|split|delete` + 路径 + `note`），再重跑 detect。
 4. `pending` 为空且无异常 → 已是最新，跳到阶段 5 收尾（无改动则直接结束）。
 

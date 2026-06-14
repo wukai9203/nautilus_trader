@@ -63,7 +63,7 @@
   - 读 `.sync-state` 基准（或 `--base`），跑 `git diff --name-status base..HEAD -- docs/concepts docs/developer_guide docs/integrations`。
   - 默认映射 `docs/X`→`docs_zh/X`，套用 `.sync-overrides` 例外。
   - 输出待翻译清单 JSON（每项 `en/zh/exists/en_lines/status∈{added,modified}`）。
-  - 单独区段列"结构异常"（renamed/deleted/新目录），需人工确认，不进自动翻译清单。
+  - 单独区段列"结构异常"（deleted/renamed/copied，即 D/R/C），需人工确认，不进自动翻译清单。新增文件（A，含新目录里的）自动进 pending。
 - **Step 1 证伪**: `python3 scripts/sync_docs_zh.py detect` 报错（未实现）。
 - **Step 4 证实**: 当前 `.sync-state=11eeb0019a` 且 HEAD 已同步完 → detect 输出空待翻译清单（diff 为空，天然回归场景）；`--base HEAD~N` 跨越某次 docs 改动 → 输出对应文件。
 - 提交。
