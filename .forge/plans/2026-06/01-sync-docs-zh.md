@@ -39,7 +39,7 @@
 | `scripts/sync_docs_zh.py` | Create | 检测/校验脚本：detect / verify / structure-check / bump |
 | `.claude/commands/sync-docs-zh.md` | Create（`git add -f`） | slash command 编排定义（`.claude` 被 gitignore） |
 | `docs_zh/.sync-state` | Create | 同步状态，初值 `upstream_commit: 11eeb0019a` |
-| `docs_zh/.sync-overrides` | Create | 重构映射表（YAML），种子记录本次 3 个重构 |
+| `docs_zh/.sync-overrides` | Create | 重构映射表（JSON），种子记录本次 3 个重构 |
 | `.forge/README.md` | Create | fork 内 forge 计划索引 |
 | `.forge/plans/2026-06/01-sync-docs-zh.md` | Create | 本计划文件 |
 
@@ -50,10 +50,10 @@
 
 - **Step 1 证伪**: `test ! -f docs_zh/.sync-state` 成立（尚未创建）。
 - **Step 2 实现**:
-  - `.sync-state` 写 `upstream_commit: 11eeb0019a` + `synced_at: 2026-06-14`。
-  - `.sync-overrides`（YAML）记录 detect 默认映射的例外：本次 3 个重构（`instruments.md`→`instruments/` 拆分、`orders.md`→`orders/` 拆分、`coinbase_intx.md`→`coinbase.md` 改名），标注 `status: done`，作为格式样例与历史。
-  - `.forge/README.md` 建索引，列本计划。
-- **Step 3 证实**: `python3 -c "import yaml; d=yaml.safe_load(open('docs_zh/.sync-state')); assert d['upstream_commit']=='11eeb0019a'"` 通过；`.sync-overrides` 可被 yaml 解析。
+  - `.sync-state`（JSON）写 `upstream_commit: 11eeb0019a` + `synced_at: 2026-06-14` + `upstream_ref: upstream/develop`。
+  - `.sync-overrides`（JSON）记录 detect 默认映射的例外：本次 3 个重构（`instruments.md`→`instruments/` 拆分、`orders.md`→`orders/` 拆分、`coinbase_intx.md`→`coinbase.md` 改名），标注 `status: done`，作为格式样例与历史。
+  - `.forge/README.md` 建索引，列本计划（已在 planning Step 5 随计划 commit 创建）。
+- **Step 3 证实**: `python3 -c "import json; d=json.load(open('docs_zh/.sync-state')); assert d['upstream_commit']=='11eeb0019a'"` 通过；`.sync-overrides` 可被 json 解析。
 - **Step 4 提交**: `git add .forge/README.md docs_zh/.sync-state docs_zh/.sync-overrides`。
 
 ### Task 2: detect 子命令
@@ -121,4 +121,4 @@
 ## 偏离与改进日志 (Deviations & Improvements)
 | 类型 | 位置 | 描述 | 已批准 |
 |------|------|------|--------|
-| （执行中记录） | | | |
+| IMPROVEMENT | Task 1 / sync_docs_zh.py | `.sync-state`/`.sync-overrides` 由 YAML 改为 JSON：实测环境无 `pyyaml`，独立工具脚本应零第三方依赖，JSON 用标准库即可解析。设计本质不变（仅序列化格式）。 | ✅ (执行时确认) |

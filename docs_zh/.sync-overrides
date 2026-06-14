@@ -1,0 +1,28 @@
+{
+  "comment": "记录 docs/ → docs_zh/ 的非默认映射例外（改名/拆分/删除）。detect 默认映射 docs/X → docs_zh/X；此处覆盖例外。type: rename|split|delete|map。status: done 表示该重构已落地，仅作历史与格式样例。",
+  "overrides": [
+    {
+      "type": "split",
+      "en_old": "docs/concepts/instruments.md",
+      "zh_target_dir": "docs_zh/concepts/instruments/",
+      "status": "done",
+      "note": "上游把单文件 instruments.md 拆为 instruments/ 目录（index.md + 各工具类型子文件）；旧 docs_zh/concepts/instruments.md 的人工注释已迁入 instruments/index.md 与 market_to_limit 等子文件"
+    },
+    {
+      "type": "split",
+      "en_old": "docs/concepts/orders.md",
+      "zh_target_dir": "docs_zh/concepts/orders/",
+      "status": "done",
+      "note": "上游把单文件 orders.md 拆为 orders/ 目录（index.md + 各订单类型子文件）；旧人工注释已迁入 orders/index.md 与 market_to_limit.md"
+    },
+    {
+      "type": "rename",
+      "en_old": "docs/integrations/coinbase_intx.md",
+      "en_new": "docs/integrations/coinbase.md",
+      "zh_old": "docs_zh/integrations/coinbase_intx.md",
+      "zh_new": "docs_zh/integrations/coinbase.md",
+      "status": "done",
+      "note": "上游 coinbase_intx（International Exchange）改为 coinbase（Advanced Trade API），内容不同，按新文件全文翻译"
+    }
+  ]
+}
