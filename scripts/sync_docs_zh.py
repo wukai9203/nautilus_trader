@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -128,6 +129,79 @@ def cmd_detect(args: argparse.Namespace) -> int:
     return 0
 
 
+# 禁止出现在中文译文里的字符：日文假名（U+3040–30FF）+ 韩文谚文（U+AC00–D7AF）
+# 用 \u 转义而非字面字符，避免源码内字面歧义 Unicode（参见 historical-lessons #2）
+CJK_FORBIDDEN = re.compile("[\\u3040-\\u30ff\\uac00-\\ud7af]")
+
+
+def _iter_zh_files() -> list[str]:
+    """列出 docs_zh 三目录下全部 .md（相对仓库根路径）。"""
+    files: list[str] = []
+    for d in ("concepts", "developer_guide", "integrations"):
+        base = REPO_ROOT / "docs_zh" / d
+        if base.is_dir():
+            files.extend(str(p.relative_to(REPO_ROOT)) for p in sorted(base.rglob("*.md")))
+    return files
+
+
+def _verify_one(rel_path: str) -> list[str]:
+    """校验单个中文文件，返回问题列表（空列表表示通过）。"""
+    path = REPO_ROOT / rel_path
+    if not path.is_file():
+        return ["文件不存在"]
+
+    text = path.read_text(encoding="utf-8")
+    problems: list[str] = []
+
+    fences = len(re.findall(r"^```", text, re.MULTILINE))
+    if fences % 2 != 0:
+        problems.append(f"代码围栏 ``` 不配对（{fences} 个）")
+
+    colons = len(re.findall(r"^:::", text, re.MULTILINE))
+    if colons % 2 != 0:
+        problems.append(f"admonition ::: 不配对（{colons} 个）")
+
+    found = CJK_FORBIDDEN.search(text)
+    if found:
+        problems.append(f"含日文假名/韩文谚文字符 U+{ord(found.group()):04X}")
+
+    # 行数下限：仅当能推导出对应英文源时校验
+    if rel_path.startswith("docs_zh/"):
+        en = "docs/" + rel_path[len("docs_zh/") :]
+        en_lines = _count_lines(en)
+        if en_lines:
+            zh_lines = text.count("\n")
+            floor = max(15, int(en_lines * 0.45))
+            if zh_lines < floor:
+                problems.append(f"行数过低 {zh_lines} < {floor}（英文 {en_lines}）")
+
+    return problems
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """校验中文译文完整性：行数/代码围栏/admonition/日韩文。"""
+    targets = _iter_zh_files() if args.all else list(args.files)
+    if not targets:
+        print("错误: 未指定文件，且未用 --all", file=sys.stderr)
+        return 2
+
+    failed = 0
+    for t in targets:
+        problems = _verify_one(t)
+        if problems:
+            failed += 1
+            print(f"✗ {t}")
+            for p in problems:
+                print(f"    - {p}")
+
+    total = len(targets)
+    if failed:
+        print(f"\n校验失败: {failed}/{total} 个文件有问题")
+        return 1
+    print(f"✓ 全部通过: {total} 个文件")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="docs_zh 增量同步工具")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -136,6 +210,11 @@ def main() -> int:
     p_detect.add_argument("--base", help="diff 基准 commit（默认取 .sync-state）")
     p_detect.add_argument("--json", action="store_true", help="输出 JSON")
     p_detect.set_defaults(func=cmd_detect)
+
+    p_verify = sub.add_parser("verify", help="校验中文译文完整性")
+    p_verify.add_argument("files", nargs="*", help="待校验文件（默认配合 --all）")
+    p_verify.add_argument("--all", action="store_true", help="校验所有 docs_zh 文件")
+    p_verify.set_defaults(func=cmd_verify)
 
     args = parser.parse_args()
     return args.func(args)
