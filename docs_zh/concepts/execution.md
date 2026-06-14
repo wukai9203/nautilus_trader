@@ -397,7 +397,7 @@ def orders_for_exec_spawn(self, exec_spawn_id: ClientOrderId) -> list[Order]:
 以下情况会增加对账竞态条件的可能性：
 
 - **阈值降低**：`open_check_threshold_ms` 和 `inflight_check_threshold_ms` 设置（两者默认均为 5,000 毫秒）定义了引擎在差异上采取行动前等待的时间。将其降低到与交易场所的往返延迟以下会增加通过对账处理成交先于实时事件到达（或反之）的可能性。
-- **对账频率增加**：将 `open_check_interval_secs` 设置为激进的值（例如 1-2 秒）会增加系统轮询交易场所的频率，从而增加与实时事件产生竞态条件的机会。
+- **对账频率增加**：将 `open_check_interval_secs` 或 `position_check_interval_secs` 设置为激进的值（例如 1-2 秒）会增加系统轮询交易场所的频率，从而增加与实时事件产生竞态条件的机会。
 - **启动延迟降低**：`reconciliation_startup_delay_secs` 设置（默认 10 秒）在持续对账开始前为 WebSocket 连接的稳定提供时间。降低此值会增加启动窗口期间重复成交的可能性。
 
 更多配置详情请参阅[持续对账](../how_to/configure_live_trading.md#continuous-reconciliation)。

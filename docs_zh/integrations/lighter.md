@@ -136,7 +136,7 @@ Rust 脚本会打印该操作的摘要，并在签名或发送之前暂停等待
 | 成交 Tick (Trade ticks)          | ✓            | -        | ✓     | `TradeTick`         | WebSocket 成交；历史 REST 成交需要鉴权。 |
 | 报价 Tick (Quote ticks)          | ✓            | -        | -     | `QuoteTick`         | 最优买卖 ticker 流。                                  |
 | 订单簿增量 (Order book deltas)    | ✓            | ✓        | -     | `OrderBookDeltas`   | 仅 `L2_MBP`。                                         |
-| 订单簿 depth10   | ✓            | ✓        | -     | `OrderBookDepth10`  | 完整的 WebSocket 订单簿快照。                            |
+| 订单簿 depth10   | ✓            | ✓        | -     | `OrderBookDepth10`  | 从维护的订单簿状态得到的实时前 10 档视图。           |
 | 订单簿快照 (Order book snapshots) | -            | ✓        | -     | `OrderBook`         | REST 快照，最大深度 250。                          |
 | 标记价格 (Mark prices)          | ✓            | -        | -     | `MarkPriceUpdate`   | 永续市场统计流。                              |
 | 指数价格 (Index prices)         | ✓            | -        | -     | `IndexPriceUpdate`  | 市场和现货统计流。                       |
@@ -147,6 +147,8 @@ Rust 脚本会打印该操作的摘要，并在签名或发送之前暂停等待
 订单簿增量和 depth10 订阅仅接受 `BookType::L2_MBP`。其他订单簿类型会在订阅前返回错误。
 
 WebSocket 订单簿仅从 `subscribed/order_book` 初始化。如果在该快照到达之前先收到了 `update/order_book`，适配器会将其丢弃并等待真正的快照，因为增量更新并不包含完整的可见订单簿。
+
+Depth10 订阅与增量使用相同的 WebSocket `order_book` 流。适配器在每次接受快照或增量更新后都会发出一份刷新后的前 10 档视图。
 
 Bar 订阅使用交易场所的 `candle/{market_id}/{resolution}` WebSocket 频道。Lighter 大约每 500 毫秒批量推送一次当前未收盘 bar 的进行中更新；适配器仅在 K 线起始时间戳前进时才发出一个 Nautilus `Bar`，因此消费者每个已收盘周期只会看到一个事件。进行中缓存会在重连和取消订阅时被清空。
 
