@@ -1,7 +1,8 @@
 # 01 - docs_zh 增量同步流程固化
 
-> **Status**: ⏳ In Progress
+> **Status**: ✅ Completed
 > **Created**: 2026-06-14
+> **Completed**: 2026-06-14
 > **Project**: nautilus_trader (fork) — docs_zh 中文文档层
 > **For Claude**: Use `/forge:execute` to implement this plan.
 
@@ -114,11 +115,33 @@
 | 1 基础设施+状态 | ✅ | 2026-06-14 | 2672c7e1d6；YAML→JSON 改进 |
 | 2 detect | ✅ | 2026-06-14 | 296218447d |
 | 3 verify | ✅ | 2026-06-14 | d0eccd9889 |
-| 4 structure-check+bump | 🔲 | | |
-| 5 slash command | 🔲 | | `.claude` 需 `git add -f` |
-| 6 close-out | 🔲 | | |
+| 4 structure-check+bump | ✅ | 2026-06-14 | 7826721ab8 |
+| 5 slash command | ✅ | 2026-06-14 | 0a69632fdf（`git add -f`） |
+| 6 close-out | ✅ | 2026-06-14 | 本 commit |
 
 ## 偏离与改进日志 (Deviations & Improvements)
 | 类型 | 位置 | 描述 | 已批准 |
 |------|------|------|--------|
 | IMPROVEMENT | Task 1 / sync_docs_zh.py | `.sync-state`/`.sync-overrides` 由 YAML 改为 JSON：实测环境无 `pyyaml`，独立工具脚本应零第三方依赖，JSON 用标准库即可解析。设计本质不变（仅序列化格式）。 | ✅ (执行时确认) |
+| IMPROVEMENT | Task 2 / sync_docs_zh.py | 用 `shutil.which("git")` 取绝对路径消除 S607、per-line `# noqa: S603` 处理 subprocess，沿用项目惯例；file-level `# ruff: noqa: RUF001/002/003` 声明有意中文标点。均不改 upstream 的 pyproject.toml。 | ✅ |
+| IMPROVEMENT | Task 4 / sync_docs_zh.py | `bump` 日期用 `_today_utc()`（timezone-aware UTC）替代 `date.today()`，满足项目 flake8-datetimez (DTZ011)。 | ✅ |
+| IMPROVEMENT | 自省 R1 / 命令+计划 | 修正"新目录"文档-实现不一致：detect 把新增文件（A，含新目录里的）归 pending 自动翻译，仅 D/R/C 为 anomalies。文档措辞同步纠正（commit 64680a0b0f）。 | ✅ |
+
+## 完成报告 (Close-out Report)
+
+- **完成日期**: 2026-06-14
+- **总 Task 数**: 6（全部 ✅）
+- **偏离数**: 4（全部 IMPROVEMENT，见上表）
+- **验证结果**: 全部通过
+  - `verify --all` → 99 文件全 PASS
+  - `structure-check` → docs/docs_zh 99=99 完全对应
+  - `detect`（已同步态）→ 0 待翻译
+  - `ruff check` / `format --check` → All checks passed
+- **实际产出**:
+  - `scripts/sync_docs_zh.py`（285 行，零第三方依赖）：detect / verify / structure-check / bump 四子命令
+  - `.claude/commands/sync-docs-zh.md`：5 阶段编排命令（`git add -f` 入库）
+  - `docs_zh/.sync-state`（基准 11eeb0019a）+ `docs_zh/.sync-overrides`（本次 3 个重构映射）
+  - `.forge/`：fork 内首个 forge 计划目录
+- **跨仓库同步**: 无（全部落在 nautilus_trader fork 内）
+- **遗留项**: 无
+  - 工具链备注：fork 的 uv 版本 pin 与本机不匹配，ruff 经 `miniforge ruff` 调用；执行者亦可用项目 `make ruff` / `make format`。
