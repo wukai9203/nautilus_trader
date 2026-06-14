@@ -18,6 +18,7 @@ docs_zh 增量同步工具。
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import shutil
@@ -202,6 +203,58 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _docs_md_set(base_dir: str) -> set[str]:
+    """返回 base_dir（docs 或 docs_zh）三目录下 .md 的相对路径集合。"""
+    out: set[str] = set()
+    root = REPO_ROOT / base_dir
+    for d in ("concepts", "developer_guide", "integrations"):
+        sub = root / d
+        if sub.is_dir():
+            out.update(str(p.relative_to(root)) for p in sub.rglob("*.md"))
+    return out
+
+
+def cmd_structure_check(args: argparse.Namespace) -> int:
+    """对照 docs/docs_zh 三目录文件集，报缺译/多余。"""
+    en = _docs_md_set("docs")
+    zh = _docs_md_set("docs_zh")
+    missing = sorted(en - zh)
+    extra = sorted(zh - en)
+
+    print(f"docs(英): {len(en)} 个  docs_zh(中): {len(zh)} 个")
+    if missing:
+        print(f"\n缺译（英有中无）: {len(missing)}")
+        for m in missing:
+            print(f"  - {m}")
+    if extra:
+        print(f"\n多余（中有英无）: {len(extra)}")
+        for e in extra:
+            print(f"  - {e}")
+    if missing or extra:
+        return 1
+    print("✓ 结构完全对应")
+    return 0
+
+
+def _today_utc() -> str:
+    """当前 UTC 日期（ISO 格式），timezone-aware 以满足 flake8-datetimez。"""
+    return datetime.datetime.now(datetime.UTC).date().isoformat()
+
+
+def cmd_bump(args: argparse.Namespace) -> int:
+    """推进 .sync-state 到给定 commit（默认 upstream/develop 当前 HEAD）。"""
+    commit = args.commit or _run_git(["rev-parse", "upstream/develop"]).strip()
+    short = commit[:10]
+    state = _load_json(SYNC_STATE)
+    state["upstream_commit"] = short
+    state.setdefault("upstream_ref", "upstream/develop")
+    state["synced_at"] = args.date or _today_utc()
+    path = REPO_ROOT / SYNC_STATE
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"已更新 .sync-state: upstream_commit={short} synced_at={state['synced_at']}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="docs_zh 增量同步工具")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -215,6 +268,14 @@ def main() -> int:
     p_verify.add_argument("files", nargs="*", help="待校验文件（默认配合 --all）")
     p_verify.add_argument("--all", action="store_true", help="校验所有 docs_zh 文件")
     p_verify.set_defaults(func=cmd_verify)
+
+    p_struct = sub.add_parser("structure-check", help="对照 docs/docs_zh 三目录文件集")
+    p_struct.set_defaults(func=cmd_structure_check)
+
+    p_bump = sub.add_parser("bump", help="推进 .sync-state 到给定 commit")
+    p_bump.add_argument("--commit", help="目标 commit（默认 upstream/develop）")
+    p_bump.add_argument("--date", help="同步日期（默认今天）")
+    p_bump.set_defaults(func=cmd_bump)
 
     args = parser.parse_args()
     return args.func(args)
