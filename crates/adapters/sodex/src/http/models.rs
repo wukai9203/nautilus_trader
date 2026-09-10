@@ -10,11 +10,18 @@ use serde::{Deserialize, Serialize};
 ///
 /// # On deciding success
 ///
-/// The documentation states that `error` is present when a request fails but does not
-/// publish the value `code` takes on success, so [`ApiResponse::into_result`] keys off the
-/// presence of `error` rather than asserting a magic number. Once a live round-trip
-/// establishes the success code, this can tighten into a check on both fields — until then,
-/// inventing a constant would be a guess dressed as a contract.
+/// Success is `code == 0`: the endpoint reference states the payload is returned "when code
+/// is `0`" for every endpoint, and per-order acknowledgements use the same convention
+/// (see [`orders::OrderAck::OK`](super::orders::OrderAck::OK)).
+///
+/// Both signals are checked, and either one alone is enough to fail the request. An `error`
+/// with a zero code, or a non-zero code with no message, are both shapes that should not
+/// reach a caller as success — treating one signal as authoritative and ignoring the other
+/// is how a rejection gets read as an empty result.
+///
+/// The code is compared leniently against `0` and `"0"` because the envelope carries it as
+/// untyped JSON, and a venue that switches between a number and a numeric string should not
+/// silently flip every response to "failed".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiResponse<T> {
     /// Venue status code. Retained verbatim for diagnostics.
@@ -38,13 +45,32 @@ impl<T> ApiResponse<T> {
     /// Returns [`EnvelopeError::Venue`] when `error` is set, and
     /// [`EnvelopeError::MissingData`] when the request succeeded but carried no payload.
     pub fn into_result(self) -> Result<T, EnvelopeError> {
+        let code_text = self.code.as_ref().map(ToString::to_string);
+
         if let Some(message) = self.error {
             return Err(EnvelopeError::Venue {
-                code: self.code.map(|c| c.to_string()),
+                code: code_text,
                 message,
             });
         }
+
+        if self.code.as_ref().is_some_and(|code| !is_success(code)) {
+            return Err(EnvelopeError::Venue {
+                code: code_text,
+                message: "venue reported a failure code without an error message".to_string(),
+            });
+        }
+
         self.data.ok_or(EnvelopeError::MissingData)
+    }
+}
+
+/// Whether a raw envelope code means success.
+fn is_success(code: &serde_json::Value) -> bool {
+    match code {
+        serde_json::Value::Number(n) => n.as_i64() == Some(0),
+        serde_json::Value::String(s) => s == "0",
+        _ => false,
     }
 }
 
@@ -110,6 +136,35 @@ mod tests {
         let parsed: ApiResponse<Payload> = serde_json::from_str(raw).unwrap();
 
         assert_eq!(parsed.into_result().unwrap_err(), EnvelopeError::MissingData);
+    }
+
+    #[test]
+    fn nonzero_code_fails_even_without_an_error_message() {
+        // Keying only off `error` would hand this to the caller as MissingData, hiding a
+        // rejection behind what looks like an empty result.
+        let raw = r#"{"code":21104,"timestamp":1,"data":{"aid":1}}"#;
+        let parsed: ApiResponse<Payload> = serde_json::from_str(raw).unwrap();
+
+        let err = parsed.into_result().unwrap_err();
+        assert!(matches!(err, EnvelopeError::Venue { .. }));
+        assert!(err.to_string().contains("21104"), "{err}");
+    }
+
+    #[test]
+    fn numeric_string_code_is_still_success() {
+        let raw = r#"{"code":"0","timestamp":1,"data":{"aid":9}}"#;
+        let parsed: ApiResponse<Payload> = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(parsed.into_result().unwrap(), Payload { aid: 9 });
+    }
+
+    #[test]
+    fn absent_code_does_not_by_itself_fail_the_response() {
+        // Not every endpoint documents a code; absence must not be read as failure.
+        let raw = r#"{"timestamp":1,"data":{"aid":3}}"#;
+        let parsed: ApiResponse<Payload> = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(parsed.into_result().unwrap(), Payload { aid: 3 });
     }
 
     #[test]

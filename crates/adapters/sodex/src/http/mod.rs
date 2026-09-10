@@ -16,9 +16,11 @@
 //! key in a trading process.
 
 pub mod models;
+pub mod orders;
 pub mod ratelimit;
 
 pub use models::{ApiResponse, EnvelopeError};
+pub use orders::{AlignError, OrderAck, align_batch};
 pub use ratelimit::{Axis, BatchCost, RateLimited, WeightBudget};
 
 use crate::common::Market;
