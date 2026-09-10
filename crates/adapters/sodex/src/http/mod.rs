@@ -18,10 +18,12 @@
 pub mod models;
 pub mod orders;
 pub mod ratelimit;
+pub mod requests;
 
 pub use models::{ApiResponse, EnvelopeError};
 pub use orders::{AlignError, OrderAck, align_batch};
 pub use ratelimit::{Axis, BatchCost, RateLimited, WeightBudget};
+pub use requests::{CancelOrderRequest, ClientOrderId, NewOrderRequest, OrderItem, RequestError};
 
 use crate::common::Market;
 

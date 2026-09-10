@@ -134,66 +134,24 @@ mod tests {
     use super::*;
     use crate::common::CHAIN_ID_TESTNET;
 
-    /// A perps order item, with field order mirroring the Go SDK's `PerpsOrderItem`:
-    /// `clOrdID, modifier, side, type, timeInForce, price, quantity, funds, stopPrice,
-    /// stopType, triggerType, reduceOnly, positionSide`.
-    #[derive(Serialize)]
-    #[allow(clippy::struct_field_names)]
-    struct PerpsOrderItem {
-        #[serde(rename = "clOrdID")]
-        cl_ord_id: String,
-        modifier: u8,
-        side: u8,
-        #[serde(rename = "type")]
-        order_type: u8,
-        #[serde(rename = "timeInForce")]
-        time_in_force: u8,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        price: Option<String>,
-        quantity: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        funds: Option<String>,
-        #[serde(rename = "stopPrice", skip_serializing_if = "Option::is_none")]
-        stop_price: Option<String>,
-        #[serde(rename = "stopType", skip_serializing_if = "Option::is_none")]
-        stop_type: Option<u8>,
-        #[serde(rename = "triggerType", skip_serializing_if = "Option::is_none")]
-        trigger_type: Option<u8>,
-        #[serde(rename = "reduceOnly")]
-        reduce_only: bool,
-        #[serde(rename = "positionSide")]
-        position_side: u8,
-    }
+    use crate::{
+        common::enums::OrderSide,
+        http::requests::{ClientOrderId, NewOrderRequest, OrderItem},
+    };
 
-    #[derive(Serialize)]
-    struct NewOrderParams {
-        #[serde(rename = "accountID")]
-        account_id: u64,
-        #[serde(rename = "symbolID")]
-        symbol_id: u32,
-        orders: Vec<PerpsOrderItem>,
-    }
-
-    fn doc_example_params() -> NewOrderParams {
-        NewOrderParams {
-            account_id: 12345,
-            symbol_id: 1,
-            orders: vec![PerpsOrderItem {
-                cl_ord_id: "my-order-1".to_string(),
-                modifier: 1,
-                side: 1,
-                order_type: 2,
-                time_in_force: 3,
-                price: None,
-                quantity: "0.001".to_string(),
-                funds: None,
-                stop_price: None,
-                stop_type: None,
-                trigger_type: None,
-                reduce_only: false,
-                position_side: 1,
-            }],
-        }
+    /// The venue's worked example, built from the production request types.
+    ///
+    /// Deliberately not a local copy of the payload shape: a duplicate would drift from the
+    /// real types, and these tests would then keep passing against a payload the adapter no
+    /// longer sends.
+    fn doc_example_params() -> NewOrderRequest {
+        let cl_ord_id = ClientOrderId::parse("my-order-1").expect("valid id");
+        NewOrderRequest::new(
+            12345,
+            1,
+            vec![OrderItem::market(cl_ord_id, OrderSide::Buy, "0.001")],
+        )
+        .expect("valid batch")
     }
 
     /// Pins the serialized form against the worked example in the venue's signing guide.
