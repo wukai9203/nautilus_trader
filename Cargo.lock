@@ -6826,6 +6826,7 @@ dependencies = [
  "nautilus-core",
  "nautilus-model",
  "nautilus-network",
+ "parking_lot",
  "rust_decimal",
  "serde",
  "serde_json",

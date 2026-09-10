@@ -128,14 +128,24 @@ impl State {
     }
 }
 
+/// A live connection and the task draining it.
+#[derive(Debug)]
+struct Connection {
+    client: Arc<WebSocketClient>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
 /// Streaming client for one network and market.
+///
+/// Subscribing takes `&self` so the client can be shared: a data client hands one to the task
+/// that drains the stream and still subscribes from the engine's thread. The connection is
+/// therefore held behind a lock rather than in `&mut self`.
 #[derive(Debug)]
 pub struct SodexWebSocketClient {
     url: String,
     probe_interval_secs: u64,
-    client: Option<Arc<WebSocketClient>>,
+    connection: parking_lot::Mutex<Option<Connection>>,
     state: Arc<Mutex<State>>,
-    reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SodexWebSocketClient {
@@ -145,9 +155,8 @@ impl SodexWebSocketClient {
         Self {
             url: stream_url(network, market),
             probe_interval_secs: DEFAULT_IDLE_PROBE_SECS,
-            client: None,
+            connection: parking_lot::Mutex::new(None),
             state: Arc::new(Mutex::new(State::default())),
-            reader: None,
         }
     }
 
@@ -200,7 +209,7 @@ impl SodexWebSocketClient {
     /// # Errors
     ///
     /// Returns [`WsError::Transport`] if the connection cannot be established.
-    pub async fn connect(&mut self) -> Result<UnboundedReceiver<SodexWsEvent>, WsError> {
+    pub async fn connect(&self) -> Result<UnboundedReceiver<SodexWsEvent>, WsError> {
         let (message_handler, raw_rx) = channel_epoch_message_handler();
 
         let client = WebSocketClient::epoch_builder()
@@ -219,10 +228,32 @@ impl SodexWebSocketClient {
             Arc::clone(&self.state),
         ));
 
-        self.client = Some(client);
-        self.reader = Some(reader);
+        if let Some(previous) = self.connection.lock().replace(Connection { client, reader }) {
+            previous.reader.abort();
+        }
 
         Ok(events_rx)
+    }
+
+    /// The live transport, if this client has connected.
+    ///
+    /// Cloned out of the lock rather than borrowed: sends await, and holding a
+    /// non-async lock across an await would block every other caller on the socket.
+    fn transport(&self) -> Result<Arc<WebSocketClient>, WsError> {
+        self.connection
+            .lock()
+            .as_ref()
+            .map(|connection| Arc::clone(&connection.client))
+            .ok_or(WsError::NotConnected)
+    }
+
+    /// Whether this client has a live connection.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.connection
+            .lock()
+            .as_ref()
+            .is_some_and(|connection| connection.client.is_active())
     }
 
     /// Subscribes to a candle feed, doing nothing if it is already subscribed.
@@ -232,7 +263,7 @@ impl SodexWebSocketClient {
     /// Returns [`WsError::NotConnected`] before [`Self::connect`], or [`WsError::Transport`]
     /// if the send fails for a reason a reconnect will not repair.
     pub async fn subscribe_candles(&self, params: CandleParams) -> Result<(), WsError> {
-        let client = self.client.as_ref().ok_or(WsError::NotConnected)?;
+        let client = self.transport()?;
         let mut state = self.state.lock().await;
 
         if !state.want(&params) {
@@ -243,7 +274,7 @@ impl SodexWebSocketClient {
         // either composed for the connection the handler has already replayed onto, or it is
         // in the desired list before that replay reads it. There is no ordering in which the
         // subscription is both absent from the replay and bound to a dead connection.
-        send_request(client, &mut state, Op::Subscribe, params).await
+        send_request(&client, &mut state, Op::Subscribe, params).await
     }
 
     /// Unsubscribes from a candle feed, doing nothing if it is not subscribed.
@@ -253,7 +284,7 @@ impl SodexWebSocketClient {
     /// Returns [`WsError::NotConnected`] before [`Self::connect`], or [`WsError::Transport`]
     /// if the send fails for a reason a reconnect will not repair.
     pub async fn unsubscribe_candles(&self, params: &CandleParams) -> Result<(), WsError> {
-        let client = self.client.as_ref().ok_or(WsError::NotConnected)?;
+        let client = self.transport()?;
         let mut state = self.state.lock().await;
 
         if !state.unwant(params) {
@@ -263,7 +294,7 @@ impl SodexWebSocketClient {
         // Losing this send to a reconnect needs no repair: the replacement connection starts
         // with no subscriptions and is replayed from a desired list that no longer holds this
         // one, so the feed is gone either way.
-        send_request(client, &mut state, Op::Unsubscribe, params.clone()).await
+        send_request(&client, &mut state, Op::Unsubscribe, params.clone()).await
     }
 
     /// The selectors this client currently wants subscribed.
@@ -272,13 +303,12 @@ impl SodexWebSocketClient {
     }
 
     /// Closes the connection and stops consuming the stream.
-    pub async fn close(&mut self) {
-        if let Some(client) = self.client.take() {
-            client.disconnect().await;
-        }
-        if let Some(reader) = self.reader.take() {
-            reader.abort();
-        }
+    pub async fn close(&self) {
+        let Some(connection) = self.connection.lock().take() else {
+            return;
+        };
+        connection.client.disconnect().await;
+        connection.reader.abort();
     }
 }
 
