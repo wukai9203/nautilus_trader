@@ -65,7 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!();
 
-    match client.send::<serde_json::Value>(request).await {
+    // scheduleCancel documents no endpoint-specific payload, so an accepted request returns
+    // an empty data field. Treating that as an error would report a working signature as a
+    // failure — which is exactly what happened on the first run of this probe.
+    match client.send_optional::<serde_json::Value>(request).await {
         Ok(data) => {
             println!("ACCEPTED — trading-domain signing verified end to end");
             println!("response data: {data:?}");

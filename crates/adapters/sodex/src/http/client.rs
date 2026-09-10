@@ -19,7 +19,7 @@ use serde::Serialize;
 
 use super::{
     Network,
-    models::ApiResponse,
+    models::{ApiResponse, EnvelopeError},
     ratelimit::{RateLimited, WeightBudget},
     requests::RequestError,
 };
@@ -260,6 +260,49 @@ impl SodexHttpClient {
             .await?;
 
         Self::decode(response)
+    }
+
+    /// Sends a prepared request against an endpoint that may return no payload.
+    ///
+    /// Several trading endpoints — `scheduleCancel`, `updateLeverage`, `updateMargin`,
+    /// `modifyOrder` — document "no endpoint-specific data". For those, an absent `data` is
+    /// the success case, not the missing-payload error [`send`](Self::send) reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, status or venue-level failure. An accepted
+    /// request that returns nothing yields `Ok(None)`.
+    pub async fn send_optional<T: serde::de::DeserializeOwned>(
+        &self,
+        request: SignedRequest,
+    ) -> Result<Option<T>, ClientError> {
+        let response = self
+            .http
+            .request(
+                request.method,
+                request.url,
+                None,
+                Some(request.headers),
+                Some(request.body),
+                None,
+                None,
+            )
+            .await?;
+
+        let status = response.status.as_u16();
+        if !(200..300).contains(&status) {
+            return Err(ClientError::Status {
+                status,
+                body: String::from_utf8_lossy(&response.body).into_owned(),
+            });
+        }
+
+        let envelope: ApiResponse<T> = serde_json::from_slice(&response.body)?;
+        match envelope.into_result() {
+            Ok(data) => Ok(Some(data)),
+            Err(EnvelopeError::MissingData) => Ok(None),
+            Err(other) => Err(ClientError::Transport(other.to_string())),
+        }
     }
 
     /// Sends an unsigned GET against a market-data path.
