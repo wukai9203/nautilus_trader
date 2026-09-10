@@ -247,6 +247,16 @@ pub struct NewOrderRequest {
 }
 
 impl NewOrderRequest {
+    /// Path this request must be posted to.
+    ///
+    /// Perps batches post here directly; the spot equivalent is `/trade/orders/batch`, and
+    /// posting a perps-shaped batch to spot's `/trade/orders` is rejected. Binding the path
+    /// to the request type keeps the two from being crossed.
+    pub const ENDPOINT: &'static str = "/trade/orders";
+
+    /// Action name for the signing payload.
+    pub const ACTION: &'static str = "newOrder";
+
     /// Builds a batch, validating size and every order.
     ///
     /// # Errors
@@ -380,6 +390,12 @@ pub struct CancelOrderRequest {
 }
 
 impl CancelOrderRequest {
+    /// Path this request must be sent to, with `DELETE`.
+    pub const ENDPOINT: &'static str = "/trade/orders";
+
+    /// Action name for the signing payload.
+    pub const ACTION: &'static str = "cancelOrder";
+
     /// Builds a cancel batch, validating size and every item.
     ///
     /// # Errors

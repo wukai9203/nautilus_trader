@@ -80,7 +80,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request = SpotNewOrderRequest::new(account_id, vec![order])?;
     let submitted = request.client_order_ids();
 
-    let signed = client.build_signed(Method::POST, "/trade/orders", "newOrder", &request)?;
+    let signed = client.build_signed(
+        Method::POST,
+        SpotNewOrderRequest::ENDPOINT,
+        SpotNewOrderRequest::ACTION,
+        &request,
+    )?;
     println!("POST {}", signed.url);
     println!("body {}", signed.body_str());
 
@@ -117,7 +122,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )],
     )?;
 
-    let signed = client.build_signed(Method::DELETE, "/trade/orders", "cancelOrder", &cancel)?;
+    let signed = client.build_signed(
+        Method::DELETE,
+        SpotCancelOrderRequest::ENDPOINT,
+        SpotCancelOrderRequest::ACTION,
+        &cancel,
+    )?;
     println!("DELETE {}", signed.url);
     println!("body   {}", signed.body_str());
 

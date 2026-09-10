@@ -10,8 +10,18 @@
 //!   uses `clOrdID` for the target directly, so porting a perps cancel across would cancel
 //!   nothing while looking correct.
 //!
+//! - **The batch endpoints live at a different path.** Spot batches go to
+//!   `/trade/orders/batch`, while the perps batch endpoint is `/trade/orders`. Spot's
+//!   `/trade/orders` is a *single-order* endpoint, so posting a batch there is rejected for
+//!   missing the top-level `symbolID`, `clOrdID`, `side`, `type` and `timeInForce` — the
+//!   fields it wanted flat rather than nested. The path is therefore bound to the request
+//!   type as [`SpotNewOrderRequest::ENDPOINT`] instead of left to the caller.
+//!
 //! Spot order items also lack the perps-only fields — no modifier, stop, trigger,
 //! reduce-only or position side — since those describe positions, which spot does not have.
+//!
+//! One more asymmetry worth knowing when pricing orders: spot's limit price bounds are
+//! computed from `lastTradePrice`, while perps uses `markPrice`.
 //!
 //! Field order mirrors the venue's schema tables, for the same signing reason as perps.
 
@@ -124,6 +134,14 @@ pub struct SpotNewOrderRequest {
 }
 
 impl SpotNewOrderRequest {
+    /// Path this request must be posted to.
+    ///
+    /// Not `/trade/orders` — that is spot's single-order endpoint and rejects a batch.
+    pub const ENDPOINT: &'static str = "/trade/orders/batch";
+
+    /// Action name for the signing payload.
+    pub const ACTION: &'static str = "newOrder";
+
     /// Builds a batch, validating size and every order.
     ///
     /// # Errors
@@ -222,6 +240,12 @@ pub struct SpotCancelOrderRequest {
 }
 
 impl SpotCancelOrderRequest {
+    /// Path this request must be sent to, with `DELETE`.
+    pub const ENDPOINT: &'static str = "/trade/orders/batch";
+
+    /// Action name for the signing payload.
+    pub const ACTION: &'static str = "cancelOrder";
+
     /// Builds a cancel batch, validating size and every item.
     ///
     /// # Errors
@@ -359,5 +383,21 @@ mod tests {
             SpotNewOrderRequest::new(1, vec![]).unwrap_err(),
             RequestError::BatchSize(0)
         );
+    }
+
+    #[test]
+    fn spot_batches_target_the_batch_path_not_the_single_order_one() {
+        // Posting to /trade/orders reaches spot's single-order endpoint, which rejects the
+        // batch for missing the flat fields it expects. This was a live failure, not a
+        // hypothetical.
+        use crate::http::requests::{CancelOrderRequest, NewOrderRequest};
+
+        assert_eq!(SpotNewOrderRequest::ENDPOINT, "/trade/orders/batch");
+        assert_eq!(SpotCancelOrderRequest::ENDPOINT, "/trade/orders/batch");
+
+        // And the perps paths deliberately differ.
+        assert_eq!(NewOrderRequest::ENDPOINT, "/trade/orders");
+        assert_eq!(CancelOrderRequest::ENDPOINT, "/trade/orders");
+        assert_ne!(SpotNewOrderRequest::ENDPOINT, NewOrderRequest::ENDPOINT);
     }
 }
