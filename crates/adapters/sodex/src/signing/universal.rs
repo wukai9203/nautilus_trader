@@ -188,7 +188,8 @@ impl UniversalSigner {
             .sign_hash_sync(&digest)
             .map_err(|e| SigningError::Sign(e.to_string()))?;
 
-        let raw = signature.as_bytes();
+        // See the note in `signers.rs`: the recovery id must be 0 or 1, not `27 + parity`.
+        let raw = signature.as_rsy();
         let mut out = Vec::with_capacity(1 + raw.len());
         out.push(SignatureKind::Universal.prefix());
         out.extend_from_slice(&raw);
@@ -311,6 +312,34 @@ mod tests {
             sign_mask(DisabledPermissions::none().as_mask()),
             sign_mask(DisabledPermissions::cancel_only().as_mask())
         );
+    }
+
+    #[test]
+    fn recovery_id_is_raw_zero_or_one_not_eip155_v() {
+        // Same gateway constraint as the exchange signer; registration failed on this first.
+        let signer = signer(CHAIN_ID_TESTNET);
+
+        let seen: Vec<u8> = (0..32)
+            .map(|n| {
+                let sig = signer
+                    .sign_add_api_key(
+                        CHAIN_ID_TESTNET,
+                        1_760_373_925_000 + n,
+                        1010,
+                        "api-key-01",
+                        1,
+                        public_key(),
+                        0,
+                    )
+                    .unwrap();
+                sig[65]
+            })
+            .collect();
+
+        for recovery_id in &seen {
+            assert!(*recovery_id <= 1, "recovery id {recovery_id} must be 0 or 1");
+        }
+        assert!(seen.contains(&0) && seen.contains(&1), "both parities exercised");
     }
 
     #[test]

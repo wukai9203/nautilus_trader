@@ -147,7 +147,11 @@ impl ExchangeSigner {
             .sign_hash_sync(&digest)
             .map_err(|e| SigningError::Sign(e.to_string()))?;
 
-        let raw = signature.as_bytes();
+        // `as_rsy`, not `as_bytes`: the gateway recovers the signer from a raw recovery id
+        // of 0 or 1, while `as_bytes` emits the EIP-155 style `27 + parity`. Sending the
+        // latter is rejected with "Invalid recovery ID: bad recovery id" — a distinction the
+        // venue's documentation never states, since it publishes no expected signature bytes.
+        let raw = signature.as_rsy();
         let mut out = Vec::with_capacity(1 + raw.len());
         out.push(SignatureKind::Exchange.prefix());
         out.extend_from_slice(&raw);
@@ -227,6 +231,33 @@ mod tests {
 
         assert_eq!(sig.len(), 66, "1 prefix byte + 65 signature bytes");
         assert_eq!(sig[0], 0x01);
+    }
+
+    /// The gateway rejected `27 + parity` with "Invalid recovery ID: bad recovery id" on the
+    /// first live attempt. Nothing in the venue's documentation states which convention it
+    /// wants — it publishes no expected signature bytes — so this test carries the finding.
+    #[test]
+    fn recovery_id_is_raw_zero_or_one_not_eip155_v() {
+        let key = ApiPrivateKey::parse(&"2".repeat(64)).unwrap();
+        let signer = ExchangeSigner::new(&key, Market::Perps, CHAIN_ID_TESTNET).unwrap();
+
+        // Sign enough distinct nonces to hit both parities; either one alone would pass a
+        // weaker assertion by luck.
+        let seen: Vec<u8> = (0..32)
+            .map(|nonce| {
+                let hash = payload_hash("newOrder", &doc_example_params()).unwrap();
+                let sig = signer.sign_action(hash, 1_760_373_925_000 + nonce).unwrap();
+                sig[65]
+            })
+            .collect();
+
+        for recovery_id in &seen {
+            assert!(
+                *recovery_id <= 1,
+                "recovery id {recovery_id} is EIP-155 style; the gateway needs 0 or 1"
+            );
+        }
+        assert!(seen.contains(&0) && seen.contains(&1), "both parities exercised");
     }
 
     /// Spot and perps sign under different domains, so the same payload must not produce
