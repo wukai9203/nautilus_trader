@@ -6814,6 +6814,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nautilus-sodex"
+version = "0.64.0"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "nautilus-system"
 version = "0.64.0"
 dependencies = [
