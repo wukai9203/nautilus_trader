@@ -289,6 +289,43 @@ impl NewOrderRequest {
     }
 }
 
+/// Body of `POST /trade/orders/schedule-cancel`.
+///
+/// A dead-man switch: at the scheduled time the venue cancels every open order. Omitting the
+/// timestamp clears any pending schedule, which makes that form a harmless idempotent
+/// no-op — useful as a probe that exercises the full trading-domain signing path without
+/// placing or touching an order.
+///
+/// The venue requires a scheduled time at least 5 seconds out, and counts triggers against a
+/// daily limit of 10; clearing does not consume one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScheduleCancelRequest {
+    #[serde(rename = "accountID")]
+    pub account_id: u64,
+    #[serde(rename = "scheduledTimestamp", skip_serializing_if = "Option::is_none")]
+    pub scheduled_timestamp: Option<u64>,
+}
+
+impl ScheduleCancelRequest {
+    /// Clears any pending scheduled cancel.
+    #[must_use]
+    pub const fn clear(account_id: u64) -> Self {
+        Self {
+            account_id,
+            scheduled_timestamp: None,
+        }
+    }
+
+    /// Arms the dead-man switch for a given millisecond timestamp.
+    #[must_use]
+    pub const fn at(account_id: u64, scheduled_timestamp: u64) -> Self {
+        Self {
+            account_id,
+            scheduled_timestamp: Some(scheduled_timestamp),
+        }
+    }
+}
+
 /// One cancel in a batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CancelItem {
@@ -503,6 +540,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.client_order_ids(), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn clearing_a_scheduled_cancel_omits_the_timestamp() {
+        // Presence of the field is what distinguishes arming from clearing, so an
+        // always-serialized `null` would arm the dead-man switch instead of clearing it.
+        let clear = serde_json::to_string(&ScheduleCancelRequest::clear(60366)).unwrap();
+        assert_eq!(clear, r#"{"accountID":60366}"#);
+
+        let armed =
+            serde_json::to_string(&ScheduleCancelRequest::at(60366, 1_760_373_925_000)).unwrap();
+        assert_eq!(
+            armed,
+            r#"{"accountID":60366,"scheduledTimestamp":1760373925000}"#
+        );
     }
 
     #[test]
