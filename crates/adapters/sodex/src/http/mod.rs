@@ -21,6 +21,7 @@ pub mod models;
 pub mod orders;
 pub mod ratelimit;
 pub mod requests;
+pub mod spot;
 
 pub use account::{AccountClient, AddApiKeyRequest, generate_api_key};
 pub use client::{ClientError, SignedRequest, SodexHttpClient};
