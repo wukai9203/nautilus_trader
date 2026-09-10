@@ -6819,9 +6819,11 @@ version = "0.64.0"
 dependencies = [
  "alloy",
  "alloy-primitives",
+ "nautilus-network",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
