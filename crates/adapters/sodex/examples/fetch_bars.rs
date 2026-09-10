@@ -44,9 +44,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("loaded {} tradable instruments", provider.len());
 
     let instrument_id = instrument_id_for(&symbol, provider.venue());
-    let symbol_id = provider
-        .symbol_id(&instrument_id)
-        .ok_or_else(|| format!("{symbol} not listed on {:?}", market))?;
+    let symbol_id = provider.symbol_id(&instrument_id).ok_or_else(|| {
+        // The two engines do not share symbol names, so "not listed" is most often a
+        // spot name asked of perps. Showing what is listed turns that into one step.
+        let listed: Vec<String> = provider
+            .store()
+            .get_all()
+            .keys()
+            .take(8)
+            .map(|id| id.symbol.to_string())
+            .collect();
+        format!(
+            "{symbol} not listed on {market:?}; listed here: {} …",
+            listed.join(", ")
+        )
+    })?;
     println!("{instrument_id} maps to venue symbolID {symbol_id}");
 
     let instrument = provider

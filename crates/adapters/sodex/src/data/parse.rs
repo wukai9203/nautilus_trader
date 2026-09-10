@@ -186,7 +186,29 @@ pub fn parse_bar(
     if !candle.is_final() {
         return Err(BarMappingError::BarNotClosed);
     }
+    parse_completed_bar(candle, bar_type, ts_init)
+}
 
+/// Converts a candle the caller has established is complete.
+///
+/// Observed on the live testnet: the venue republishes the forming bar on every block and
+/// then simply starts the next one — over two full bar periods, no push ever carried
+/// `closed`. A consumer that waited for that flag would receive nothing at all while its
+/// connection looked perfectly healthy.
+///
+/// The flag is still authoritative when it is set. When it is not, a bar whose successor has
+/// begun is complete by construction, and that is evidence the caller holds and this function
+/// does not — hence the split. Use [`parse_bar`] wherever the flag is the only evidence
+/// available.
+///
+/// # Errors
+///
+/// Returns [`BarMappingError::InvalidValue`] if a price or volume cannot be parsed.
+pub fn parse_completed_bar(
+    candle: &Candle,
+    bar_type: BarType,
+    ts_init: UnixNanos,
+) -> Result<Bar, BarMappingError> {
     let volume = quantity_field(&candle.volume, "volume")?;
 
     Ok(Bar::new(

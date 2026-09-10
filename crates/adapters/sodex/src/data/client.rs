@@ -7,10 +7,23 @@
 //! trait's defaults leave them logged and unhandled rather than silently pretending.
 //!
 //! Every push on the candle channel republishes the bar that is currently forming, so most
-//! frames describe a bar whose high, low and close can still move. Only closed bars are
+//! frames describe a bar whose high, low and close can still move. Only completed bars are
 //! published. A strategy that acted on a forming bar would be deciding from values that were
 //! not knowable at that timestamp, and its live results would not be comparable with any
 //! backtest — the same look-ahead the historical path removes with `drop_forming_tail`.
+//!
+//! Completion cannot be read off the venue's `closed` flag alone. Observed on the live
+//! testnet across two full bar periods: the flag was never set, and the bar simply rolled —
+//! each push carried an open time one interval later than the last. A client that waited for
+//! the flag would publish nothing at all while its connection looked healthy, which is the
+//! worst failure available here, because it is indistinguishable from a market with no
+//! trades. So the last push of each bar is held, and released when either the flag is set or
+//! a push for a later bar proves the held one's window has elapsed. The flag stays
+//! authoritative when present; the successor is the fallback evidence.
+//!
+//! The cost is one bar of latency: a bar is published when the next one starts rather than
+//! the instant it closes. That is inherent to the venue's behaviour, not a choice — there is
+//! no earlier moment at which completion is observable.
 //!
 //! # Pushes are matched to the subscription that asked for them
 //!
@@ -54,18 +67,21 @@ use parking_lot::Mutex;
 
 use super::{
     history::{BarRequest, fetch_bars},
-    parse::{parse_bar, spec_to_interval},
+    parse::{parse_completed_bar, spec_to_interval},
 };
 use crate::{
     common::Market,
     config::SodexDataClientConfig,
     http::SodexHttpClient,
     providers::SodexInstrumentProvider,
-    websocket::{CandleParams, SodexWebSocketClient, SodexWsEvent},
+    websocket::{Candle, CandleParams, SodexWebSocketClient, SodexWsEvent},
 };
 
 /// Identifies a candle feed the way the venue's push frames do.
 type FeedKey = (String, String);
+
+/// The most recent push for one feed, held until its bar is provably complete.
+type Pending = HashMap<FeedKey, Candle>;
 
 /// Live market data client for one SoDEX engine.
 pub struct SodexDataClient {
@@ -149,22 +165,18 @@ fn feed_key(bar_type: &BarType, market: Market) -> anyhow::Result<FeedKey> {
     Ok((bar_type.instrument_id().symbol.to_string(), interval.to_string()))
 }
 
-/// Publishes closed bars from the stream and reports what the venue refused.
+/// Publishes completed bars from the stream and reports what the venue refused.
 async fn run_stream(
     mut events: tokio::sync::mpsc::UnboundedReceiver<SodexWsEvent>,
     feeds: Arc<Mutex<HashMap<FeedKey, BarType>>>,
     sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     clock: &'static AtomicTime,
 ) {
+    let mut pending = Pending::new();
+
     while let Some(event) = events.recv().await {
         match event {
             SodexWsEvent::Candle(candle) => {
-                if !candle.is_final() {
-                    // The forming bar is republished on every block. Publishing it would put
-                    // values into the engine that were not final at their own timestamp.
-                    continue;
-                }
-
                 let key = (candle.symbol.clone(), candle.interval.clone());
                 let Some(bar_type) = feeds.lock().get(&key).copied() else {
                     log::debug!(
@@ -175,14 +187,18 @@ async fn run_stream(
                     continue;
                 };
 
-                match parse_bar(&candle, bar_type, clock.get_time_ns()) {
-                    Ok(bar) => {
-                        if sender.send(DataEvent::Data(Data::Bar(bar))).is_err() {
-                            log::debug!("sodex_data_consumer_gone");
-                            break;
+                for completed in advance(&mut pending, key, *candle) {
+                    match parse_completed_bar(&completed, bar_type, clock.get_time_ns()) {
+                        Ok(bar) => {
+                            if sender.send(DataEvent::Data(Data::Bar(bar))).is_err() {
+                                log::debug!("sodex_data_consumer_gone");
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("sodex_bar_unparsed bar_type={bar_type} error={e}");
                         }
                     }
-                    Err(e) => log::error!("sodex_bar_unparsed bar_type={bar_type} error={e}"),
                 }
             }
             SodexWsEvent::RequestRejected { op, params, reason } => {
@@ -190,8 +206,58 @@ async fn run_stream(
                 // exactly like a market with no trades.
                 log::error!("sodex_stream_request_rejected op={op:?} params={params:?} {reason}");
             }
-            SodexWsEvent::Reconnected => log::info!("sodex_stream_reconnected"),
+            SodexWsEvent::Reconnected => {
+                // The held bars belong to the connection that just went away. A gap in the
+                // feed means the held snapshot may no longer be that bar's final state, so
+                // publishing it later would present a partial bar as a complete one.
+                pending.clear();
+                log::info!("sodex_stream_reconnected pending_bars_dropped");
+            }
         }
+    }
+}
+
+/// Folds one push into the held state, returning whatever became complete.
+///
+/// Completion has two sources, and this is where they are reconciled: the venue's own flag,
+/// and the arrival of a push for a later bar. A push for an *earlier* bar than the one held
+/// is discarded — the venue republishes the forming bar constantly, so an out-of-order frame
+/// would otherwise rewrite a bar that has already been published.
+fn advance(pending: &mut Pending, key: FeedKey, candle: Candle) -> Vec<Candle> {
+    if candle.is_final() {
+        // The flag is authoritative. Anything still held for this feed is at or before this
+        // bar, so it is superseded rather than published twice.
+        let held = pending.remove(&key);
+        let mut completed = Vec::new();
+        if let Some(held) = held
+            && held.open_time_ms < candle.open_time_ms
+        {
+            completed.push(held);
+        }
+        completed.push(candle);
+        return completed;
+    }
+
+    match pending.insert(key.clone(), candle) {
+        Some(held) => {
+            let candle = &pending[&key];
+            if held.open_time_ms < candle.open_time_ms {
+                // The held bar's window has elapsed: its successor is already forming.
+                vec![held]
+            } else if held.open_time_ms > candle.open_time_ms {
+                log::debug!(
+                    "sodex_candle_out_of_order held={} received={}",
+                    held.open_time_ms,
+                    candle.open_time_ms
+                );
+                pending.insert(key, held);
+                Vec::new()
+            } else {
+                // A later snapshot of the same forming bar, which has just replaced it.
+                Vec::new()
+            }
+        }
+        None => Vec::new(),
     }
 }
 
@@ -430,7 +496,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{config::SODEX_PERPS, websocket::Candle};
+    use crate::config::SODEX_PERPS;
 
     fn bar_type(step: usize, aggregation: BarAggregation) -> BarType {
         BarType::new(
@@ -441,8 +507,12 @@ mod tests {
     }
 
     fn candle(closed: bool) -> Candle {
+        candle_at(1_767_972_900_000, closed)
+    }
+
+    fn candle_at(open_time_ms: u64, closed: bool) -> Candle {
         Candle {
-            open_time_ms: 1_767_972_900_000,
+            open_time_ms,
             update_time_ms: 1_767_972_960_000,
             symbol: "vBTC_vUSDC".to_string(),
             interval: "1m".to_string(),
@@ -517,9 +587,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bar_is_published_once_its_successor_starts() {
+        // The venue was observed never to set the closed flag: the bar simply rolls. Waiting
+        // for the flag would publish nothing at all, so a later open time is what proves the
+        // held bar's window has elapsed.
+        let subscribed = bar_type(1, BarAggregation::Minute);
+
+        let published = publish(
+            vec![
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_900_000, false))),
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_900_000, false))),
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_960_000, false))),
+            ],
+            feeds_with(subscribed),
+        )
+        .await;
+
+        assert_eq!(published.len(), 1);
+        let DataEvent::Data(Data::Bar(bar)) = &published[0] else {
+            panic!("expected a bar");
+        };
+        // The first bar, not the one that is still forming.
+        assert_eq!(bar.ts_event.as_u64(), 1_767_972_900_000 * 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn the_bar_still_forming_is_never_published() {
+        // Two bars start, so only the first is complete; the second is still open when the
+        // stream ends and must not be released by the ending itself.
+        let published = publish(
+            vec![
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_900_000, false))),
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_960_000, false))),
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_960_000, false))),
+            ],
+            feeds_with(bar_type(1, BarAggregation::Minute)),
+        )
+        .await;
+
+        assert_eq!(published.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_bar_is_published_once_even_when_the_flag_arrives_after_the_roll() {
+        // Belt and braces: if the venue starts setting the flag, a bar already released by
+        // its successor must not be published a second time.
+        let published = publish(
+            vec![
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_900_000, false))),
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_960_000, false))),
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_960_000, true))),
+            ],
+            feeds_with(bar_type(1, BarAggregation::Minute)),
+        )
+        .await;
+
+        assert_eq!(published.len(), 2);
+        let opens: Vec<u64> = published
+            .iter()
+            .map(|event| {
+                let DataEvent::Data(Data::Bar(bar)) = event else {
+                    panic!("expected a bar");
+                };
+                bar.ts_event.as_u64() / 1_000_000
+            })
+            .collect();
+        assert_eq!(opens, vec![1_767_972_900_000, 1_767_972_960_000]);
+    }
+
+    #[tokio::test]
+    async fn an_out_of_order_push_does_not_republish_a_finished_bar() {
+        // The venue republishes constantly; a late frame for an earlier bar must not rewrite
+        // one the engine has already consumed.
+        let published = publish(
+            vec![
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_960_000, false))),
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_900_000, false))),
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_960_000, false))),
+            ],
+            feeds_with(bar_type(1, BarAggregation::Minute)),
+        )
+        .await;
+
+        assert!(published.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_drops_the_held_bar_rather_than_completing_it_later() {
+        // The gap means the held snapshot may not be that bar's final state. Publishing it
+        // after the reconnect would present a partial bar as a complete one.
+        let published = publish(
+            vec![
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_900_000, false))),
+                SodexWsEvent::Reconnected,
+                SodexWsEvent::Candle(Box::new(candle_at(1_767_972_960_000, false))),
+            ],
+            feeds_with(bar_type(1, BarAggregation::Minute)),
+        )
+        .await;
+
+        assert!(published.is_empty());
+    }
+
+    #[tokio::test]
     async fn a_forming_bar_is_not_published() {
         // The venue republishes the forming bar on every block. Publishing it would hand the
-        // strategy an open, high, low and close that were not yet final at that timestamp.
+        // strategy an open, high, low and close that were not yet final at that timestamp,
+        // and nothing yet proves this one is over.
         let published = publish(
             vec![SodexWsEvent::Candle(Box::new(candle(false)))],
             feeds_with(bar_type(1, BarAggregation::Minute)),

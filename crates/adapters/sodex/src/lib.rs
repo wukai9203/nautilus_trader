@@ -31,6 +31,42 @@
 //! own Go structs and re-marshaling, so field order is part of the contract — see
 //! [`signing`] for how that is preserved on this side.
 
+//! # What is implemented
+//!
+//! | Area | State |
+//! |------|-------|
+//! | Instruments | Loaded from the venue listing for both engines |
+//! | Historical bars | REST klines, with the still-forming tail removed |
+//! | Streaming bars | Candle channel, closed bars only |
+//! | Order submission | Market and limit, spot and perps |
+//! | Order cancellation | By venue order id, falling back to the client order id |
+//! | Account state | **Not implemented** |
+//! | Order status and fill reports | **Not implemented** |
+//! | Position reports | **Not implemented** |
+//!
+//! The three gaps share one cause: the venue documentation this adapter was built from
+//! covers the trading endpoints, and the paths for account, order-status and position reads
+//! have not been verified against a live link. Guessing them would produce failures that
+//! read like credential errors rather than missing endpoints — a diagnosis this integration
+//! has already cost time on once.
+//!
+//! The consequence is worth stating rather than leaving to be discovered: **the execution
+//! client cannot reconcile.** Orders it did not place, and fills that occurred while it was
+//! disconnected, remain invisible to the engine. Fills are also not reported at all, so a
+//! live run currently learns that an order was accepted but never that it was filled. The
+//! venue does publish a user stream that would carry them, and it requires no authorization,
+//! but its channel names and payload shapes are not documented here — that stream is the
+//! next thing to add, and it should be built against a live link rather than from
+//! assumption.
+//!
+//! # Backtesting
+//!
+//! Historical bars come back through the same conversion the stream uses, so a backtest and
+//! a live run see bars built by identical code. The one asymmetry that would otherwise
+//! remain — the venue marks streamed bars closed but leaves historical ones unmarked — is
+//! removed on both paths: the stream filters on the venue's flag, and history drops its
+//! trailing bar by comparing the bar's open plus its interval against the clock.
+
 #![allow(clippy::module_name_repetitions)]
 
 pub mod common;

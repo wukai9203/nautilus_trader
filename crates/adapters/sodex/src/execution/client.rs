@@ -444,10 +444,14 @@ impl ExecutionClient for SodexExecutionClient {
         let orders = self.core.get_orders_for_list(&cmd.order_list)?;
 
         // A list whose legs carry a contingency is a bracket, and a bracket the venue cannot
-        // enforce is not a bracket. Denying the whole list keeps a partial one from resting.
-        if orders.iter().any(|order| order.contingency_type().is_some()) {
+        // enforce is not a bracket. Every leg is denied, including the ones carrying no
+        // contingency of their own: denying only the marked legs would leave the rest of the
+        // bracket resting with nothing to trigger or protect it.
+        if let Some(contingency) = orders.iter().find_map(Order::contingency_type) {
+            let reason =
+                format!("SoDEX cannot enforce {contingency:?} contingency between orders");
             for order in &orders {
-                self.deny_if_contingent(order);
+                self.emitter.emit_order_denied(order, &reason);
             }
             return Ok(());
         }
