@@ -22,6 +22,8 @@
 //!   `skip_serializing_if`
 //! - non-optional fields must be present even at their zero value
 
+pub mod nonce;
 pub mod signers;
 
+pub use nonce::{NonceGenerator, is_within_window};
 pub use signers::{ExchangeSigner, SigningError, payload_hash};

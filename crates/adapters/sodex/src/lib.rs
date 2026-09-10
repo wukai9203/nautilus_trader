@@ -34,4 +34,5 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod common;
+pub mod http;
 pub mod signing;
