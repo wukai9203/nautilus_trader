@@ -10,10 +10,18 @@
 //! export SODEX_ACCOUNT_ID=<the "aid" from /accounts/{address}/state>
 //! export SODEX_API_KEY_NAME=api-key-01
 //! export SODEX_NETWORK=testnet          # or mainnet
+//! export SODEX_MARKET=perps             # or spot
 //! cargo run -p nautilus-sodex --example register_api_key
 //! ```
 //!
-//! The generated API private key is printed once and never written anywhere. Store it before
+//! # One key, both engines
+//!
+//! Spot and perps hold separate key sets, so a key registered on one is unknown to the
+//! other. To use a single private key for both, run this twice with `SODEX_MARKET` set each
+//! way; on the second run set `SODEX_API_PRIVATE_KEY` to the key from the first, and its
+//! address is registered again rather than a new keypair being generated.
+//!
+//! A generated API private key is printed once and never written anywhere. Store it before
 //! the terminal scrolls away; losing it means revoking the key and registering another.
 //!
 //! The master key is read from the environment and used only to sign this one action. It is
@@ -26,12 +34,13 @@ use std::env;
 use nautilus_sodex::{
     common::{
         Market,
-        credential::{ApiKeyName, MasterPrivateKey},
+        credential::{ApiKeyName, ApiPrivateKey, MasterPrivateKey},
     },
     http::{
         Network,
         account::{AccountClient, NO_EXPIRY, generate_api_key},
     },
+    signing::ExchangeSigner,
 };
 
 #[tokio::main]
@@ -50,23 +59,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let master = MasterPrivateKey::parse(&master_hex)?;
     let name = ApiKeyName::parse(&key_name)?;
 
-    // Perps and spot share one account and one API key set; the market only selects the
-    // gateway path this request is sent to.
-    let client = AccountClient::new(network, Market::Perps, &master)?;
+    // Each engine holds its own key set, so the market decides which set this registration
+    // lands in — not merely which gateway path is used.
+    let market = match env::var("SODEX_MARKET").as_deref() {
+        Ok("spot") => Market::Spot,
+        _ => Market::Perps,
+    };
+    let client = AccountClient::new(network, market, &master)?;
 
     println!("network:        {network:?}");
+    println!("market:         {market:?}");
     println!("account id:     {account_id}");
     println!("master address: {:?}", client.master_address());
     println!("key name:       {key_name}");
     println!();
 
-    let generated = generate_api_key()?;
-    println!("generated API key address: {:?}", generated.public_key);
+    // Reuse an existing key when one is supplied, so the same private key can be registered
+    // on the second engine instead of ending up with a separate key per market.
+    let existing = env::var("SODEX_API_PRIVATE_KEY").ok();
+    let (public_key, generated_secret) = match existing {
+        Some(hex) => {
+            let key = ApiPrivateKey::parse(&hex)?;
+            let address = ExchangeSigner::new(&key, market, network.chain_id())?.address();
+            println!("reusing existing API key address: {address:?}");
+            (address, None)
+        }
+        None => {
+            let generated = generate_api_key()?;
+            println!("generated API key address: {:?}", generated.public_key);
+            (generated.public_key, Some(generated.private_key))
+        }
+    };
 
     let request = client.build_add_api_key(
         account_id,
         &name,
-        generated.public_key,
+        public_key,
         NO_EXPIRY,
         None, // all permissions enabled; pass a DisabledPermissions mask to restrict
     )?;
@@ -75,11 +103,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let response: Option<serde_json::Value> = client.send(request).await?;
     println!("venue accepted the registration: {response:?}");
 
-    println!();
-    println!("=== store this now; it is not recoverable ===");
-    println!("SODEX_API_KEY_NAME={key_name}");
-    println!("SODEX_API_PRIVATE_KEY={}", generated.private_key.as_hex());
-    println!("=== the master key can go back offline ===");
+    match generated_secret {
+        Some(secret) => {
+            println!();
+            println!("=== store this now; it is not recoverable ===");
+            println!("SODEX_API_KEY_NAME={key_name}");
+            println!("SODEX_API_PRIVATE_KEY={}", secret.as_hex());
+            println!("=== the master key can go back offline ===");
+        }
+        None => {
+            println!();
+            println!("Existing key registered on {market:?}; nothing new to store.");
+        }
+    }
 
     Ok(())
 }

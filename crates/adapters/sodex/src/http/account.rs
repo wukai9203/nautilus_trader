@@ -4,6 +4,17 @@
 //! than part of a trading loop. [`AccountClient`] is therefore separate from
 //! [`SodexHttpClient`](super::client::SodexHttpClient): a trading process constructs the
 //! latter and never holds the key that can authorize withdrawals.
+//!
+//! # API keys are registered per engine
+//!
+//! Spot and perps keep **separate key sets** even though they share an account id. A key
+//! registered through the perps gateway is not visible to spot, which rejects requests
+//! signed by it with "API key not found". Registering the same public key on both engines
+//! is what lets one private key sign for both — that is a deliberate second registration,
+//! not something the first one implies.
+//!
+//! `GET /{engine}/accounts/{address}/api-keys` lists what a given engine actually holds,
+//! which is the quickest way to tell this failure from a signing problem.
 
 use std::collections::HashMap;
 
