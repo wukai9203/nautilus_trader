@@ -24,6 +24,8 @@
 
 pub mod nonce;
 pub mod signers;
+pub mod universal;
 
 pub use nonce::{NonceGenerator, is_within_window};
 pub use signers::{ExchangeSigner, SigningError, payload_hash};
+pub use universal::UniversalSigner;
