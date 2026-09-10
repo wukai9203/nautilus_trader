@@ -42,9 +42,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => Network::Testnet,
     };
 
+    // Selectable because API keys are registered per engine: the same key can be known to
+    // one engine and unknown to the other, and this probe is the cheapest way to tell which.
+    let market = match env::var("SODEX_MARKET").as_deref() {
+        Ok("spot") => Market::Spot,
+        _ => Market::Perps,
+    };
+
     let key = ApiPrivateKey::parse(&key_hex)?;
     let name = ApiKeyName::parse(&key_name)?;
-    let client = SodexHttpClient::with_credentials(network, Market::Perps, name, &key)?;
+    let client = SodexHttpClient::with_credentials(network, market, name, &key)?;
 
     let body = ScheduleCancelRequest::clear(account_id);
     let request = client.build_signed(
@@ -55,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     println!("network:   {network:?}");
+    println!("market:    {market:?}");
     println!("account:   {account_id}");
     println!("key name:  {key_name}");
     println!("url:       {}", request.url);
