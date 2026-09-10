@@ -1,6 +1,7 @@
 //! Shared types and constants for the SoDEX adapter.
 
 pub mod credential;
+pub mod decimal;
 pub mod enums;
 
 /// ValueChain mainnet, used as `message.chainID` and as the trading-action EIP-712 `chainId`.

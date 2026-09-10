@@ -27,13 +27,13 @@ use nautilus_model::{
     enums::CurrencyType,
     identifiers::{InstrumentId, Symbol, Venue},
     instruments::{CryptoPerpetual, CurrencyPair, InstrumentAny},
-    types::{Currency, Money, Price, Quantity},
+    types::{Currency, Money, Price, Quantity, fixed::FIXED_PRECISION},
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::Deserialize;
 
 use crate::{
-    common::Market,
+    common::{Market, decimal::normalize as normalize_decimal},
     config::venue_for,
     http::{Network, SodexHttpClient},
 };
@@ -105,11 +105,25 @@ pub struct PerpsSymbol {
 /// SoDEX testnet trades `vBTC` and `vUSDC`, which are not in any standard currency table.
 /// Failing on an unknown code would make the adapter unusable there, so unknown codes are
 /// registered as crypto with the venue's stated precision.
+///
+/// # Precision is clamped, and that is safe here
+///
+/// The venue reports coin precision as on-chain token decimals, which reach 18 — beyond
+/// Nautilus's fixed-point maximum, where an unclamped value panics. Clamping loses nothing
+/// that matters for trading: this precision describes the currency's own denomination, while
+/// order prices and sizes take their precision from the symbol's `tickSize` and `stepSize`,
+/// which are far coarser and are carried separately.
 fn resolve_currency(code: &str, precision: u8) -> Currency {
     if let Some(existing) = CURRENCY_MAP.lock().get(code) {
         return *existing;
     }
-    Currency::new(code, precision, 0, code, CurrencyType::Crypto)
+    Currency::new(
+        code,
+        precision.min(FIXED_PRECISION),
+        0,
+        code,
+        CurrencyType::Crypto,
+    )
 }
 
 /// Parses a decimal string into a `Decimal`, defaulting to zero.
@@ -125,12 +139,12 @@ fn parse_decimal_or_zero(raw: &str) -> Decimal {
 /// The venue documents each filter as inactive when its value is `0`, so mapping `0` onto a
 /// real limit would reject orders the venue would have accepted.
 fn optional_price(raw: &str) -> Option<Price> {
-    let price = Price::from_str(raw).ok()?;
+    let price = Price::from_str(&normalize_decimal(raw).ok()?).ok()?;
     (price.as_f64() != 0.0).then_some(price)
 }
 
 fn optional_quantity(raw: &str) -> Option<Quantity> {
-    let quantity = Quantity::from_str(raw).ok()?;
+    let quantity = Quantity::from_str(&normalize_decimal(raw).ok()?).ok()?;
     (quantity.as_f64() != 0.0).then_some(quantity)
 }
 
@@ -143,12 +157,17 @@ fn optional_notional(raw: &str, currency: Currency) -> Option<Money> {
 }
 
 /// Parses a required decimal string, attributing failures to the field that caused them.
+///
+/// Normalises first: the venue emits on-chain precision, which the engine's fixed-point
+/// types reject outright.
 fn parse_price(raw: &str, field: &'static str) -> anyhow::Result<Price> {
-    Price::from_str(raw).map_err(|e| anyhow::anyhow!("invalid {field} {raw:?}: {e}"))
+    let normalized = normalize_decimal(raw)?;
+    Price::from_str(&normalized).map_err(|e| anyhow::anyhow!("invalid {field} {raw:?}: {e}"))
 }
 
 fn parse_quantity(raw: &str, field: &'static str) -> anyhow::Result<Quantity> {
-    Quantity::from_str(raw).map_err(|e| anyhow::anyhow!("invalid {field} {raw:?}: {e}"))
+    let normalized = normalize_decimal(raw)?;
+    Quantity::from_str(&normalized).map_err(|e| anyhow::anyhow!("invalid {field} {raw:?}: {e}"))
 }
 
 /// Builds a Nautilus instrument id for a venue symbol.
@@ -482,6 +501,37 @@ mod tests {
         assert!(instrument.min_price.is_none());
         assert!(instrument.max_price.is_none());
         assert!(instrument.min_quantity.is_some(), "0.00001 is a real bound");
+    }
+
+    #[test]
+    fn on_chain_token_decimals_are_clamped_to_the_fixed_point_maximum() {
+        // The venue reports coin precision as token decimals, which reach 18. Passing that
+        // through panics inside Nautilus. Found by fetching the live symbol listing, not by
+        // the earlier tests, which happened to use in-range values.
+        let venue = Venue::from(SODEX_SPOT);
+        let mut symbol = spot_symbol();
+        symbol.base_coin = Some("wSOMETOKEN".to_string());
+        symbol.base_coin_precision = Some(18);
+
+        let instrument = parse_spot_instrument(&symbol, venue, UnixNanos::default()).unwrap();
+
+        assert_eq!(instrument.base_currency.precision, FIXED_PRECISION);
+    }
+
+    #[test]
+    fn clamping_does_not_touch_order_precision() {
+        // The clamp applies to the currency's denomination only; order price and size
+        // precision come from tickSize and stepSize and must be unaffected.
+        let venue = Venue::from(SODEX_SPOT);
+        let mut symbol = spot_symbol();
+        symbol.base_coin = Some("wOTHERTOKEN".to_string());
+        symbol.base_coin_precision = Some(18);
+
+        let instrument = parse_spot_instrument(&symbol, venue, UnixNanos::default()).unwrap();
+
+        assert_eq!(instrument.price_precision, 0);
+        assert_eq!(instrument.size_precision, 5);
+        assert_eq!(instrument.size_increment.to_string(), "0.00001");
     }
 
     #[test]

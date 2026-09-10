@@ -33,7 +33,10 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 
-use crate::{common::Market, websocket::Candle};
+use crate::{
+    common::{Market, decimal::normalize as normalize_decimal},
+    websocket::Candle,
+};
 
 /// Every interval the venue serves, with its Nautilus equivalent.
 ///
@@ -148,12 +151,25 @@ pub fn bar_type_for(
     ))
 }
 
+/// Parses a venue decimal into a price, normalising on-chain precision first.
 fn price_field(raw: &str, field: &'static str) -> Result<Price, BarMappingError> {
-    Price::from_str(raw).map_err(|e| BarMappingError::InvalidValue {
+    let invalid = |reason: String| BarMappingError::InvalidValue {
         field,
         value: raw.to_string(),
-        reason: e.to_string(),
-    })
+        reason,
+    };
+    let normalized = normalize_decimal(raw).map_err(|e| invalid(e.to_string()))?;
+    Price::from_str(&normalized).map_err(|e| invalid(e.to_string()))
+}
+
+fn quantity_field(raw: &str, field: &'static str) -> Result<Quantity, BarMappingError> {
+    let invalid = |reason: String| BarMappingError::InvalidValue {
+        field,
+        value: raw.to_string(),
+        reason,
+    };
+    let normalized = normalize_decimal(raw).map_err(|e| invalid(e.to_string()))?;
+    Quantity::from_str(&normalized).map_err(|e| invalid(e.to_string()))
 }
 
 /// Converts a closed candle into a Nautilus bar.
@@ -171,11 +187,7 @@ pub fn parse_bar(
         return Err(BarMappingError::BarNotClosed);
     }
 
-    let volume = Quantity::from_str(&candle.volume).map_err(|e| BarMappingError::InvalidValue {
-        field: "volume",
-        value: candle.volume.clone(),
-        reason: e.to_string(),
-    })?;
+    let volume = quantity_field(&candle.volume, "volume")?;
 
     Ok(Bar::new(
         bar_type,
