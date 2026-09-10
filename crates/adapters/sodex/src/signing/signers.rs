@@ -9,7 +9,10 @@ use alloy::{
 use alloy_primitives::{Address, B256, keccak256};
 use serde::Serialize;
 
-use crate::common::{Market, SignatureKind, credential::ApiPrivateKey};
+use crate::common::{
+    Market, SignatureKind,
+    credential::{ApiPrivateKey, MasterPrivateKey},
+};
 
 // The typed struct bound into every trading-action signature. `payloadHash` commits to the
 // JSON body; `nonce` is replayed-protected by the gateway's per-signer nonce window.
@@ -82,8 +85,31 @@ impl ExchangeSigner {
     ///
     /// Returns [`SigningError::Signer`] if the key cannot be parsed into a signer.
     pub fn new(key: &ApiPrivateKey, market: Market, chain_id: u64) -> Result<Self, SigningError> {
-        let signer = PrivateKeySigner::from_str(key.as_hex())
-            .map_err(|e| SigningError::Signer(e.to_string()))?;
+        Self::from_hex(key.as_hex(), market, chain_id)
+    }
+
+    /// Creates a signer from the master wallet, for the one action that requires it.
+    ///
+    /// `revokeAPIKey` sits in the venue's trading-action list — it commits to an
+    /// [`ExchangeAction`] under the `spot`/`futures` domain with the `0x01` prefix — yet the
+    /// "which key signs what" table requires the **master wallet** to sign it, because it
+    /// changes the API key set itself. That makes it the only combination of master key and
+    /// exchange domain, and this constructor exists solely for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SigningError::Signer`] if the key cannot be parsed into a signer.
+    pub fn for_master_revocation(
+        key: &MasterPrivateKey,
+        market: Market,
+        chain_id: u64,
+    ) -> Result<Self, SigningError> {
+        Self::from_hex(key.as_hex(), market, chain_id)
+    }
+
+    fn from_hex(hex: &str, market: Market, chain_id: u64) -> Result<Self, SigningError> {
+        let signer =
+            PrivateKeySigner::from_str(hex).map_err(|e| SigningError::Signer(e.to_string()))?;
 
         let domain = eip712_domain! {
             name: market.domain_name(),

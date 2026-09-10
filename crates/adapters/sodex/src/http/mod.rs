@@ -15,12 +15,14 @@
 //! registered key — this adapter does not use that path, since it would require the master
 //! key in a trading process.
 
+pub mod account;
 pub mod client;
 pub mod models;
 pub mod orders;
 pub mod ratelimit;
 pub mod requests;
 
+pub use account::{AccountClient, AddApiKeyRequest, generate_api_key};
 pub use client::{ClientError, SignedRequest, SodexHttpClient};
 pub use models::{ApiResponse, EnvelopeError};
 pub use orders::{AlignError, OrderAck, align_batch};
