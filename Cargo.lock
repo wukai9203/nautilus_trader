@@ -6819,6 +6819,8 @@ version = "0.64.0"
 dependencies = [
  "alloy",
  "alloy-primitives",
+ "nautilus-core",
+ "nautilus-model",
  "nautilus-network",
  "serde",
  "serde_json",

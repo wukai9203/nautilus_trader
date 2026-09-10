@@ -33,7 +33,8 @@ pub use requests::{CancelOrderRequest, ClientOrderId, NewOrderRequest, OrderItem
 use crate::common::Market;
 
 /// Gateway host for the two networks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Network {
     Mainnet,
     Testnet,

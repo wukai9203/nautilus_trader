@@ -20,6 +20,8 @@ name = "nautilus_sodex"
 crate-type = ["rlib"]
 
 [dependencies]
+nautilus-core = { workspace = true }
+nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
 alloy = { workspace = true, features = ["sol-types", "signer-local"] }
 alloy-primitives = { workspace = true }
