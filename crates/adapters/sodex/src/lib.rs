@@ -36,3 +36,4 @@
 pub mod common;
 pub mod http;
 pub mod signing;
+pub mod websocket;
