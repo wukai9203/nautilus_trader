@@ -37,6 +37,7 @@ pub mod common;
 pub mod config;
 pub mod data;
 pub mod execution;
+pub mod factories;
 pub mod http;
 pub mod providers;
 pub mod signing;

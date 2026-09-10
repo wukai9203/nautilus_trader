@@ -26,6 +26,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{common::Market, http::Network};
 
+/// Registry key for this adapter's client factories.
+///
+/// One key covers both engines: a factory reads [`SodexDataClientConfig::market`] to decide
+/// which venue the client it builds belongs to, so a node registers the factory once and
+/// creates a spot and a perps client from it.
+pub const SODEX: &str = "SODEX";
+
 /// Venue identifier for the spot engine.
 pub const SODEX_SPOT: &str = "SODEX_SPOT";
 

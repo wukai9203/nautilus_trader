@@ -1,11 +1,12 @@
 //! Order execution.
 //!
-//! Translation between Nautilus orders and venue requests lives in [`parse`]. The client
-//! that drives submission and publishes execution reports is not implemented yet; the
-//! conversion layer is separated so it can be exercised without a connection.
+//! Translation between Nautilus orders and venue requests lives in [`parse`], separated from
+//! [`client`] so it can be exercised without a connection.
 
+pub mod client;
 pub mod parse;
 
+pub use client::SodexExecutionClient;
 pub use parse::{
     OrderSpec,
     OrderConversionError, is_fill, map_client_order_id, map_order_status, map_order_type,
