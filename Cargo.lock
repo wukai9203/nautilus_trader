@@ -6821,6 +6821,7 @@ dependencies = [
  "alloy-primitives",
  "anyhow",
  "async-trait",
+ "log",
  "nautilus-common",
  "nautilus-core",
  "nautilus-model",
@@ -6830,6 +6831,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-tungstenite 0.30.0",
 ]
 
 [[package]]
