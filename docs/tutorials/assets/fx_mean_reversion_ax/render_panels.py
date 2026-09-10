@@ -1,11 +1,12 @@
 """
 Render the AX EURUSD-PERP mean reversion tutorial panels from a backtest run.
 
-Usage:
+After building NautilusTrader from source, run these commands from the repository root:
 
-    uv sync --extra visualization
-    TRUEFX_CSV=tests/test_data/local/truefx/EURUSD-2025-12.csv \
-        python3 docs/tutorials/assets/fx_mean_reversion_ax/render_panels.py
+    make sync
+    TRUEFX_CSV=test_data/local/truefx/EURUSD-2025-12.csv \
+        uv run --project python --no-sync \
+            python docs/tutorials/assets/fx_mean_reversion_ax/render_panels.py
 
 Replays TrueFX EUR/USD ticks through the shipped ``BBMeanReversion`` strategy,
 then writes four PNG panels using the ``nautilus_dark`` tearsheet theme.
@@ -15,6 +16,7 @@ then writes four PNG panels using the ``nautilus_dark`` tearsheet theme.
 from __future__ import annotations
 
 import os
+import sys
 from decimal import Decimal
 from pathlib import Path
 
@@ -25,31 +27,35 @@ from plotly.subplots import make_subplots
 
 from nautilus_trader.analysis.tearsheet import _write_figure
 from nautilus_trader.analysis.themes import get_theme
-from nautilus_trader.backtest.config import BacktestEngineConfig
-from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.cache.config import CacheConfig
-from nautilus_trader.config import LoggingConfig
-from nautilus_trader.examples.strategies.bb_mean_reversion import BBMeanReversion
-from nautilus_trader.examples.strategies.bb_mean_reversion import BBMeanReversionConfig
-from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.data import BarType
-from nautilus_trader.model.enums import AccountType
-from nautilus_trader.model.enums import AssetClass
-from nautilus_trader.model.enums import OmsType
-from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.identifiers import Symbol
-from nautilus_trader.model.identifiers import TraderId
-from nautilus_trader.model.identifiers import Venue
-from nautilus_trader.model.instruments import PerpetualContract
-from nautilus_trader.model.objects import Money
-from nautilus_trader.model.objects import Price
-from nautilus_trader.model.objects import Quantity
-from nautilus_trader.persistence.wranglers import QuoteTickDataWrangler
+from nautilus_trader.common import LogLevel
+from nautilus_trader.config import BacktestEngineConfig
+from nautilus_trader.backtest import BacktestEngine
+from nautilus_trader.config import CacheConfig
+from nautilus_trader.config import LoggerConfig
+from nautilus_trader.model import AccountType
+from nautilus_trader.model import AssetClass
+from nautilus_trader.model import BarType
+from nautilus_trader.model import Currency
+from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import Money
+from nautilus_trader.model import OmsType
+from nautilus_trader.model import PerpetualContract
+from nautilus_trader.model import Price
+from nautilus_trader.model import Quantity
+from nautilus_trader.model import QuoteTick
+from nautilus_trader.model import Symbol
+from nautilus_trader.model import TraderId
+from nautilus_trader.model import Venue
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "examples" / "live" / "architect_ax"))
+from strategies import BBMeanReversion
+from strategies import BBMeanReversionConfig
 
 
 OUT = Path(__file__).resolve().parent
+USD = Currency.from_str("USD")
 TRUEFX_CSV = Path(
-    os.environ.get("TRUEFX_CSV", "tests/test_data/local/truefx/EURUSD-2025-12.csv"),
+    os.environ.get("TRUEFX_CSV", "test_data/local/truefx/EURUSD-2025-12.csv"),
 )
 
 THEME = get_theme("nautilus_dark")
@@ -86,7 +92,7 @@ def apply_layout(fig: go.Figure, title: str, height: int = 480) -> None:
     fig.update_yaxes(gridcolor=GRID, zeroline=False)
 
 
-def run_backtest():
+def run_backtest() -> object:
     instrument_id = InstrumentId.from_str("EURUSD-PERP.AX")
     EURUSD_PERP = PerpetualContract(
         instrument_id=instrument_id,
@@ -115,16 +121,33 @@ def run_backtest():
         header=None,
         names=["pair", "timestamp", "bid", "ask"],
     )
-    df["timestamp"] = pd.to_datetime(df["timestamp"], format="%Y%m%d %H:%M:%S.%f")
-    df = df.set_index("timestamp")[["bid", "ask"]]
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        format="%Y%m%d %H:%M:%S.%f",
+        utc=True,
+    )
+    df = df.set_index("timestamp")[["bid", "ask"]].sort_index()
 
-    wrangler = QuoteTickDataWrangler(instrument=EURUSD_PERP)
-    ticks = wrangler.process(df)
+    ticks = []
+
+    for timestamp, row in df.iterrows():
+        ts_ns = pd.Timestamp(str(timestamp)).value
+        ticks.append(
+            QuoteTick(
+                instrument_id=instrument_id,
+                bid_price=EURUSD_PERP.make_price(float(row.bid)),
+                ask_price=EURUSD_PERP.make_price(float(row.ask)),
+                bid_size=Quantity.from_int(1),
+                ask_size=Quantity.from_int(1),
+                ts_event=ts_ns,
+                ts_init=ts_ns,
+            ),
+        )
 
     engine = BacktestEngine(
         BacktestEngineConfig(
             trader_id=TraderId("BACKTESTER-001"),
-            logging=LoggingConfig(log_level="ERROR"),
+            logging=LoggerConfig(stdout_level=LogLevel.ERROR),
             cache=CacheConfig(bar_capacity=200_000, tick_capacity=10_000),
         ),
     )
@@ -157,8 +180,8 @@ def run_backtest():
     engine.run()
 
     bars = engine.cache.bars(bar_type)
-    fills = engine.trader.generate_fills_report()
-    positions = engine.trader.generate_positions_report()
+    fills = engine.generate_fills_report()
+    positions = engine.generate_positions_report()
 
     bars_df = (
         pd.DataFrame(
@@ -530,7 +553,7 @@ def panel_c_decision_scatter(bars: pd.DataFrame) -> go.Figure:
 def panel_d_pnl(positions: pd.DataFrame, cycles: list[dict]) -> go.Figure:
     fig = go.Figure()
     if not cycles:
-        apply_layout(fig, "Cumulative realised pnl per closed cycle (no cycles)", height=420)
+        apply_layout(fig, "Cumulative realized pnl per closed cycle (no cycles)", height=420)
         return fig
     if "realized_pnl" in positions.columns:
         df = positions.copy()
@@ -575,7 +598,7 @@ def panel_d_pnl(positions: pd.DataFrame, cycles: list[dict]) -> go.Figure:
         ),
     )
     fig.add_hline(y=0, line={"color": NEUTRAL, "dash": "dash", "width": 1})
-    apply_layout(fig, "Cumulative realised pnl per closed position (USD)", height=420)
+    apply_layout(fig, "Cumulative realized pnl per closed position (USD)", height=420)
     fig.update_xaxes(title_text="position close time")
     fig.update_yaxes(title_text="USD")
     return fig

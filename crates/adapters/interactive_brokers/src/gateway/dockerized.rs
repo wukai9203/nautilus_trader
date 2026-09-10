@@ -37,6 +37,8 @@ use bollard::query_parameters::{
 #[cfg(feature = "gateway")]
 use futures_util::StreamExt;
 #[cfg(feature = "gateway")]
+use nautilus_core::string::secret::SecretString;
+#[cfg(feature = "gateway")]
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "gateway")]
@@ -48,8 +50,15 @@ use crate::config::DockerizedIBGatewayConfig;
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
-        from_py_object
+        module = "nautilus_trader.adapters.interactive_brokers",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE"
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(
+        module = "nautilus_trader.adapters.interactive_brokers"
     )
 )]
 pub enum ContainerStatus {
@@ -77,8 +86,14 @@ pub enum ContainerStatus {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
+        module = "nautilus_trader.adapters.interactive_brokers",
         from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(
+        module = "nautilus_trader.adapters.interactive_brokers"
     )
 )]
 #[cfg(feature = "gateway")]
@@ -88,9 +103,9 @@ pub struct DockerizedIBGateway {
     /// Docker client.
     pub(crate) docker: Docker,
     /// Username for IB account.
-    username: String,
+    username: SecretString,
     /// Password for IB account.
-    password: String,
+    password: SecretString,
     /// Host address (always 127.0.0.1).
     host: String,
     /// Port for the gateway.
@@ -157,19 +172,17 @@ impl DockerizedIBGateway {
     /// Returns an error if:
     /// - Username or password is not provided and not available in environment variables
     /// - Docker client creation fails
-    pub fn new(config: DockerizedIBGatewayConfig) -> anyhow::Result<Self> {
-        // Load username from config or environment (clone to avoid partial move)
+    pub fn new(mut config: DockerizedIBGatewayConfig) -> anyhow::Result<Self> {
         let username = config
             .username
-            .clone()
-            .or_else(|| std::env::var("TWS_USERNAME").ok())
+            .take()
+            .or_else(|| std::env::var("TWS_USERNAME").ok().map(SecretString::from))
             .ok_or_else(|| anyhow::anyhow!("username not set nor available in env TWS_USERNAME"))?;
 
-        // Load password from config or environment (clone to avoid partial move)
         let password = config
             .password
-            .clone()
-            .or_else(|| std::env::var("TWS_PASSWORD").ok())
+            .take()
+            .or_else(|| std::env::var("TWS_PASSWORD").ok().map(SecretString::from))
             .ok_or_else(|| anyhow::anyhow!("password not set nor available in env TWS_PASSWORD"))?;
 
         // Connect to Docker
@@ -313,7 +326,7 @@ impl DockerizedIBGateway {
     ///
     /// Returns an error if container creation or startup fails.
     pub async fn start(&mut self, wait: Option<u64>) -> anyhow::Result<()> {
-        tracing::info!("Ensuring gateway is running");
+        tracing::debug!("Ensuring gateway is running");
 
         let status = self.container_status().await?;
 
@@ -333,7 +346,7 @@ impl DockerizedIBGateway {
                 self.stop().await?;
             }
             ContainerStatus::Ready | ContainerStatus::ContainerStarting => {
-                tracing::info!("Status {:?}, using existing container", status);
+                tracing::debug!("Status {:?}, using existing container", status);
                 return Ok(());
             }
             _ => {}
@@ -370,8 +383,8 @@ impl DockerizedIBGateway {
             crate::config::TradingMode::Live => "live",
         };
         let env = vec![
-            format!("TWS_USERID={}", self.username),
-            format!("TWS_PASSWORD={}", self.password),
+            format!("TWS_USERID={}", self.username.expose_secret()),
+            format!("TWS_PASSWORD={}", self.password.expose_secret()),
             format!("TRADING_MODE={}", mode_str),
             format!(
                 "READ_ONLY_API={}",
@@ -420,7 +433,7 @@ impl DockerizedIBGateway {
             .await
             .context("Failed to start container")?;
 
-        tracing::info!(
+        tracing::debug!(
             "Container `{}` starting, waiting for ready",
             self.container_name
         );
@@ -431,7 +444,7 @@ impl DockerizedIBGateway {
 
         while waited < wait_time {
             if self.is_logged_in(&container_id).await.unwrap_or(false) {
-                tracing::info!(
+                tracing::debug!(
                     "Gateway `{}` ready. VNC port is {:?}",
                     self.container_name,
                     self.config.vnc_port
@@ -519,7 +532,7 @@ impl DockerizedIBGateway {
                     .await
                     .context("Failed to remove container")?;
 
-                tracing::info!("Stopped and removed container `{}`", self.container_name);
+                tracing::debug!("Stopped and removed container `{}`", self.container_name);
             }
         }
 
@@ -578,14 +591,18 @@ mod tests {
     fn new_reports_the_host_api_port(#[case] trading_mode: TradingMode, #[case] expected: u16) {
         let gateway = DockerizedIBGateway::new(
             crate::config::DockerizedIBGatewayConfig::builder()
-                .username("test-user".to_string())
-                .password("test-password".to_string())
+                .username("test-user".into())
+                .password("test-password".into())
                 .trading_mode(trading_mode)
                 .build(),
         )
         .unwrap();
 
         assert_eq!(gateway.port(), expected);
+        assert_eq!(gateway.username.expose_secret(), "test-user");
+        assert_eq!(gateway.password.expose_secret(), "test-password");
+        assert!(gateway.config.username.is_none());
+        assert!(gateway.config.password.is_none());
     }
 
     #[rstest]

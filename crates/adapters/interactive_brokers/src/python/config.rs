@@ -15,14 +15,14 @@
 
 //! Python bindings for Interactive Brokers configuration types.
 
-use nautilus_core::python::to_pyvalue_err;
+use nautilus_core::{python::to_pyvalue_err, string::secret::SecretString};
 use nautilus_model::identifiers::InstrumentId;
 use pyo3::prelude::*;
 
 use crate::config::{
     DockerizedIBGatewayConfig, InteractiveBrokersDataClientConfig,
-    InteractiveBrokersExecClientConfig, InteractiveBrokersInstrumentProviderConfig, MarketDataType,
-    SymbologyMethod, TradingMode,
+    InteractiveBrokersExecutionClientConfig, InteractiveBrokersInstrumentProviderConfig,
+    MarketDataType, TradingMode,
 };
 
 fn validate_order_id_client_slot(client_id: i32) -> PyResult<()> {
@@ -36,39 +36,7 @@ fn validate_order_id_client_slot(client_id: i32) -> PyResult<()> {
 }
 
 #[pymethods]
-impl MarketDataType {
-    #[classattr]
-    const REALTIME: Self = Self::Realtime;
-
-    #[classattr]
-    const FROZEN: Self = Self::Frozen;
-
-    #[classattr]
-    const DELAYED: Self = Self::Delayed;
-
-    #[classattr]
-    const DELAYED_FROZEN: Self = Self::DelayedFrozen;
-}
-
-#[pymethods]
-impl SymbologyMethod {
-    #[classattr]
-    const SIMPLIFIED: Self = Self::Simplified;
-
-    #[classattr]
-    const RAW: Self = Self::Raw;
-}
-
-#[pymethods]
-impl TradingMode {
-    #[classattr]
-    const PAPER: Self = Self::Paper;
-
-    #[classattr]
-    const LIVE: Self = Self::Live;
-}
-
-#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl InteractiveBrokersDataClientConfig {
     /// Creates a new `InteractiveBrokersDataClientConfig` instance.
     #[new]
@@ -191,8 +159,9 @@ impl InteractiveBrokersDataClientConfig {
 }
 
 #[pymethods]
-impl InteractiveBrokersExecClientConfig {
-    /// Creates a new `InteractiveBrokersExecClientConfig` instance.
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl InteractiveBrokersExecutionClientConfig {
+    /// Creates a new `InteractiveBrokersExecutionClientConfig` instance.
     #[new]
     #[pyo3(signature = (host=None, port=None, client_id=None, account_id=None, connection_timeout=None, request_timeout=None, fetch_all_open_orders=None, track_option_exercise_from_position_update=None, instrument_provider=None, dockerized_gateway=None))]
     #[allow(clippy::too_many_arguments)]
@@ -299,6 +268,7 @@ impl InteractiveBrokersExecClientConfig {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl InteractiveBrokersInstrumentProviderConfig {
     /// Creates a new `InteractiveBrokersInstrumentProviderConfig` instance.
     #[new]
@@ -435,6 +405,7 @@ impl InteractiveBrokersInstrumentProviderConfig {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl DockerizedIBGatewayConfig {
     /// Creates a new `DockerizedIBGatewayConfig` instance.
     #[new]
@@ -449,8 +420,8 @@ impl DockerizedIBGatewayConfig {
         vnc_port: Option<u16>,
     ) -> Self {
         Self {
-            username,
-            password,
+            username: username.map(SecretString::from),
+            password: password.map(SecretString::from),
             trading_mode: trading_mode.unwrap_or_default(),
             read_only_api: read_only_api.unwrap_or(true),
             timeout: timeout.unwrap_or(300),
@@ -462,14 +433,13 @@ impl DockerizedIBGatewayConfig {
 
     /// Returns the username.
     #[getter]
-    fn username(&self) -> Option<String> {
-        self.username.clone()
+    fn username(&self) -> Option<&str> {
+        self.username.as_ref().map(SecretString::expose_secret)
     }
 
-    /// Returns the password (masked for security).
     #[getter]
-    fn password(&self) -> Option<String> {
-        self.password.as_ref().map(|_| "********".to_string())
+    const fn has_password(&self) -> bool {
+        self.password.is_some()
     }
 
     /// Returns the trading mode.

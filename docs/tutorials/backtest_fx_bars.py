@@ -69,32 +69,41 @@
 # ## Prerequisites
 #
 # - Python 3.12+
-# - [NautilusTrader](https://pypi.org/project/nautilus_trader/) installed
-#   (`pip install nautilus_trader`). The `visualization` extra is only needed
-#   if you also want to regenerate the panels at the end of the tutorial.
+# - [NautilusTrader](https://pypi.org/project/nautilus_trader/) 2.x installed
+#   (`pip install -U --pre nautilus_trader`). The `visualization` extra is only
+#   needed if you also want to regenerate the panels at the end of the tutorial.
+# - pandas (`pip install pandas`). The wheel declares no runtime dependencies.
+# - The sibling [`ema_cross.py`](./ema_cross.py) file. Keep it next to this
+#   tutorial when downloading or converting it with Jupytext.
 
 # %%
 from decimal import Decimal
 
-from nautilus_trader.backtest.config import BacktestEngineConfig
-from nautilus_trader.backtest.engine import BacktestEngine
-from nautilus_trader.backtest.models import FillModel
-from nautilus_trader.backtest.modules import FXRolloverInterestConfig
-from nautilus_trader.backtest.modules import FXRolloverInterestModule
-from nautilus_trader.config import LoggingConfig
+from nautilus_trader.common import LogLevel
+from nautilus_trader.config import BacktestEngineConfig
+from nautilus_trader.backtest import BacktestEngine
+from nautilus_trader.backtest import FXRolloverInterestModule
+from nautilus_trader.backtest import InterestRateRecord
+from nautilus_trader.config import LoggerConfig
 from nautilus_trader.config import RiskEngineConfig
-from nautilus_trader.examples.strategies.ema_cross import EMACross
-from nautilus_trader.examples.strategies.ema_cross import EMACrossConfig
+from nautilus_trader.execution import ProbabilisticFillModel
+from nautilus_trader.model import AccountType
 from nautilus_trader.model import BarType
+from nautilus_trader.model import Currency
 from nautilus_trader.model import Money
+from nautilus_trader.model import OmsType
+from nautilus_trader.model import TraderId
 from nautilus_trader.model import Venue
-from nautilus_trader.model.currencies import JPY
-from nautilus_trader.model.currencies import USD
-from nautilus_trader.model.enums import AccountType
-from nautilus_trader.model.enums import OmsType
-from nautilus_trader.persistence.wranglers import QuoteTickDataWrangler
-from nautilus_trader.test_kit.providers import TestDataProvider
-from nautilus_trader.test_kit.providers import TestInstrumentProvider
+from nautilus_trader.testkit.providers import TestDataProvider
+from nautilus_trader.testkit.providers import TestInstrumentProvider
+
+from ema_cross import EMACross
+from ema_cross import EMACrossConfig
+
+
+JPY = Currency.from_str("JPY")
+USD = Currency.from_str("USD")
+
 
 # %% [markdown]
 # ## Engine setup
@@ -104,8 +113,8 @@ from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
 # %%
 config = BacktestEngineConfig(
-    trader_id="BACKTESTER-001",
-    logging=LoggingConfig(log_level="ERROR"),
+    trader_id=TraderId.from_str("BACKTESTER-001"),
+    logging=LoggerConfig(stdout_level=LogLevel.ERROR),
     risk_engine=RiskEngineConfig(bypass=True),
 )
 engine = BacktestEngine(config=config)
@@ -120,8 +129,12 @@ engine = BacktestEngine(config=config)
 
 # %%
 provider = TestDataProvider()
-rollover_config = FXRolloverInterestConfig(provider.read_csv("short-term-interest.csv"))
-fx_rollover_interest = FXRolloverInterestModule(config=rollover_config)
+interest_rate_data = provider.read_csv("short-term-interest.csv")
+interest_rate_records = [
+    InterestRateRecord(location=row.LOCATION, time=row.TIME, value=row.Value)
+    for row in interest_rate_data.itertuples(index=False)
+]
+fx_rollover_interest = FXRolloverInterestModule(records=interest_rate_records)
 
 # %% [markdown]
 # ## Fill model
@@ -131,7 +144,7 @@ fx_rollover_interest = FXRolloverInterestModule(config=rollover_config)
 # The seed makes the run reproducible.
 
 # %%
-fill_model = FillModel(
+fill_model = ProbabilisticFillModel(
     prob_fill_on_limit=0.2,
     prob_slippage=0.5,
     random_seed=42,
@@ -160,9 +173,8 @@ engine.add_venue(
 # %% [markdown]
 # ## Instrument and data
 #
-# `QuoteTickDataWrangler.process_bar_data` synthesises one quote tick at the
-# open and one at the close of each minute bar from the bundled FXCM bid and
-# ask CSVs, giving the engine a quote tick stream ahead of bar aggregation.
+# `TestDataProvider.quotes_from_fxcm_bars` synthesizes quote ticks from each
+# minute's open, high, low, and close in the bundled FXCM bid and ask CSVs.
 # The strategy declares `5-MINUTE-BID-INTERNAL`, so the engine builds 5-minute
 # BID bars from the quote stream internally.
 
@@ -170,10 +182,10 @@ engine.add_venue(
 USDJPY_SIM = TestInstrumentProvider.default_fx_ccy("USD/JPY", SIM)
 engine.add_instrument(USDJPY_SIM)
 
-wrangler = QuoteTickDataWrangler(instrument=USDJPY_SIM)
-ticks = wrangler.process_bar_data(
-    bid_data=provider.read_csv_bars("fxcm/usdjpy-m1-bid-2013.csv"),
-    ask_data=provider.read_csv_bars("fxcm/usdjpy-m1-ask-2013.csv"),
+ticks = provider.quotes_from_fxcm_bars(
+    instrument=USDJPY_SIM,
+    bid_csv="fxcm/usdjpy-m1-bid-2013.csv",
+    ask_csv="fxcm/usdjpy-m1-ask-2013.csv",
 )
 engine.add_data(ticks)
 
@@ -207,17 +219,17 @@ engine.run()
 # %% [markdown]
 # ## Reports
 #
-# `engine.trader.generate_*` returns DataFrames covering the account state, the
+# `engine.generate_*` returns DataFrames covering the account state, the
 # fills, and the closed positions.
 
 # %%
-engine.trader.generate_account_report(SIM)
+engine.generate_account_report(SIM)
 
 # %%
-engine.trader.generate_order_fills_report()
+engine.generate_order_fills_report()
 
 # %%
-engine.trader.generate_positions_report()
+engine.generate_positions_report()
 
 # %% [markdown]
 # ## What the run produces
@@ -239,7 +251,7 @@ engine.trader.generate_positions_report()
 # **Figure 2.** *Zoom on 2013-02-12 to 2013-02-15 UTC. Each marker is a
 # crossover entry: triangles up are long, triangles down are short.*
 #
-# ![Cumulative realised pnl](./assets/backtest_fx_bars/panel_c_pnl_curve.png)
+# ![Cumulative realized pnl](./assets/backtest_fx_bars/panel_c_pnl_curve.png)
 #
 # **Figure 3.** *Cumulative JPY pnl across all closed cycles. Marker color
 # encodes per-cycle pnl: blue = positive, red = negative.*
@@ -257,9 +269,12 @@ engine.trader.generate_positions_report()
 # backtest, pulls bars and fills from the engine cache, and writes PNGs using
 # the shared `nautilus_dark` tearsheet theme.
 #
+# After building NautilusTrader from source, run these commands from the repository root:
+#
 # ```bash
-# uv sync --extra visualization
-# python3 docs/tutorials/assets/backtest_fx_bars/render_panels.py
+# make sync
+# uv run --project python --no-sync \
+#     python docs/tutorials/assets/backtest_fx_bars/render_panels.py
 # ```
 
 # %% [markdown]
@@ -268,7 +283,7 @@ engine.trader.generate_positions_report()
 # - **Slow the signal**. The default 10/20 EMAs whip in low-trend sessions.
 #   Try 20/60 on the same bars or move to 15-minute bars to cut the cycle
 #   count.
-# - **Add a regime filter**. Suppress entries when realised range is below
+# - **Add a regime filter**. Suppress entries when realized range is below
 #   a threshold so the strategy only trades sessions with directional movement.
 # - **Compare aggregations**. Build the bars from raw tick data via
 #   `BarType.from_str("USD/JPY.SIM-5-MINUTE-BID-INTERNAL")` against an

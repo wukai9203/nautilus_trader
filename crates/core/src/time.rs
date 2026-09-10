@@ -42,7 +42,7 @@ use std::{
 };
 
 use crate::{
-    UnixNanos,
+    DurationNanos, UnixNanos,
     datetime::{NANOSECONDS_IN_MICROSECOND, NANOSECONDS_IN_MILLISECOND, NANOSECONDS_IN_SECOND},
 };
 
@@ -166,19 +166,21 @@ impl Default for AtomicTime {
 impl AtomicTime {
     /// Creates a new [`AtomicTime`] instance.
     ///
-    /// - If `realtime` is `true`, the provided `time` is used only as an initial placeholder
-    ///   and will quickly be overridden by calls to [`AtomicTime::time_since_epoch`].
+    /// - If `realtime` is `true`, the provided `time` is ignored and the first read starts from
+    ///   the current system time.
     /// - If `realtime` is `false`, this clock starts in **static mode**, with the given `time`
     ///   as its current value.
     #[must_use]
     pub fn new(realtime: bool, time: UnixNanos) -> Self {
+        let timestamp_ns = if realtime { 0 } else { time.into() };
+
         Self {
             realtime: AtomicBool::new(realtime),
-            timestamp_ns: AtomicU64::new(time.into()),
+            timestamp_ns: AtomicU64::new(timestamp_ns),
         }
     }
 
-    /// Returns the current time in nanoseconds, based on the clock’s mode.
+    /// Returns the current time in nanoseconds, based on the clock's mode.
     ///
     /// - In **real-time mode**, calls [`AtomicTime::time_since_epoch`], ensuring strictly increasing
     ///   timestamps across threads, using `AcqRel` semantics for the underlying atomic.
@@ -258,9 +260,9 @@ impl AtomicTime {
         );
     }
 
-    /// Increments the current (static-mode) time by `delta` nanoseconds and returns the updated value.
+    /// Increments the current static-mode time by `delta` and returns the updated value.
     ///
-    /// Internally this uses [`AtomicU64::fetch_update`] with [`Ordering::AcqRel`] to ensure the increment is
+    /// Internally this uses [`AtomicU64::try_update`] with [`Ordering::AcqRel`] to ensure the increment is
     /// atomic and visible to readers using `Acquire` loads.
     ///
     /// # Errors
@@ -275,7 +277,7 @@ impl AtomicTime {
     /// This is intentional: mode switching is a setup-time operation and should not
     /// occur concurrently with time operations. Callers must ensure mode switches are
     /// complete before resuming time operations.
-    pub fn increment_time(&self, delta: u64) -> anyhow::Result<UnixNanos> {
+    pub fn increment_time(&self, delta: DurationNanos) -> anyhow::Result<UnixNanos> {
         anyhow::ensure!(
             !self.realtime.load(Ordering::SeqCst),
             "Cannot increment time while clock is in realtime mode"
@@ -284,8 +286,8 @@ impl AtomicTime {
         let previous =
             match self
                 .timestamp_ns
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    current.checked_add(delta)
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_add(delta.as_u64())
                 }) {
                 Ok(prev) => prev,
                 Err(_) => anyhow::bail!("Cannot increment time beyond u64::MAX"),
@@ -296,10 +298,10 @@ impl AtomicTime {
             "Invariant: clock must remain in static mode across `increment_time`"
         );
 
-        Ok(UnixNanos::from(previous + delta))
+        Ok(UnixNanos::from(previous) + delta)
     }
 
-    /// Retrieves and updates the current “real-time” clock, returning a strictly increasing
+    /// Retrieves and updates the current "real-time" clock, returning a strictly increasing
     /// timestamp based on system time.
     ///
     /// Internally:
@@ -328,11 +330,13 @@ impl AtomicTime {
         loop {
             // Acquire to observe the latest stored value
             let last = self.timestamp_ns.load(Ordering::Acquire);
-            // Ensure we never wrap past u64::MAX – treat that as a fatal error
+
+            // Ensure we never wrap past u64::MAX - treat that as a fatal error
             let incremented = last
                 .checked_add(1)
                 .expect("AtomicTime overflow: reached u64::MAX");
             let next = now.max(incremented);
+
             // AcqRel on success ensures this new value is published,
             // Acquire on failure reloads if we lost a CAS race.
             //
@@ -409,6 +413,7 @@ mod tests {
     use rstest::*;
 
     use super::*;
+    use crate::DurationNanos;
 
     #[rstest]
     fn test_global_clocks_initialization() {
@@ -450,7 +455,7 @@ mod tests {
     #[rstest]
     fn test_increment_time_returns_error_in_realtime_mode() {
         let clock = AtomicTime::new(true, UnixNanos::default());
-        let result = clock.increment_time(1);
+        let result = clock.increment_time(DurationNanos::new(1));
         assert!(result.is_err());
         assert!(
             result
@@ -473,6 +478,17 @@ mod tests {
 
         // This call will attempt to add 1 and must panic
         let _ = clock.time_since_epoch();
+    }
+
+    #[rstest]
+    fn test_new_realtime_ignores_initial_time() {
+        let before = nanos_since_unix_epoch();
+        let clock = AtomicTime::new(true, UnixNanos::from(u64::MAX));
+        let timestamp = clock.get_time_ns().as_u64();
+        let after = nanos_since_unix_epoch();
+
+        assert!(timestamp >= before);
+        assert!(timestamp <= after);
     }
 
     #[rstest]
@@ -540,10 +556,10 @@ mod tests {
         // Start in static mode
         let time = AtomicTime::new(false, UnixNanos::from(0));
 
-        let updated_time = time.increment_time(500).unwrap();
+        let updated_time = time.increment_time(DurationNanos::new(500)).unwrap();
         assert_eq!(updated_time.as_u64(), 500);
 
-        let updated_time = time.increment_time(1_000).unwrap();
+        let updated_time = time.increment_time(DurationNanos::new(1_000)).unwrap();
         assert_eq!(updated_time.as_u64(), 1_500);
     }
 
@@ -551,7 +567,7 @@ mod tests {
     fn test_increment_time_overflow_errors() {
         let time = AtomicTime::new(false, UnixNanos::from(u64::MAX - 5));
 
-        let err = time.increment_time(10).unwrap_err();
+        let err = time.increment_time(DurationNanos::new(10)).unwrap_err();
         assert_eq!(err.to_string(), "Cannot increment time beyond u64::MAX");
     }
 
@@ -561,8 +577,8 @@ mod tests {
         let clock = AtomicTime::new(true, UnixNanos::default());
         clock.make_static();
         let before = clock.get_time_ns();
-        let after = clock.increment_time(1_000).unwrap();
-        assert_eq!(after, before + 1_000_u64);
+        let after = clock.increment_time(DurationNanos::new(1_000)).unwrap();
+        assert_eq!(after, before + DurationNanos::new(1_000));
         assert_eq!(clock.get_time_ns(), after);
     }
 
@@ -784,7 +800,7 @@ mod tests {
 
     #[rstest]
     fn test_acquire_release_contract_increment_time() {
-        // Similar test for increment_time, which uses fetch_update with AcqRel (see AtomicTime::increment_time)
+        // Similar test for increment_time, which uses try_update with AcqRel (see AtomicTime::increment_time)
 
         let clock = Arc::new(AtomicTime::new(false, UnixNanos::from(0)));
         let aux_data = Arc::new(AtomicU64::new(0));
@@ -797,7 +813,9 @@ mod tests {
         let writer = std::thread::spawn(move || {
             for i in 1..=1_000u64 {
                 writer_aux.store(i, Ordering::Relaxed);
-                let _ = writer_clock.increment_time(1000).unwrap();
+                let _ = writer_clock
+                    .increment_time(DurationNanos::new(1000))
+                    .unwrap();
                 std::thread::yield_now();
             }
             writer_done.store(true, Ordering::Release);
@@ -866,7 +884,7 @@ mod tests {
     #[madsim::test]
     async fn test_wall_clock_advances_with_virtual_time() {
         let before = nanos_since_unix_epoch();
-        madsim::time::sleep(std::time::Duration::from_secs(60)).await;
+        madsim::time::sleep(std::time::Duration::from_mins(1)).await;
         let after = nanos_since_unix_epoch();
 
         let elapsed_ns = after.saturating_sub(before);

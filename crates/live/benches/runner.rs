@@ -22,7 +22,7 @@ use nautilus_common::{
         self, MessageBus, TypedIntoHandler, register_data_endpoint,
         switchboard::MessagingSwitchboard,
     },
-    timer::TimeEventHandler,
+    runner::TimeEventMessage,
 };
 use nautilus_core::UnixNanos;
 use nautilus_live::runner::AsyncRunner;
@@ -50,7 +50,7 @@ fn create_test_trade() -> TradeTick {
         instrument_id: InstrumentId::from("EUR/USD.SIM"),
         price: Price::from("1.10000"),
         size: Quantity::from(100_000),
-        aggressor_side: AggressorSide::Buyer,
+        aggressor_side: AggressorSide::Buy,
         trade_id: TradeId::from("123456"),
         ts_event: UnixNanos::default(),
         ts_init: UnixNanos::default(),
@@ -83,7 +83,7 @@ fn bench_channel_operations(c: &mut Criterion) {
     group.bench_function("channel_creation", |b| {
         b.iter(|| {
             let (_tx1, _rx1) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-            let (_tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<TimeEventHandler>();
+            let (_tx2, _rx2) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
             let (_tx3, _rx3) = tokio::sync::mpsc::unbounded_channel::<()>();
         });
     });
@@ -100,7 +100,7 @@ fn bench_runner_components(c: &mut Criterion) {
             // Simulate what AsyncRunner::new() does without the global state
             let (_data_tx, _data_rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
             let (_cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel::<DataCommand>();
-            let (_time_tx, _time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventHandler>();
+            let (_time_tx, _time_rx) = tokio::sync::mpsc::unbounded_channel::<TimeEventMessage>();
             let (_signal_tx, _signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         });
     });
@@ -275,7 +275,7 @@ fn bench_memory_usage(c: &mut Criterion) {
 // increment, and a noop handler. Skips the 5-branch `select!` poll cost,
 // which is bounded by `tokio::mpsc::recv` and is small relative to the
 // dispatch shown by this bench. Pair with the `stress_trade_burst` test
-// (`crates/live/tests/stress.rs`) for end-to-end runner+engine numbers.
+// (`crates/live/tests/integration/stress.rs`) for end-to-end runner+engine numbers.
 fn bench_runner_dispatch(c: &mut Criterion) {
     msgbus::set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
 

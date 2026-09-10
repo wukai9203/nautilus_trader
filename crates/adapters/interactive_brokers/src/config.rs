@@ -15,8 +15,12 @@
 
 //! Configuration types for the Interactive Brokers adapter.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+};
 
+use nautilus_core::string::secret::SecretString;
 use nautilus_model::identifiers::InstrumentId;
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +31,15 @@ use crate::common::consts::{DEFAULT_CLIENT_ID, DEFAULT_HOST, DEFAULT_PORT};
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
-        from_py_object
+        module = "nautilus_trader.adapters.interactive_brokers",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE"
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(
+        module = "nautilus_trader.adapters.interactive_brokers"
     )
 )]
 #[derive(Default)]
@@ -61,9 +72,15 @@ impl From<MarketDataType> for ibapi::market_data::MarketDataType {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
+        module = "nautilus_trader.adapters.interactive_brokers",
         subclass,
         from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(
+        module = "nautilus_trader.adapters.interactive_brokers"
     )
 )]
 pub struct InteractiveBrokersDataClientConfig {
@@ -116,12 +133,18 @@ impl Default for InteractiveBrokersDataClientConfig {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
+        module = "nautilus_trader.adapters.interactive_brokers",
         subclass,
         from_py_object
     )
 )]
-pub struct InteractiveBrokersExecClientConfig {
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(
+        module = "nautilus_trader.adapters.interactive_brokers"
+    )
+)]
+pub struct InteractiveBrokersExecutionClientConfig {
     /// Host for IB Gateway/TWS.
     #[builder(default = DEFAULT_HOST.to_string())]
     pub host: String,
@@ -150,7 +173,7 @@ pub struct InteractiveBrokersExecClientConfig {
     pub instrument_provider: InteractiveBrokersInstrumentProviderConfig,
 }
 
-impl Default for InteractiveBrokersExecClientConfig {
+impl Default for InteractiveBrokersExecutionClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
@@ -161,8 +184,15 @@ impl Default for InteractiveBrokersExecClientConfig {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
-        from_py_object
+        module = "nautilus_trader.adapters.interactive_brokers",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE"
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(
+        module = "nautilus_trader.adapters.interactive_brokers"
     )
 )]
 #[derive(Default)]
@@ -182,9 +212,15 @@ pub enum SymbologyMethod {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
+        module = "nautilus_trader.adapters.interactive_brokers",
         subclass,
         from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(
+        module = "nautilus_trader.adapters.interactive_brokers"
     )
 )]
 pub struct InteractiveBrokersInstrumentProviderConfig {
@@ -236,8 +272,15 @@ impl Default for InteractiveBrokersInstrumentProviderConfig {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
-        from_py_object
+        module = "nautilus_trader.adapters.interactive_brokers",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE"
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(
+        module = "nautilus_trader.adapters.interactive_brokers"
     )
 )]
 #[derive(Default)]
@@ -260,16 +303,22 @@ pub enum TradingMode {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
+        module = "nautilus_trader.adapters.interactive_brokers",
         subclass,
         from_py_object
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(
+        module = "nautilus_trader.adapters.interactive_brokers"
+    )
+)]
 pub struct DockerizedIBGatewayConfig {
     /// Username for IB account (falls back to `TWS_USERNAME` env var via [`Default`]).
-    pub username: Option<String>,
+    pub username: Option<SecretString>,
     /// Password for IB account (falls back to `TWS_PASSWORD` env var via [`Default`]).
-    pub password: Option<String>,
+    pub password: Option<SecretString>,
     /// Trading mode (paper or live).
     #[builder(default)]
     pub trading_mode: TradingMode,
@@ -328,8 +377,30 @@ impl DockerizedIBGatewayConfig {
 impl Default for DockerizedIBGatewayConfig {
     fn default() -> Self {
         Self::builder()
-            .maybe_username(std::env::var("TWS_USERNAME").ok())
-            .maybe_password(std::env::var("TWS_PASSWORD").ok())
+            .maybe_username(std::env::var("TWS_USERNAME").ok().map(SecretString::from))
+            .maybe_password(std::env::var("TWS_PASSWORD").ok().map(SecretString::from))
             .build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn dockerized_gateway_config_debug_redacts_credentials() {
+        let config = DockerizedIBGatewayConfig::builder()
+            .username("test-user".into())
+            .password("test-password".into())
+            .build();
+
+        let formatted = format!("{config:?}");
+
+        assert!(formatted.contains("username: Some(<redacted>)"));
+        assert!(formatted.contains("password: Some(<redacted>)"));
+        assert!(!formatted.contains("test-user"));
+        assert!(!formatted.contains("test-password"));
     }
 }

@@ -22,6 +22,8 @@
 //! signal to fail-stop trading; it is fired exactly once before the writer ceases to accept
 //! further entries.
 
+#[cfg(not(madsim))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{sync::Arc, time::Duration};
 
 use crate::error::EventStoreError;
@@ -63,6 +65,18 @@ impl HaltReason {
 /// Cloneable so submit, the writer thread, and tests can share the same fail-stop sink.
 pub type HaltCallback = Arc<dyn Fn(HaltReason) + Send + Sync + 'static>;
 
+/// Fires `halt` only when `halted` transitions from unset, so the callback runs
+/// exactly once across every failure path; the first condition wins the reason.
+#[cfg(not(madsim))]
+pub(crate) fn fire_once(halt: &HaltCallback, halted: &AtomicBool, reason: HaltReason) {
+    if halted
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        halt(reason);
+    }
+}
+
 /// Returns a [`HaltCallback`] that performs no action.
 ///
 /// Useful for tests and for writers operating under simulation where halt is observed
@@ -74,8 +88,7 @@ pub fn noop_halt() -> HaltCallback {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
+    use parking_lot::Mutex;
     use rstest::rstest;
 
     use super::*;
@@ -126,12 +139,12 @@ mod tests {
         let captured: Arc<Mutex<Option<HaltReason>>> = Arc::new(Mutex::new(None));
         let captured_for_cb = Arc::clone(&captured);
         let halt: HaltCallback = Arc::new(move |reason| {
-            *captured_for_cb.lock().expect("lock") = Some(reason);
+            *captured_for_cb.lock() = Some(reason);
         });
 
         halt(HaltReason::BackendDisk("stall".to_string()));
 
-        match captured.lock().expect("lock").take() {
+        match captured.lock().take() {
             Some(HaltReason::BackendDisk(msg)) => assert_eq!(msg, "stall"),
             other => panic!("expected BackendDisk, was {other:?}"),
         }

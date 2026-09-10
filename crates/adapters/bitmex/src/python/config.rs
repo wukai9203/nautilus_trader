@@ -15,12 +15,14 @@
 
 //! Python bindings for BitMEX configuration.
 
+use nautilus_core::{python::to_pyvalue_err, string::secret::SecretString};
 use nautilus_model::identifiers::AccountId;
+use nautilus_network::websocket::TransportBackend;
 use pyo3::prelude::*;
 
 use crate::{
     common::enums::BitmexEnvironment,
-    config::{BitmexDataClientConfig, BitmexExecClientConfig},
+    config::{BitmexDataClientConfig, BitmexExecutionClientConfig},
 };
 
 #[pymethods]
@@ -39,12 +41,14 @@ impl BitmexDataClientConfig {
         retry_delay_initial_ms = None,
         retry_delay_max_ms = None,
         heartbeat_interval_secs = None,
+        auth_timeout_secs = None,
         recv_window_ms = None,
         active_only = None,
         update_instruments_interval_mins = None,
         environment = None,
         max_requests_per_second = None,
         max_requests_per_minute = None,
+        transport_backend = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -58,26 +62,29 @@ impl BitmexDataClientConfig {
         retry_delay_initial_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
         heartbeat_interval_secs: Option<u64>,
+        auth_timeout_secs: Option<u64>,
         recv_window_ms: Option<u64>,
         active_only: Option<bool>,
         update_instruments_interval_mins: Option<u64>,
         environment: Option<BitmexEnvironment>,
         max_requests_per_second: Option<u32>,
         max_requests_per_minute: Option<u32>,
+        transport_backend: Option<TransportBackend>,
     ) -> Self {
         let defaults = Self::default();
         Self {
-            api_key,
-            api_secret,
+            api_key: api_key.map(SecretString::from),
+            api_secret: api_secret.map(SecretString::from),
             base_url_http,
             base_url_ws,
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             max_retries: max_retries.unwrap_or(defaults.max_retries),
             retry_delay_initial_ms: retry_delay_initial_ms
                 .unwrap_or(defaults.retry_delay_initial_ms),
             retry_delay_max_ms: retry_delay_max_ms.unwrap_or(defaults.retry_delay_max_ms),
             heartbeat_interval_secs,
+            auth_timeout_secs,
             recv_window_ms: recv_window_ms.unwrap_or(defaults.recv_window_ms),
             active_only: active_only.unwrap_or(defaults.active_only),
             update_instruments_interval_mins,
@@ -86,19 +93,27 @@ impl BitmexDataClientConfig {
                 .unwrap_or(defaults.max_requests_per_second),
             max_requests_per_minute: max_requests_per_minute
                 .unwrap_or(defaults.max_requests_per_minute),
-            transport_backend: defaults.transport_backend,
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(BitmexDataClientConfig).to_string()
     }
 }
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl BitmexExecClientConfig {
+impl BitmexExecutionClientConfig {
     /// Configuration for the BitMEX live execution client.
+    ///
+    /// The submit and cancel broadcaster pools must each contain `[1, 15]` clients, with a combined
+    /// size in `[2, 16]`.
     #[new]
     #[pyo3(signature = (
         api_key = None,
@@ -111,6 +126,7 @@ impl BitmexExecClientConfig {
         retry_delay_initial_ms = None,
         retry_delay_max_ms = None,
         heartbeat_interval_secs = None,
+        auth_timeout_secs = None,
         recv_window_ms = None,
         active_only = None,
         environment = None,
@@ -122,6 +138,7 @@ impl BitmexExecClientConfig {
         submitter_proxy_urls = None,
         canceller_proxy_urls = None,
         deadmans_switch_timeout_secs = None,
+        transport_backend = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -135,6 +152,7 @@ impl BitmexExecClientConfig {
         retry_delay_initial_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
         heartbeat_interval_secs: Option<u64>,
+        auth_timeout_secs: Option<u64>,
         recv_window_ms: Option<u64>,
         active_only: Option<bool>,
         environment: Option<BitmexEnvironment>,
@@ -146,14 +164,15 @@ impl BitmexExecClientConfig {
         submitter_proxy_urls: Option<Vec<String>>,
         canceller_proxy_urls: Option<Vec<String>>,
         deadmans_switch_timeout_secs: Option<u64>,
-    ) -> Self {
+        transport_backend: Option<TransportBackend>,
+    ) -> PyResult<Self> {
         let defaults = Self::default();
-        Self {
-            api_key,
-            api_secret,
+        let config = Self {
+            api_key: api_key.map(SecretString::from),
+            api_secret: api_secret.map(SecretString::from),
             base_url_http,
             base_url_ws,
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             max_retries: max_retries.unwrap_or(defaults.max_retries),
             retry_delay_initial_ms: retry_delay_initial_ms
@@ -161,6 +180,7 @@ impl BitmexExecClientConfig {
             retry_delay_max_ms: retry_delay_max_ms.unwrap_or(defaults.retry_delay_max_ms),
             heartbeat_interval_secs: heartbeat_interval_secs
                 .unwrap_or(defaults.heartbeat_interval_secs),
+            auth_timeout_secs,
             recv_window_ms: recv_window_ms.unwrap_or(defaults.recv_window_ms),
             active_only: active_only.unwrap_or(defaults.active_only),
             environment: environment.unwrap_or(defaults.environment),
@@ -171,14 +191,35 @@ impl BitmexExecClientConfig {
                 .unwrap_or(defaults.max_requests_per_minute),
             submitter_pool_size,
             canceller_pool_size,
-            submitter_proxy_urls,
-            canceller_proxy_urls,
+            submitter_proxy_urls: submitter_proxy_urls
+                .map(|values| values.into_iter().map(SecretString::from).collect()),
+            canceller_proxy_urls: canceller_proxy_urls
+                .map(|values| values.into_iter().map(SecretString::from).collect()),
             deadmans_switch_timeout_secs,
-            transport_backend: defaults.transport_backend,
-        }
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
+        };
+        config
+            .validate_broadcaster_pool_sizes()
+            .map_err(to_pyvalue_err)?;
+        Ok(config)
+    }
+
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
+    #[getter]
+    const fn has_submitter_proxy_urls(&self) -> bool {
+        self.submitter_proxy_urls.is_some()
+    }
+
+    #[getter]
+    const fn has_canceller_proxy_urls(&self) -> bool {
+        self.canceller_proxy_urls.is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(BitmexExecutionClientConfig).to_string()
     }
 }

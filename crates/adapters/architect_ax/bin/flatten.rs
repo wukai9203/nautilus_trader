@@ -27,7 +27,7 @@
 
 use nautilus_architect_ax::{
     common::{
-        consts::AX_AUTH_TOKEN_TTL_EXEC_SECS,
+        consts::AX_AUTH_TOKEN_TTL_SECS,
         enums::{AxEnvironment, AxOrderSide, AxTimeInForce},
     },
     http::{
@@ -69,9 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let token = client
-        .authenticate(&api_key, &api_secret, AX_AUTH_TOKEN_TTL_EXEC_SECS)
+        .authenticate(&api_key, &api_secret, AX_AUTH_TOKEN_TTL_SECS)
         .await?;
-    client.set_session_token(token.token);
+    client.set_session_token(token.into_token());
     log::info!("Authenticated");
 
     // Cancel all open orders
@@ -132,8 +132,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             s: pos.symbol,
             tif: AxTimeInForce::Ioc,
             tag: None,
-            order_type: None,
-            trigger_price: None,
         };
 
         let resp = client.place_order(&request).await?;

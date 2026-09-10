@@ -17,7 +17,7 @@
 
 use ahash::AHashMap;
 use anyhow::Context;
-use chrono::{Duration, TimeZone, Timelike, Utc};
+use jiff::{Span, Timestamp, tz::Offset};
 use nautilus_core::{UUID4, UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND};
 use nautilus_model::{
     data::{
@@ -27,8 +27,8 @@ use nautilus_model::{
     },
     enums::{
         AggregationSource, AggressorSide, BarAggregation, BookAction, GreeksConvention,
-        LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSideSpecified, PriceType,
-        RecordFlag, TimeInForce,
+        LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide, PriceType, RecordFlag,
+        TimeInForce,
     },
     events::{OrderAccepted, OrderCanceled, OrderExpired, OrderUpdated},
     identifiers::{
@@ -52,25 +52,17 @@ use crate::{common::parse::build_public_trade_id, http::models::DeribitPosition}
 
 fn next_8_utc(from_ns: UnixNanos) -> anyhow::Result<UnixNanos> {
     let from_secs = from_ns.as_u64() / 1_000_000_000;
-    let dt = Utc
-        .timestamp_opt(from_secs as i64, 0)
-        .single()
-        .context("failed to convert timestamp to UTC datetime")?;
-    let next_8 = if dt.hour() < 8 {
-        dt.date_naive()
-            .and_hms_opt(8, 0, 0)
-            .context("failed to construct 08:00 UTC time")?
-            .and_utc()
+    let timestamp = Timestamp::from_second(i64::try_from(from_secs)?)?;
+    let dt = Offset::UTC.to_datetime(timestamp);
+    let date = if dt.hour() < 8 {
+        dt.date()
     } else {
-        (dt.date_naive() + Duration::days(1))
-            .and_hms_opt(8, 0, 0)
-            .context("failed to construct next-day 08:00 UTC time")?
-            .and_utc()
+        dt.date().checked_add(Span::new().days(1))?
     };
-    let nanos = next_8
-        .timestamp_nanos_opt()
-        .context("GTD expiry timestamp out of nanosecond range")?;
-    Ok(UnixNanos::from(nanos as u64))
+    let next_8 = Offset::UTC.to_timestamp(date.at(8, 0, 0, 0))?;
+    let nanos = u64::try_from(next_8.as_nanosecond())
+        .context("GTD expiry timestamp out of UnixNanos range")?;
+    Ok(UnixNanos::from(nanos))
 }
 
 /// Parses a Deribit trade message into a Nautilus `TradeTick`.
@@ -91,8 +83,8 @@ pub fn parse_trade_msg(
     let size = Quantity::from_decimal_dp(msg.amount.abs(), size_precision)?;
 
     let aggressor_side = match msg.direction.as_str() {
-        "buy" => AggressorSide::Buyer,
-        "sell" => AggressorSide::Seller,
+        "buy" => AggressorSide::Buy,
+        "sell" => AggressorSide::Sell,
         _ => AggressorSide::NoAggressor,
     };
 
@@ -695,11 +687,7 @@ pub fn parse_chart_msg(
 
     // Adjust timestamp to close time if configured
     if timestamp_on_close {
-        let interval_ns = bar_type
-            .spec()
-            .timedelta()
-            .num_nanoseconds()
-            .context("bar specification produced non-integer interval")?;
+        let interval_ns = bar_type.spec().timedelta().as_nanos();
         let interval_ns = u64::try_from(interval_ns)
             .context("bar interval overflowed the u64 range for nanoseconds")?;
         let updated = ts_event
@@ -734,18 +722,7 @@ pub fn parse_user_order_msg(
     };
 
     // Map Deribit order type to Nautilus
-    let order_type = match msg.order_type.as_str() {
-        "limit" => OrderType::Limit,
-        "market" => OrderType::Market,
-        "stop_limit" => OrderType::StopLimit,
-        "stop_market" => OrderType::StopMarket,
-        "take_limit" => OrderType::LimitIfTouched,
-        "take_market" => OrderType::MarketIfTouched,
-        other => {
-            log::warn!("Unknown Deribit order_type '{other}', defaulting to Limit");
-            OrderType::Limit
-        }
-    };
+    let order_type = parse_deribit_order_type(&msg.order_type);
 
     // Deribit supports: good_til_cancelled, good_til_day, fill_or_kill, immediate_or_cancel
     let time_in_force = match msg.time_in_force.as_str() {
@@ -792,7 +769,7 @@ pub fn parse_user_order_msg(
         instrument_id,
         None, // order_list_id
         venue_order_id,
-        order_side,
+        order_side.into(),
         order_type,
         time_in_force,
         order_status,
@@ -828,7 +805,7 @@ pub fn parse_user_order_msg(
     if let Some(avg_price) = msg.average_price
         && !avg_price.is_zero()
     {
-        report = report.with_avg_px(avg_price.to_f64().unwrap_or_default())?;
+        report = report.with_avg_px(avg_price);
     }
 
     // Add trigger price for stop/take orders
@@ -855,6 +832,22 @@ pub fn parse_user_order_msg(
     }
 
     Ok(report)
+}
+
+#[must_use]
+pub(crate) fn parse_deribit_order_type(order_type: &str) -> OrderType {
+    match order_type {
+        "limit" => OrderType::Limit,
+        "market" => OrderType::Market,
+        "stop_limit" => OrderType::StopLimit,
+        "stop_market" => OrderType::StopMarket,
+        "take_limit" => OrderType::LimitIfTouched,
+        "take_market" => OrderType::MarketIfTouched,
+        other => {
+            log::warn!("Unknown Deribit order_type '{other}', defaulting to Limit");
+            OrderType::Limit
+        }
+    }
 }
 
 /// Parses a Deribit user trade message into a Nautilus `FillReport`.
@@ -965,9 +958,9 @@ pub fn parse_position_status_report(
         .unwrap_or_else(|_| Quantity::zero(size_precision));
 
     let position_side = match position.direction.as_str() {
-        "buy" => PositionSideSpecified::Long,
-        "sell" => PositionSideSpecified::Short,
-        _ => PositionSideSpecified::Flat,
+        "buy" => PositionSide::Long,
+        "sell" => PositionSide::Short,
+        _ => PositionSide::Flat,
     };
 
     // Use average_price directly as it's already a Decimal
@@ -1025,12 +1018,31 @@ pub fn parse_order_accepted(
     strategy_id: StrategyId,
     ts_init: UnixNanos,
 ) -> OrderAccepted {
+    let client_order_id =
+        extract_client_order_id(msg).unwrap_or_else(|| ClientOrderId::new(&msg.order_id));
+    parse_order_accepted_with_client_order_id(
+        msg,
+        instrument,
+        account_id,
+        trader_id,
+        strategy_id,
+        client_order_id,
+        ts_init,
+    )
+}
+
+#[must_use]
+pub(crate) fn parse_order_accepted_with_client_order_id(
+    msg: &DeribitOrderMsg,
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    client_order_id: ClientOrderId,
+    ts_init: UnixNanos,
+) -> OrderAccepted {
     let instrument_id = instrument.id();
     let venue_order_id = VenueOrderId::new(&msg.order_id);
-    let client_order_id = extract_client_order_id(msg).unwrap_or_else(|| {
-        // Generate a client order ID from the venue order ID if not provided
-        ClientOrderId::new(&msg.order_id)
-    });
     let ts_event = UnixNanos::new(msg.last_update_timestamp * NANOSECONDS_IN_MILLISECOND);
 
     OrderAccepted::new(
@@ -1059,10 +1071,31 @@ pub fn parse_order_canceled(
     strategy_id: StrategyId,
     ts_init: UnixNanos,
 ) -> OrderCanceled {
-    let instrument_id = instrument.id();
-    let venue_order_id = VenueOrderId::new(&msg.order_id);
     let client_order_id =
         extract_client_order_id(msg).unwrap_or_else(|| ClientOrderId::new(&msg.order_id));
+    parse_order_canceled_with_client_order_id(
+        msg,
+        instrument,
+        account_id,
+        trader_id,
+        strategy_id,
+        client_order_id,
+        ts_init,
+    )
+}
+
+#[must_use]
+pub(crate) fn parse_order_canceled_with_client_order_id(
+    msg: &DeribitOrderMsg,
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    client_order_id: ClientOrderId,
+    ts_init: UnixNanos,
+) -> OrderCanceled {
+    let instrument_id = instrument.id();
+    let venue_order_id = VenueOrderId::new(&msg.order_id);
     let ts_event = UnixNanos::new(msg.last_update_timestamp * NANOSECONDS_IN_MILLISECOND);
 
     OrderCanceled::new(
@@ -1076,6 +1109,7 @@ pub fn parse_order_canceled(
         false, // reconciliation
         Some(venue_order_id),
         Some(account_id),
+        msg.cancel_reason.as_deref().map(Ustr::from),
     )
 }
 
@@ -1092,10 +1126,31 @@ pub fn parse_order_expired(
     strategy_id: StrategyId,
     ts_init: UnixNanos,
 ) -> OrderExpired {
-    let instrument_id = instrument.id();
-    let venue_order_id = VenueOrderId::new(&msg.order_id);
     let client_order_id =
         extract_client_order_id(msg).unwrap_or_else(|| ClientOrderId::new(&msg.order_id));
+    parse_order_expired_with_client_order_id(
+        msg,
+        instrument,
+        account_id,
+        trader_id,
+        strategy_id,
+        client_order_id,
+        ts_init,
+    )
+}
+
+#[must_use]
+pub(crate) fn parse_order_expired_with_client_order_id(
+    msg: &DeribitOrderMsg,
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    client_order_id: ClientOrderId,
+    ts_init: UnixNanos,
+) -> OrderExpired {
+    let instrument_id = instrument.id();
+    let venue_order_id = VenueOrderId::new(&msg.order_id);
     let ts_event = UnixNanos::new(msg.last_update_timestamp * NANOSECONDS_IN_MILLISECOND);
 
     OrderExpired::new(
@@ -1124,13 +1179,34 @@ pub fn parse_order_updated(
     strategy_id: StrategyId,
     ts_init: UnixNanos,
 ) -> OrderUpdated {
+    let client_order_id =
+        extract_client_order_id(msg).unwrap_or_else(|| ClientOrderId::new(&msg.order_id));
+    parse_order_updated_with_client_order_id(
+        msg,
+        instrument,
+        account_id,
+        trader_id,
+        strategy_id,
+        client_order_id,
+        ts_init,
+    )
+}
+
+#[must_use]
+pub(crate) fn parse_order_updated_with_client_order_id(
+    msg: &DeribitOrderMsg,
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+    trader_id: TraderId,
+    strategy_id: StrategyId,
+    client_order_id: ClientOrderId,
+    ts_init: UnixNanos,
+) -> OrderUpdated {
     let instrument_id = instrument.id();
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
 
     let venue_order_id = VenueOrderId::new(&msg.order_id);
-    let client_order_id =
-        extract_client_order_id(msg).unwrap_or_else(|| ClientOrderId::new(&msg.order_id));
     let quantity = Quantity::from_decimal_dp(msg.amount, size_precision)
         .unwrap_or_else(|_| Quantity::zero(size_precision));
     let price = msg
@@ -1232,7 +1308,7 @@ mod tests {
         http::models::{DeribitInstrument, DeribitJsonRpcResponse},
     };
 
-    /// Helper function to create a test instrument (BTC-PERPETUAL).
+    /// Creates a BTC-PERPETUAL test instrument.
     fn test_perpetual_instrument() -> InstrumentAny {
         let json = load_test_json("http_get_instruments.json");
         let response: DeribitJsonRpcResponse<Vec<DeribitInstrument>> =
@@ -1257,7 +1333,7 @@ mod tests {
         assert_eq!(tick.instrument_id, instrument.id());
         assert_eq!(tick.price, instrument.make_price(92294.5));
         assert_eq!(tick.size, instrument.make_qty(10.0, None));
-        assert_eq!(tick.aggressor_side, AggressorSide::Seller);
+        assert_eq!(tick.aggressor_side, AggressorSide::Sell);
         assert_eq!(tick.trade_id.to_string(), "403691824");
         assert_eq!(tick.ts_event, UnixNanos::new(1_765_531_356_452_000_000));
     }
@@ -1276,7 +1352,7 @@ mod tests {
         assert_eq!(tick.instrument_id, instrument.id());
         assert_eq!(tick.price, instrument.make_price(92288.5));
         assert_eq!(tick.size, instrument.make_qty(750.0, None));
-        assert_eq!(tick.aggressor_side, AggressorSide::Seller);
+        assert_eq!(tick.aggressor_side, AggressorSide::Sell);
         assert_eq!(tick.trade_id.to_string(), "403691825");
     }
 
@@ -1346,7 +1422,7 @@ mod tests {
             .result
             .unwrap()
             .into_iter()
-            .find(|i| i.instrument_name.as_str() == "BTC-CS-19MAY26-70000_75000")
+            .find(|i| i.instrument_name == "BTC-CS-19MAY26-70000_75000")
             .expect("fixture must contain BTC-CS-19MAY26-70000_75000");
         parse_deribit_instrument_any(&combo_raw, UnixNanos::default(), UnixNanos::default())
             .unwrap()
@@ -1384,7 +1460,7 @@ mod tests {
         // so a regression in price/size precision is caught here too.
         assert_eq!(tick.price, Price::from("0.0639"));
         assert_eq!(tick.size, Quantity::from("0.1"));
-        assert_eq!(tick.aggressor_side, AggressorSide::Seller);
+        assert_eq!(tick.aggressor_side, AggressorSide::Sell);
         assert_eq!(tick.trade_id.to_string(), "244365193");
     }
 
@@ -1392,7 +1468,7 @@ mod tests {
     fn test_parse_trades_data_combo_not_cached_emits_no_tick() {
         // When the combo InstrumentAny is not in the WS handler cache,
         // parse_trades_data must drop the message rather than panic or
-        // synthesise a tick against an unknown instrument.
+        // synthesize a tick against an unknown instrument.
         let cache: AHashMap<Ustr, InstrumentAny> = AHashMap::new();
         let trades = load_combo_trade_msgs();
         let data = parse_trades_data(&trades, &cache, UnixNanos::default());
@@ -1463,14 +1539,14 @@ mod tests {
         // Check first bid
         let first_bid = &deltas.deltas[1];
         assert_eq!(first_bid.action, BookAction::Add);
-        assert_eq!(first_bid.order.side, OrderSide::Buy);
+        assert_eq!(first_bid.order.side, OrderSide::Buy.into());
         assert_eq!(first_bid.order.price, instrument.make_price(42500.0));
         assert_eq!(first_bid.order.size, instrument.make_qty(1000.0, None));
 
         // Check first ask
         let first_ask = &deltas.deltas[6];
         assert_eq!(first_ask.action, BookAction::Add);
-        assert_eq!(first_ask.order.side, OrderSide::Sell);
+        assert_eq!(first_ask.order.side, OrderSide::Sell.into());
         assert_eq!(first_ask.order.price, instrument.make_price(42501.0));
         assert_eq!(first_ask.order.size, instrument.make_qty(800.0, None));
 
@@ -1499,28 +1575,28 @@ mod tests {
         // Check first bid - "change" action
         let bid_change = &deltas.deltas[0];
         assert_eq!(bid_change.action, BookAction::Update);
-        assert_eq!(bid_change.order.side, OrderSide::Buy);
+        assert_eq!(bid_change.order.side, OrderSide::Buy.into());
         assert_eq!(bid_change.order.price, instrument.make_price(42500.0));
         assert_eq!(bid_change.order.size, instrument.make_qty(950.0, None));
 
         // Check second bid - "new" action
         let bid_new = &deltas.deltas[1];
         assert_eq!(bid_new.action, BookAction::Add);
-        assert_eq!(bid_new.order.side, OrderSide::Buy);
+        assert_eq!(bid_new.order.side, OrderSide::Buy.into());
         assert_eq!(bid_new.order.price, instrument.make_price(42498.5));
         assert_eq!(bid_new.order.size, instrument.make_qty(300.0, None));
 
         // Check first ask - "delete" action
         let ask_delete = &deltas.deltas[2];
         assert_eq!(ask_delete.action, BookAction::Delete);
-        assert_eq!(ask_delete.order.side, OrderSide::Sell);
+        assert_eq!(ask_delete.order.side, OrderSide::Sell.into());
         assert_eq!(ask_delete.order.price, instrument.make_price(42501.0));
         assert_eq!(ask_delete.order.size, instrument.make_qty(0.0, None));
 
         // Check second ask - "change" action
         let ask_change = &deltas.deltas[3];
         assert_eq!(ask_change.action, BookAction::Update);
-        assert_eq!(ask_change.order.side, OrderSide::Sell);
+        assert_eq!(ask_change.order.side, OrderSide::Sell.into());
         assert_eq!(ask_change.order.price, instrument.make_price(42501.5));
         assert_eq!(ask_change.order.size, instrument.make_qty(700.0, None));
 
@@ -1541,7 +1617,7 @@ mod tests {
             serde_json::from_value(response["params"]["data"].clone()).unwrap();
 
         // Verify the message was deserialized correctly
-        assert_eq!(msg.instrument_name.as_str(), "BTC-PERPETUAL");
+        assert_eq!(msg.instrument_name, "BTC-PERPETUAL");
         assert_eq!(msg.timestamp, 1_765_541_474_086);
         assert_eq!(msg.best_bid_price, Some(dec!(92283.5)));
         assert_eq!(msg.best_ask_price, Some(dec!(92284.0)));
@@ -1570,7 +1646,7 @@ mod tests {
             serde_json::from_value(response["params"]["data"].clone()).unwrap();
 
         // Verify the message was deserialized correctly
-        assert_eq!(msg.instrument_name.as_str(), "BTC-PERPETUAL");
+        assert_eq!(msg.instrument_name, "BTC-PERPETUAL");
         assert_eq!(msg.timestamp, 1_765_541_767_174);
         assert_eq!(msg.best_bid_price, dec!(92288.0));
         assert_eq!(msg.best_ask_price, dec!(92288.5));
@@ -1629,14 +1705,14 @@ mod tests {
         // Verify first bid was parsed correctly from ["new", 42500.0, 1000.0]
         let first_bid = &deltas.deltas[1];
         assert_eq!(first_bid.action, BookAction::Add);
-        assert_eq!(first_bid.order.side, OrderSide::Buy);
+        assert_eq!(first_bid.order.side, OrderSide::Buy.into());
         assert_eq!(first_bid.order.price, instrument.make_price(42500.0));
         assert_eq!(first_bid.order.size, instrument.make_qty(1000.0, None));
 
         // Verify first ask was parsed correctly from ["new", 42501.0, 800.0]
         let first_ask = &deltas.deltas[6];
         assert_eq!(first_ask.action, BookAction::Add);
-        assert_eq!(first_ask.order.side, OrderSide::Sell);
+        assert_eq!(first_ask.order.side, OrderSide::Sell.into());
         assert_eq!(first_ask.order.price, instrument.make_price(42501.0));
         assert_eq!(first_ask.order.size, instrument.make_qty(800.0, None));
     }
@@ -1688,27 +1764,27 @@ mod tests {
         // Verify first bid "change" action was parsed correctly from ["change", 42500.0, 950.0]
         let bid_change = &deltas.deltas[0];
         assert_eq!(bid_change.action, BookAction::Update);
-        assert_eq!(bid_change.order.side, OrderSide::Buy);
+        assert_eq!(bid_change.order.side, OrderSide::Buy.into());
         assert_eq!(bid_change.order.price, instrument.make_price(42500.0));
         assert_eq!(bid_change.order.size, instrument.make_qty(950.0, None));
 
         // Verify second bid "new" action was parsed correctly from ["new", 42498.5, 300.0]
         let bid_new = &deltas.deltas[1];
         assert_eq!(bid_new.action, BookAction::Add);
-        assert_eq!(bid_new.order.side, OrderSide::Buy);
+        assert_eq!(bid_new.order.side, OrderSide::Buy.into());
         assert_eq!(bid_new.order.price, instrument.make_price(42498.5));
         assert_eq!(bid_new.order.size, instrument.make_qty(300.0, None));
 
         // Verify first ask "delete" action was parsed correctly from ["delete", 42501.0, 0.0]
         let ask_delete = &deltas.deltas[2];
         assert_eq!(ask_delete.action, BookAction::Delete);
-        assert_eq!(ask_delete.order.side, OrderSide::Sell);
+        assert_eq!(ask_delete.order.side, OrderSide::Sell.into());
         assert_eq!(ask_delete.order.price, instrument.make_price(42501.0));
 
         // Verify second ask "change" action was parsed correctly from ["change", 42501.5, 700.0]
         let ask_change = &deltas.deltas[3];
         assert_eq!(ask_change.action, BookAction::Update);
-        assert_eq!(ask_change.order.side, OrderSide::Sell);
+        assert_eq!(ask_change.order.side, OrderSide::Sell.into());
         assert_eq!(ask_change.order.price, instrument.make_price(42501.5));
         assert_eq!(ask_change.order.size, instrument.make_qty(700.0, None));
     }
@@ -1754,14 +1830,14 @@ mod tests {
         // Verify first bid was parsed correctly from [89532.5, 254900.0]
         let first_bid = &deltas.deltas[1];
         assert_eq!(first_bid.action, BookAction::Add);
-        assert_eq!(first_bid.order.side, OrderSide::Buy);
+        assert_eq!(first_bid.order.side, OrderSide::Buy.into());
         assert_eq!(first_bid.order.price, instrument.make_price(89532.5));
         assert_eq!(first_bid.order.size, instrument.make_qty(254900.0, None));
 
         // Verify first ask was parsed correctly from [89533.0, 91570.0]
         let first_ask = &deltas.deltas[11];
         assert_eq!(first_ask.action, BookAction::Add);
-        assert_eq!(first_ask.order.side, OrderSide::Sell);
+        assert_eq!(first_ask.order.side, OrderSide::Sell.into());
         assert_eq!(first_ask.order.price, instrument.make_price(89533.0));
         assert_eq!(first_ask.order.size, instrument.make_qty(91570.0, None));
 
@@ -2038,6 +2114,7 @@ mod tests {
         );
         assert_eq!(order_msg.direction, "buy");
         assert_eq!(order_msg.order_state, "open");
+        assert!(order_msg.replaced);
         assert_eq!(order_msg.price, Some(dec!(3067.2))); // New price after edit
 
         // Test parse_order_updated
@@ -2192,7 +2269,7 @@ mod tests {
             report.client_order_id.unwrap().to_string(),
             "O-19700101-000000-001-001-1"
         );
-        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_side, OrderSide::Buy.into());
         assert_eq!(report.order_type, OrderType::Limit);
         assert_eq!(report.time_in_force, TimeInForce::Gtc);
         assert_eq!(report.order_status, OrderStatus::Accepted);

@@ -25,16 +25,17 @@ use std::{any::Any, fmt::Debug};
 
 use ustr::Ustr;
 
+#[doc(hidden)]
+pub mod binding;
 pub mod data_actor;
-#[cfg(feature = "indicators")]
-pub(crate) mod indicators;
+pub mod indicators;
 pub mod registry;
 
 #[cfg(test)]
 pub(crate) mod tests;
 
 // Re-exports
-pub use data_actor::{DataActor, DataActorConfig, DataActorCore};
+pub use data_actor::{DataActor, DataActorConfig, DataActorCore, DataActorNative};
 
 pub use crate::component::Component;
 

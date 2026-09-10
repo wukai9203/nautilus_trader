@@ -15,12 +15,13 @@
 
 //! Python bindings for dYdX configuration.
 
-use nautilus_model::identifiers::{AccountId, TraderId};
+use nautilus_core::string::secret::SecretString;
+use nautilus_model::identifiers::AccountId;
 use pyo3::prelude::*;
 
 use crate::{
     common::enums::DydxNetwork,
-    config::{DydxDataClientConfig, DydxExecClientConfig},
+    config::{DydxDataClientConfig, DydxExecutionClientConfig},
 };
 
 #[pymethods]
@@ -32,23 +33,27 @@ impl DydxDataClientConfig {
     fn py_new(proxy_url: Option<String>, network: Option<DydxNetwork>) -> Self {
         Self {
             network: network.unwrap_or_default(),
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
             ..Self::default()
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(DydxDataClientConfig).to_string()
     }
 }
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl DydxExecClientConfig {
+impl DydxExecutionClientConfig {
     /// Configuration for the dYdX execution client.
     #[new]
     #[pyo3(signature = (
-        trader_id,
         account_id,
         proxy_url=None,
         network=None,
@@ -57,7 +62,6 @@ impl DydxExecClientConfig {
         subaccount_number=0,
     ))]
     fn py_new(
-        trader_id: TraderId,
         account_id: AccountId,
         proxy_url: Option<String>,
         network: Option<DydxNetwork>,
@@ -66,18 +70,22 @@ impl DydxExecClientConfig {
         subaccount_number: u32,
     ) -> Self {
         Self {
-            trader_id,
             account_id,
             network: network.unwrap_or_default(),
-            private_key,
+            private_key: private_key.map(SecretString::from),
             wallet_address,
             subaccount_number,
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
             ..Self::default()
         }
     }
 
+    #[getter]
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
+    }
+
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(DydxExecutionClientConfig).to_string()
     }
 }

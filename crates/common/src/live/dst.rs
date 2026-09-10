@@ -42,9 +42,9 @@
 //! - `time`: `Duration`, `Instant`, `Interval`, `MissedTickBehavior`, `Sleep`,
 //!   `error` (submodule), `interval`, `interval_at`, `sleep`, `sleep_until`,
 //!   `timeout`
-//! - `task`: `JoinHandle`, `spawn`, `spawn_local`, `yield_now`
+//! - `task`: `JoinError`, `JoinHandle`, `spawn`, `spawn_local`, `yield_now`
 //! - `runtime`: `Builder`, `Handle`, `Runtime`
-//! - `signal`: `ctrl_c`
+//! - `signal`: `ctrl_c`, `terminate`
 //!
 //! # Related seam
 //!
@@ -77,9 +77,9 @@ pub mod time {
 /// Deterministic task spawning: fixed-order scheduler under simulation.
 pub mod task {
     #[cfg(all(feature = "simulation", madsim))]
-    pub use madsim::task::{JoinHandle, spawn, spawn_local, yield_now};
+    pub use madsim::task::{JoinError, JoinHandle, spawn, spawn_local, yield_now};
     #[cfg(not(all(feature = "simulation", madsim)))]
-    pub use tokio::task::{JoinHandle, spawn, spawn_local, yield_now};
+    pub use tokio::task::{JoinError, JoinHandle, spawn, spawn_local, yield_now};
 }
 
 /// Deterministic runtime: single-threaded sim runtime under simulation.
@@ -146,12 +146,36 @@ pub mod runtime {
 /// Deterministic signal handling: injectable signals under simulation.
 ///
 /// Under simulation (`simulation` + `cfg(madsim)`), `ctrl_c()` responds to
-/// `madsim::runtime::Handle::send_ctrl_c(node_id)` from test code.
+/// `madsim::runtime::Handle::send_ctrl_c(node_id)` from test code. Unix
+/// builds also expose SIGTERM; simulation and non-Unix builds never complete
+/// that future.
 pub mod signal {
     #[cfg(all(feature = "simulation", madsim))]
     pub use madsim::signal::ctrl_c;
     #[cfg(not(all(feature = "simulation", madsim)))]
     pub use tokio::signal::ctrl_c;
+
+    /// Waits for SIGTERM on Unix builds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SIGTERM listener cannot be installed.
+    #[cfg(all(not(all(feature = "simulation", madsim)), unix))]
+    pub async fn terminate() -> std::io::Result<()> {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        signal.recv().await;
+        Ok(())
+    }
+
+    /// Waits forever on builds without a real SIGTERM listener.
+    ///
+    /// # Errors
+    ///
+    /// This function never returns on these builds.
+    #[cfg(any(all(feature = "simulation", madsim), not(unix)))]
+    pub async fn terminate() -> std::io::Result<()> {
+        std::future::pending::<std::io::Result<()>>().await
+    }
 }
 
 /// Compile-time probe of the DST re-export surface.
@@ -175,8 +199,8 @@ pub mod signal {
 mod surface {
     use super::{
         runtime::{Builder, Handle, Runtime},
-        signal::ctrl_c,
-        task::{JoinHandle, spawn, spawn_local, yield_now},
+        signal::{ctrl_c, terminate},
+        task::{JoinError, JoinHandle, spawn, spawn_local, yield_now},
         time::{
             Duration, Instant, Interval, MissedTickBehavior, Sleep, error, interval, interval_at,
             sleep, sleep_until, timeout,
@@ -197,27 +221,16 @@ mod tests {
 
     use super::*;
 
-    // -- Normal build tests (real tokio) --
-
-    #[cfg(not(all(feature = "simulation", madsim)))]
-    #[tokio::test]
-    async fn test_dst_sleep() {
-        let start = time::Instant::now();
-        time::sleep(time::Duration::from_millis(10)).await;
-        let elapsed = start.elapsed();
-        assert!(elapsed >= time::Duration::from_millis(5));
-    }
-
-    #[cfg(not(all(feature = "simulation", madsim)))]
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_dst_task_spawn() {
         let handle = task::spawn(async { 42 });
         let result = handle.await.unwrap();
         assert_eq!(result, 42);
     }
 
-    #[cfg(not(all(feature = "simulation", madsim)))]
-    #[tokio::test]
+    #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
+    #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
     async fn test_real_tokio_sync_alongside_dst() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         tx.send(7).unwrap();
@@ -225,7 +238,6 @@ mod tests {
         assert_eq!(result.unwrap(), Some(7));
     }
 
-    #[cfg(not(all(feature = "simulation", madsim)))]
     #[rstest]
     fn test_dst_runtime_builder() {
         let rt = runtime::Builder::new_multi_thread()
@@ -237,7 +249,14 @@ mod tests {
         assert_eq!(result, 99);
     }
 
-    // -- Simulation build tests (madsim) --
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    #[tokio::test]
+    async fn test_dst_sleep() {
+        let start = time::Instant::now();
+        time::sleep(time::Duration::from_millis(10)).await;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= time::Duration::from_millis(5));
+    }
 
     #[cfg(all(feature = "simulation", madsim))]
     #[madsim::test]
@@ -249,35 +268,6 @@ mod tests {
         // Real tokio would show 100-115ms from OS jitter.
         assert!(elapsed >= time::Duration::from_millis(100));
         assert!(elapsed < time::Duration::from_millis(101));
-    }
-
-    #[cfg(all(feature = "simulation", madsim))]
-    #[madsim::test]
-    async fn test_dst_task_spawn() {
-        let handle = task::spawn(async { 42 });
-        let result = handle.await.unwrap();
-        assert_eq!(result, 42);
-    }
-
-    #[cfg(all(feature = "simulation", madsim))]
-    #[madsim::test]
-    async fn test_real_tokio_sync_alongside_dst() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        tx.send(7).unwrap();
-        let result = time::timeout(time::Duration::from_secs(1), rx.recv()).await;
-        assert_eq!(result.unwrap(), Some(7));
-    }
-
-    #[cfg(all(feature = "simulation", madsim))]
-    #[rstest]
-    fn test_dst_runtime_builder() {
-        let rt = runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let result = rt.block_on(async { 99 });
-        assert_eq!(result, 99);
     }
 
     // Pins the wall-clock seam end-to-end on the common leg: the `simulation`
@@ -292,7 +282,7 @@ mod tests {
     #[madsim::test]
     async fn test_dst_wall_clock_advances_with_virtual_time() {
         let before = nanos_since_unix_epoch();
-        time::sleep(time::Duration::from_secs(60)).await;
+        time::sleep(time::Duration::from_mins(1)).await;
         let after = nanos_since_unix_epoch();
 
         let elapsed_ns = after.saturating_sub(before);

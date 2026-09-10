@@ -15,9 +15,9 @@
 
 //! Pure builder functions that convert Nautilus execution commands into Kraken WS param structs.
 
-use chrono::{DateTime, Utc};
+use jiff::tz::Offset;
 use nautilus_common::messages::execution::{CancelOrder, ModifyOrder, SubmitOrder};
-use nautilus_core::nanos::UnixNanos;
+use nautilus_core::{nanos::UnixNanos, string::secret::SecretString};
 use nautilus_model::{
     enums::{OrderSide, OrderType, TimeInForce, TriggerType},
     orders::{Order, any::OrderAny},
@@ -46,7 +46,7 @@ use crate::{
 pub fn build_add_order_params(
     cmd: &SubmitOrder,
     order: &OrderAny,
-    token: String,
+    token: SecretString,
     leverage: Option<u16>,
 ) -> anyhow::Result<KrakenWsAddOrderParams> {
     let order_type = order.order_type();
@@ -56,7 +56,6 @@ pub fn build_add_order_params(
     let side = match order_side {
         OrderSide::Buy => KrakenOrderSide::Buy,
         OrderSide::Sell => KrakenOrderSide::Sell,
-        _ => anyhow::bail!("Invalid order side: {order_side:?}"),
     };
 
     if matches!(
@@ -105,7 +104,7 @@ pub fn build_add_order_params(
             | OrderType::LimitIfTouched
     );
 
-    let limit_price = order.price().map(|p| p.as_f64());
+    let limit_price = order.price().map(|p| p.as_decimal());
 
     let trigger = if is_conditional {
         let trigger_ref = match order.trigger_type() {
@@ -117,7 +116,7 @@ pub fn build_add_order_params(
         };
         order.trigger_price().map(|tp| KrakenWsTriggerParams {
             reference: trigger_ref,
-            price: tp.as_f64(),
+            price: tp.as_decimal(),
             price_type: None,
         })
     } else {
@@ -136,7 +135,7 @@ pub fn build_add_order_params(
     Ok(KrakenWsAddOrderParams {
         order_type: kraken_order_type,
         side,
-        order_qty: order.quantity().as_f64(),
+        order_qty: order.quantity().as_decimal(),
         symbol,
         token,
         limit_price,
@@ -155,22 +154,21 @@ pub fn build_add_order_params(
 /// WebSocket v2 `expire_time` field.
 ///
 /// `UnixNanos` is a `u64` whose maximum value (`~1.8e19` ns) corresponds to
-/// year 2554, well within both `i64::MAX` seconds and `chrono`'s representable
-/// range, so the conversion cannot fail for any in-range input.
+/// year 2554, within Jiff's representable range.
 pub(crate) fn format_expire_time(ts: UnixNanos) -> String {
-    let raw = ts.as_u64();
-    let secs = (raw / 1_000_000_000) as i64;
-    let nanos = (raw % 1_000_000_000) as u32;
-    DateTime::<Utc>::from_timestamp(secs, nanos)
-        .expect("Invariant: UnixNanos always fits a valid DateTime<Utc>")
-        .to_rfc3339()
+    ts.to_datetime_utc()
+        .display_with_offset(Offset::UTC)
+        .to_string()
 }
 
 /// Builds WebSocket `amend_order` parameters from a Nautilus modify command.
 ///
 /// Prefers `venue_order_id` (as `order_id`) over `client_order_id` (as `cl_ord_id`);
 /// `cmd.client_order_id` is always set so a fallback is always available.
-pub fn build_amend_order_params(cmd: &ModifyOrder, token: String) -> KrakenWsAmendOrderParams {
+pub fn build_amend_order_params(
+    cmd: &ModifyOrder,
+    token: SecretString,
+) -> KrakenWsAmendOrderParams {
     let order_id = cmd.venue_order_id.as_ref().map(|id| id.to_string());
     let cl_ord_id = if order_id.is_none() {
         Some(truncate_cl_ord_id(&cmd.client_order_id))
@@ -182,9 +180,9 @@ pub fn build_amend_order_params(cmd: &ModifyOrder, token: String) -> KrakenWsAme
         token,
         order_id,
         cl_ord_id,
-        order_qty: cmd.quantity.map(|q| q.as_f64()),
-        limit_price: cmd.price.map(|p| p.as_f64()),
-        trigger_price: cmd.trigger_price.map(|p| p.as_f64()),
+        order_qty: cmd.quantity.map(|q| q.as_decimal()),
+        limit_price: cmd.price.map(|p| p.as_decimal()),
+        trigger_price: cmd.trigger_price.map(|p| p.as_decimal()),
     }
 }
 
@@ -193,7 +191,10 @@ pub fn build_amend_order_params(cmd: &ModifyOrder, token: String) -> KrakenWsAme
 /// Prefers `venue_order_id` (as `order_id`) over `client_order_id` (as `cl_ord_id`),
 /// mirroring the REST cancel path which prefers the venue identifier since Kraken
 /// always knows it.
-pub fn build_cancel_order_params(cmd: &CancelOrder, token: String) -> KrakenWsCancelOrderParams {
+pub fn build_cancel_order_params(
+    cmd: &CancelOrder,
+    token: SecretString,
+) -> KrakenWsCancelOrderParams {
     if let Some(ref venue_id) = cmd.venue_order_id {
         KrakenWsCancelOrderParams {
             token,
@@ -241,6 +242,7 @@ mod tests {
         ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId,
     };
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
 
@@ -268,7 +270,7 @@ mod tests {
 
     #[rstest]
     fn test_format_expire_time_max_unix_nanos_handled() {
-        // u64::MAX nanos ≈ year 2554; chrono accepts it. Documents that the
+        // u64::MAX nanos is approximately year 2554 and is representable. Documents that the
         // function never panics for any in-range UnixNanos value.
         let ts = UnixNanos::from(u64::MAX);
         let formatted = format_expire_time(ts);
@@ -296,6 +298,7 @@ mod tests {
             cl_ord_id,
             OrderSide::Buy,
             Quantity::from("0.01"),
+            None,
             Price::from("50000.00"),
             TriggerType::LastPrice,
             Decimal::new(100, 0),
@@ -335,7 +338,7 @@ mod tests {
             causation_id: None,
         };
 
-        let err = build_add_order_params(&cmd, &order, "TKN".to_string(), None)
+        let err = build_add_order_params(&cmd, &order, SecretString::from("TKN"), None)
             .expect_err("TrailingStopMarket must bail to REST");
         let msg = format!("{err}");
         assert!(
@@ -400,7 +403,7 @@ mod tests {
             causation_id: None,
         };
 
-        let err = build_add_order_params(&cmd, &order, "TKN".to_string(), None)
+        let err = build_add_order_params(&cmd, &order, SecretString::from("TKN"), None)
             .expect_err("Iceberg orders must bail to REST");
         let msg = format!("{err}");
         assert!(
@@ -465,7 +468,7 @@ mod tests {
             causation_id: None,
         };
 
-        let err = build_add_order_params(&cmd, &order, "TKN".to_string(), None)
+        let err = build_add_order_params(&cmd, &order, SecretString::from("TKN"), None)
             .expect_err("MarkPrice trigger must bail to REST");
         let msg = format!("{err}");
         assert!(
@@ -488,7 +491,7 @@ mod tests {
     #[rstest]
     fn test_build_cancel_order_params_with_venue_id() {
         let cmd = make_cancel_order("O-20260505-001", Some("OABCDE-12345-FGHIJ"));
-        let params = build_cancel_order_params(&cmd, "TOKEN".to_string());
+        let params = build_cancel_order_params(&cmd, SecretString::from("TOKEN"));
 
         let ids = params.order_id.as_ref().unwrap();
         assert_eq!(ids, &["OABCDE-12345-FGHIJ"]);
@@ -498,7 +501,7 @@ mod tests {
     #[rstest]
     fn test_build_cancel_order_params_falls_back_to_client_id() {
         let cmd = make_cancel_order("O-20260505-001", None);
-        let params = build_cancel_order_params(&cmd, "TOKEN".to_string());
+        let params = build_cancel_order_params(&cmd, SecretString::from("TOKEN"));
 
         assert!(params.order_id.is_none());
         let cl_ord_ids = params.cl_ord_id.as_ref().unwrap();
@@ -508,7 +511,7 @@ mod tests {
     #[rstest]
     fn test_build_cancel_order_params_long_client_id_is_truncated() {
         let cmd = make_cancel_order("O202602270023210040011", None);
-        let params = build_cancel_order_params(&cmd, "TOKEN".to_string());
+        let params = build_cancel_order_params(&cmd, SecretString::from("TOKEN"));
 
         assert!(params.order_id.is_none());
         let cl_ord_ids = params.cl_ord_id.as_ref().unwrap();
@@ -532,8 +535,8 @@ mod tests {
             instrument_id: InstrumentId::from("XBT/USD.KRAKEN"),
             client_order_id: ClientOrderId::from("O-001"),
             venue_order_id: Some(VenueOrderId::new("OABCDE-12345-FGHIJ")),
-            quantity: Some(Quantity::new(0.1, 1)),
-            price: Some(Price::new(50000.0, 1)),
+            quantity: Some(Quantity::from("0.1")),
+            price: Some(Price::from("50000.0")),
             trigger_price: None,
             command_id: UUID4::new(),
             ts_init: UnixNanos::default(),
@@ -542,12 +545,12 @@ mod tests {
             causation_id: None,
         };
 
-        let params = build_amend_order_params(&cmd, "TOKEN".to_string());
+        let params = build_amend_order_params(&cmd, SecretString::from("TOKEN"));
 
         assert_eq!(params.order_id.as_deref(), Some("OABCDE-12345-FGHIJ"));
         assert!(params.cl_ord_id.is_none());
-        assert!((params.order_qty.unwrap() - 0.1).abs() < 1e-10);
-        assert!((params.limit_price.unwrap() - 50000.0).abs() < 1e-10);
+        assert_eq!(params.order_qty, Some(dec!(0.1)));
+        assert_eq!(params.limit_price, Some(dec!(50000)));
         assert!(params.trigger_price.is_none());
     }
 
@@ -562,7 +565,7 @@ mod tests {
             instrument_id: InstrumentId::from("XBT/USD.KRAKEN"),
             client_order_id: ClientOrderId::from("O-001"),
             venue_order_id: None,
-            quantity: Some(Quantity::new(0.2, 1)),
+            quantity: Some(Quantity::from("0.2")),
             price: None,
             trigger_price: None,
             command_id: UUID4::new(),
@@ -572,7 +575,7 @@ mod tests {
             causation_id: None,
         };
 
-        let params = build_amend_order_params(&cmd, "TOKEN".to_string());
+        let params = build_amend_order_params(&cmd, SecretString::from("TOKEN"));
 
         assert!(params.order_id.is_none());
         assert_eq!(params.cl_ord_id.as_deref(), Some("O-001"));

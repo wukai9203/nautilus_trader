@@ -23,6 +23,9 @@ use std::{
     },
 };
 
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::string::secret::SecretString;
 use nautilus_network::{
     RECONNECTED,
     websocket::{SubscriptionState, WebSocketClient},
@@ -34,8 +37,8 @@ use tokio_tungstenite::tungstenite::Message;
 use super::{
     enums::{KrakenWsChannel, KrakenWsMessageType},
     messages::{
-        KrakenSpotWsMessage, KrakenWsBookData, KrakenWsExecutionData, KrakenWsMessage,
-        KrakenWsOhlcData, KrakenWsResponse, KrakenWsTickerData, KrakenWsTradeData,
+        KrakenSpotWsMessage, KrakenWsBookData, KrakenWsExecutionData, KrakenWsOhlcData,
+        KrakenWsRawMessage, KrakenWsResponse, KrakenWsTickerData, KrakenWsTradeData,
     },
     parse::parse_order_response,
 };
@@ -49,10 +52,10 @@ use crate::{
 pub enum SpotHandlerCommand {
     SetClient(WebSocketClient),
     Disconnect,
-    Subscribe { payload: String },
-    Unsubscribe { payload: String },
-    Ping { payload: String },
-    SendOrderRequest { req_id: u64, payload: String },
+    Subscribe { payload: SecretString },
+    Unsubscribe { payload: SecretString },
+    Ping { payload: SecretString },
+    SendOrderRequest { req_id: u64, payload: SecretString },
 }
 
 /// WebSocket message handler for Kraken Spot v2.
@@ -115,21 +118,21 @@ impl SpotFeedHandler {
                         SpotHandlerCommand::Subscribe { payload }
                         | SpotHandlerCommand::Unsubscribe { payload } => {
                             if let Some(client) = &self.inner
-                                && let Err(e) = client.send_text(payload, Some(KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION.as_slice())).await
+                                && let Err(e) = client.send_text(payload.expose_secret().to_owned(), Some(KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION.as_slice())).await
                             {
                                 log::error!("Failed to send text: {e}");
                             }
                         }
                         SpotHandlerCommand::Ping { payload } => {
                             if let Some(client) = &self.inner
-                                && let Err(e) = client.send_text(payload, None).await
+                                && let Err(e) = client.send_text(payload.expose_secret().to_owned(), None).await
                             {
                                 log::error!("Failed to send text: {e}");
                             }
                         }
                         SpotHandlerCommand::SendOrderRequest { req_id, payload } => {
                             if let Some(client) = &self.inner {
-                                if let Err(e) = client.send_text(payload, Some(KRAKEN_RATE_LIMIT_KEY_ORDER.as_slice())).await {
+                                if let Err(e) = client.send_text(payload.expose_secret().to_owned(), Some(KRAKEN_RATE_LIMIT_KEY_ORDER.as_slice())).await {
                                     log::error!(
                                         "Kraken WS send_order_request failed req_id={req_id}: {e}"
                                     );
@@ -188,7 +191,7 @@ impl SpotFeedHandler {
                             continue;
                         }
                         Message::Close(_) => {
-                            log::info!("WebSocket connection closed");
+                            log::debug!("WebSocket connection closed");
                             return None;
                         }
                         Message::Frame(_) => {
@@ -199,7 +202,7 @@ impl SpotFeedHandler {
                     };
 
                     if text == RECONNECTED {
-                        log::info!("Received WebSocket reconnected signal");
+                        log::debug!("Received WebSocket reconnected signal");
                         return Some(KrakenSpotWsMessage::Reconnected);
                     }
 
@@ -250,7 +253,7 @@ impl SpotFeedHandler {
         }
 
         if value.get("channel").is_some() && value.get("data").is_some() {
-            match serde_json::from_value::<KrakenWsMessage>(value) {
+            match serde_json::from_str::<KrakenWsRawMessage>(text) {
                 Ok(msg) => return self.handle_data_message(msg),
                 Err(e) => {
                     log::debug!("Failed to parse data message: {e}");
@@ -309,7 +312,7 @@ impl SpotFeedHandler {
         }
     }
 
-    fn handle_data_message(&self, msg: KrakenWsMessage) -> Option<KrakenSpotWsMessage> {
+    fn handle_data_message(&self, msg: KrakenWsRawMessage) -> Option<KrakenSpotWsMessage> {
         match msg.channel {
             KrakenWsChannel::Book => self.handle_book_message(msg),
             KrakenWsChannel::Ticker => self.handle_ticker_message(msg),
@@ -326,12 +329,12 @@ impl SpotFeedHandler {
         }
     }
 
-    fn handle_book_message(&self, msg: KrakenWsMessage) -> Option<KrakenSpotWsMessage> {
+    fn handle_book_message(&self, msg: KrakenWsRawMessage) -> Option<KrakenSpotWsMessage> {
         let is_snapshot = msg.event_type == KrakenWsMessageType::Snapshot;
         let mut book_data = Vec::new();
 
         for data in msg.data {
-            match serde_json::from_value::<KrakenWsBookData>(data) {
+            match serde_json::from_str::<KrakenWsBookData>(data.get()) {
                 Ok(bd) => {
                     if !self.is_subscribed(&format!("book:{}", bd.symbol)) {
                         continue;
@@ -352,11 +355,11 @@ impl SpotFeedHandler {
         }
     }
 
-    fn handle_ticker_message(&self, msg: KrakenWsMessage) -> Option<KrakenSpotWsMessage> {
+    fn handle_ticker_message(&self, msg: KrakenWsRawMessage) -> Option<KrakenSpotWsMessage> {
         let mut tickers = Vec::new();
 
         for data in msg.data {
-            match serde_json::from_value::<KrakenWsTickerData>(data) {
+            match serde_json::from_str::<KrakenWsTickerData>(data.get()) {
                 Ok(td) => {
                     let symbol = &td.symbol;
                     let quotes_key = format!("quotes:{symbol}");
@@ -377,11 +380,11 @@ impl SpotFeedHandler {
         }
     }
 
-    fn handle_trade_message(&self, msg: KrakenWsMessage) -> Option<KrakenSpotWsMessage> {
+    fn handle_trade_message(&self, msg: KrakenWsRawMessage) -> Option<KrakenSpotWsMessage> {
         let mut trades = Vec::new();
 
         for data in msg.data {
-            match serde_json::from_value::<KrakenWsTradeData>(data) {
+            match serde_json::from_str::<KrakenWsTradeData>(data.get()) {
                 Ok(td) => trades.push(td),
                 Err(e) => log::error!("Failed to deserialize trade data: {e}"),
             }
@@ -394,11 +397,11 @@ impl SpotFeedHandler {
         }
     }
 
-    fn handle_ohlc_message(&self, msg: KrakenWsMessage) -> Option<KrakenSpotWsMessage> {
+    fn handle_ohlc_message(&self, msg: KrakenWsRawMessage) -> Option<KrakenSpotWsMessage> {
         let mut ohlc_data = Vec::new();
 
         for data in msg.data {
-            match serde_json::from_value::<KrakenWsOhlcData>(data) {
+            match serde_json::from_str::<KrakenWsOhlcData>(data.get()) {
                 Ok(od) => ohlc_data.push(od),
                 Err(e) => log::error!("Failed to deserialize OHLC data: {e}"),
             }
@@ -411,11 +414,11 @@ impl SpotFeedHandler {
         }
     }
 
-    fn handle_executions_message(&self, msg: KrakenWsMessage) -> Option<KrakenSpotWsMessage> {
+    fn handle_executions_message(&self, msg: KrakenWsRawMessage) -> Option<KrakenSpotWsMessage> {
         let mut executions = Vec::new();
 
         for data in msg.data {
-            match serde_json::from_value::<KrakenWsExecutionData>(data) {
+            match serde_json::from_str::<KrakenWsExecutionData>(data.get()) {
                 Ok(ed) => executions.push(ed),
                 Err(e) => log::error!("Failed to deserialize execution data: {e}"),
             }
@@ -482,6 +485,7 @@ impl SpotFeedHandler {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
 
@@ -606,6 +610,39 @@ mod tests {
     }
 
     #[rstest]
+    fn test_ticker_message_preserves_decimal_precision() {
+        let handler = create_test_handler();
+        handler.subscriptions.mark_subscribe("ticker:BTC/USD");
+        handler.subscriptions.confirm_subscribe("ticker:BTC/USD");
+        let json = include_str!("../../../test_data/ws_ticker_precision.json");
+
+        let message = handler.parse_message(json).unwrap();
+
+        let KrakenSpotWsMessage::Ticker(data) = message else {
+            panic!("Expected Ticker message, was {message:?}");
+        };
+        let ticker = &data[0];
+        assert_eq!(ticker.symbol, "BTC/USD");
+        assert_eq!(ticker.bid, dec!(123456789.123456789));
+        assert_eq!(ticker.bid_qty, dec!(0.1234567890123456789012345678));
+        assert_eq!(ticker.ask, dec!(123456789.223456789));
+        assert_eq!(ticker.ask_qty, dec!(0.2234567890123456789012345678));
+        assert_eq!(ticker.last, dec!(123456789.323456789));
+        assert_eq!(ticker.volume, dec!(123456789.423456789));
+        assert_eq!(ticker.vwap, dec!(123456789.523456789));
+        assert_eq!(ticker.low, dec!(123456789.623456789));
+        assert_eq!(ticker.high, dec!(123456789.723456789));
+        assert_eq!(ticker.change, dec!(123456789.823456789));
+        assert_eq!(ticker.change_pct, dec!(0.9234567890123456789012345678));
+        assert_eq!(
+            ticker.timestamp,
+            "2022-12-25T09:30:59.123456Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+        );
+    }
+
+    #[rstest]
     fn test_book_message_filtered_without_book_subscription() {
         let handler = create_test_handler();
 
@@ -665,16 +702,29 @@ mod tests {
     fn test_send_order_request_variant_construction() {
         let cmd = SpotHandlerCommand::SendOrderRequest {
             req_id: 7,
-            payload: r#"{"method":"add_order","req_id":7}"#.to_string(),
+            payload: SecretString::from(r#"{"method":"add_order","req_id":7}"#.to_string()),
         };
 
         match cmd {
             SpotHandlerCommand::SendOrderRequest { req_id, payload } => {
                 assert_eq!(req_id, 7);
-                assert!(payload.contains("add_order"));
+                assert!(payload.expose_secret().contains("add_order"));
             }
             _ => panic!("Expected SendOrderRequest, was a different variant"),
         }
+    }
+
+    #[rstest]
+    fn test_command_debug_redacts_payload() {
+        let cmd = SpotHandlerCommand::SendOrderRequest {
+            req_id: 7,
+            payload: SecretString::from("auth-token".to_string()),
+        };
+
+        let debug = format!("{cmd:?}");
+
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains("auth-token"));
     }
 
     #[rstest]
@@ -690,7 +740,7 @@ mod tests {
         cmd_tx
             .send(SpotHandlerCommand::SendOrderRequest {
                 req_id: 42,
-                payload: r#"{"method":"add_order","req_id":42}"#.to_string(),
+                payload: SecretString::from(r#"{"method":"add_order","req_id":42}"#.to_string()),
             })
             .unwrap();
 

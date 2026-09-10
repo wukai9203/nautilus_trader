@@ -29,6 +29,10 @@ use crate::{
 
 /// Converts a Python dict to `Params` (IndexMap<String, Value>).
 ///
+/// An empty dict canonicalizes to `None`, distinguishing "no params provided"
+/// from a populated map. This is not the inverse of [`params_to_pydict`], which
+/// accepts `&Params` (not `Option<&Params>`); callers handle the outer option.
+///
 /// # Errors
 ///
 /// Returns a `PyErr` if:
@@ -144,6 +148,30 @@ mod tests {
                     assert!((actual - expected).abs() < f64::EPSILON);
                 }
             }
+        });
+    }
+
+    #[rstest]
+    fn test_params_pydict_roundtrip() {
+        let mut params = Params::new();
+        params.insert("null".to_string(), Value::Null);
+        params.insert("enabled".to_string(), json!(true));
+        params.insert("name".to_string(), json!("nautilus"));
+        params.insert("signed".to_string(), json!(-7));
+        params.insert("unsigned".to_string(), json!(42_u64));
+        params.insert("ratio".to_string(), json!(2.5));
+        params.insert("levels".to_string(), json!([1, "two", false]));
+        params.insert("nested".to_string(), json!({"venue": "SIM", "count": 3}));
+
+        Python::initialize();
+        Python::attach(|py| {
+            let dict = params_to_pydict(py, &params).unwrap();
+            let restored = pydict_to_params(py, &dict).unwrap().unwrap();
+            let empty = PyDict::new(py).unbind();
+            let absent = pydict_to_params(py, &empty).unwrap();
+
+            assert_eq!(restored, params);
+            assert_eq!(absent, None);
         });
     }
 }

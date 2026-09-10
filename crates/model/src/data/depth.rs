@@ -35,11 +35,13 @@ pub const DEPTH10_LEN: usize = 10;
 ///
 /// Note: This type is not compatible with `OrderBookDelta` or `OrderBookDeltas` due to
 /// its specialized structure and limited depth use case.
-#[repr(C)]
+///
+/// Per-level [`BookOrder::order_id`] values are non-semantic for this aggregated MBP data.
+/// Parquet catalog decoding canonicalizes them to zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -112,66 +114,19 @@ impl OrderBookDepth10 {
     #[must_use]
     pub fn get_fields() -> IndexMap<String, String> {
         let mut metadata = IndexMap::new();
-        metadata.insert("bid_price_0".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_price_1".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_price_2".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_price_3".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_price_4".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_price_5".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_price_6".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_price_7".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_price_8".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_price_9".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_price_0".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_price_1".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_price_2".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_price_3".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_price_4".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_price_5".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_price_6".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_price_7".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_price_8".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_price_9".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_size_0".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_size_1".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_size_2".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_size_3".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_size_4".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_size_5".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_size_6".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_size_7".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_size_8".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_size_9".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_size_0".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_size_1".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_size_2".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_size_3".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_size_4".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_size_5".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_size_6".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_size_7".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_size_8".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("ask_size_9".to_string(), FIXED_SIZE_BINARY.to_string());
-        metadata.insert("bid_count_0".to_string(), "UInt32".to_string());
-        metadata.insert("bid_count_1".to_string(), "UInt32".to_string());
-        metadata.insert("bid_count_2".to_string(), "UInt32".to_string());
-        metadata.insert("bid_count_3".to_string(), "UInt32".to_string());
-        metadata.insert("bid_count_4".to_string(), "UInt32".to_string());
-        metadata.insert("bid_count_5".to_string(), "UInt32".to_string());
-        metadata.insert("bid_count_6".to_string(), "UInt32".to_string());
-        metadata.insert("bid_count_7".to_string(), "UInt32".to_string());
-        metadata.insert("bid_count_8".to_string(), "UInt32".to_string());
-        metadata.insert("bid_count_9".to_string(), "UInt32".to_string());
-        metadata.insert("ask_count_0".to_string(), "UInt32".to_string());
-        metadata.insert("ask_count_1".to_string(), "UInt32".to_string());
-        metadata.insert("ask_count_2".to_string(), "UInt32".to_string());
-        metadata.insert("ask_count_3".to_string(), "UInt32".to_string());
-        metadata.insert("ask_count_4".to_string(), "UInt32".to_string());
-        metadata.insert("ask_count_5".to_string(), "UInt32".to_string());
-        metadata.insert("ask_count_6".to_string(), "UInt32".to_string());
-        metadata.insert("ask_count_7".to_string(), "UInt32".to_string());
-        metadata.insert("ask_count_8".to_string(), "UInt32".to_string());
-        metadata.insert("ask_count_9".to_string(), "UInt32".to_string());
+
+        for name in ["bid_price", "ask_price", "bid_size", "ask_size"] {
+            for level in 0..DEPTH10_LEN {
+                metadata.insert(format!("{name}_{level}"), FIXED_SIZE_BINARY.to_string());
+            }
+        }
+
+        for name in ["bid_count", "ask_count"] {
+            for level in 0..DEPTH10_LEN {
+                metadata.insert(format!("{name}_{level}"), "UInt32".to_string());
+            }
+        }
+
         metadata.insert("flags".to_string(), "UInt8".to_string());
         metadata.insert("sequence".to_string(), "UInt64".to_string());
         metadata.insert("ts_event".to_string(), "UInt64".to_string());

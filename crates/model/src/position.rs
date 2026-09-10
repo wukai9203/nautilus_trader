@@ -23,18 +23,21 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use indexmap::IndexMap;
 use nautilus_core::{
-    UUID4, UnixNanos,
-    correctness::{FAILED, check_equal, check_predicate_true},
+    DurationNanos, UUID4, UnixNanos,
+    correctness::{
+        CorrectnessError, CorrectnessResult, CorrectnessResultExt, FAILED, check_equal,
+        check_predicate_true,
+    },
 };
 use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    enums::{InstrumentClass, OrderSide, OrderSideSpecified, PositionAdjustmentType, PositionSide},
-    events::{OrderFilled, PositionAdjusted},
+    enums::{InstrumentClass, OrderSide, PositionAdjustmentType, PositionSide},
+    events::{OrderFillVoided, OrderFilled, PositionAdjusted},
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, Symbol, TradeId, TraderId,
         Venue, VenueOrderId,
@@ -47,11 +50,13 @@ use crate::{
 ///
 /// The position ID may be assigned at the trading venue, or can be system
 /// generated depending on a strategies OMS (Order Management System) settings.
+/// Replay events and cumulative fill corrections preserve derived state across close and reopen
+/// cycles.
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -60,6 +65,10 @@ use crate::{
 pub struct Position {
     pub events: Vec<OrderFilled>,
     pub adjustments: Vec<PositionAdjusted>,
+    #[serde(default)]
+    pub replay_events: Vec<PositionReplayEvent>,
+    #[serde(default)]
+    pub fill_voids: Vec<PositionFillVoid>,
     pub trader_id: TraderId,
     pub strategy_id: StrategyId,
     pub instrument_id: InstrumentId,
@@ -85,7 +94,7 @@ pub struct Position {
     pub ts_opened: UnixNanos,
     pub ts_last: UnixNanos,
     pub ts_closed: Option<UnixNanos>,
-    pub duration_ns: u64,
+    pub duration_ns: DurationNanos,
     pub avg_px_open: f64,
     pub avg_px_close: Option<f64>,
     pub realized_return: f64,
@@ -97,31 +106,54 @@ pub struct Position {
     pub commissions: IndexMap<Currency, Money>,
 }
 
+#[expect(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PositionReplayEvent {
+    Filled(OrderFilled),
+    Adjusted(PositionAdjusted),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionFillVoid {
+    pub event: OrderFillVoided,
+    pub voided_qty: Quantity,
+    pub commission_voided: Option<Money>,
+}
+
 impl Position {
     /// Creates a new [`Position`] instance.
     ///
     /// # Panics
     ///
-    /// This function panics if:
-    /// - The `instrument.id()` does not match the `fill.instrument_id`.
-    /// - The `fill.order_side` is `NoOrderSide`.
-    /// - The `fill.position_id` is `None`.
+    /// Panics if [`Position::new_checked`] returns an error.
     #[must_use]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "constructor takes the opening fill by value as the position's seed event"
+    )]
     pub fn new(instrument: &InstrumentAny, fill: OrderFilled) -> Self {
-        check_equal(
-            &instrument.id(),
-            &fill.instrument_id,
-            "instrument.id()",
-            "fill.instrument_id",
-        )
-        .expect(FAILED);
-        assert_ne!(fill.order_side, OrderSide::NoOrderSide);
+        Self::new_checked(instrument, fill).expect_display(FAILED)
+    }
 
-        let position_id = fill.position_id.expect("No position ID to open `Position`");
+    /// Creates a new [`Position`] instance with correctness checking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the instrument ID does not match the fill or the fill has no position
+    /// ID.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "constructor takes the opening fill by value as the position's seed event"
+    )]
+    pub fn new_checked(instrument: &InstrumentAny, fill: OrderFilled) -> CorrectnessResult<Self> {
+        Self::check_fill_instrument(instrument.id(), "instrument.id()", &fill)?;
+        let position_id = Self::fill_position_id(&fill)?;
 
         let mut item = Self {
             events: Vec::<OrderFilled>::new(),
             adjustments: Vec::<PositionAdjusted>::new(),
+            replay_events: Vec::new(),
+            fill_voids: Vec::new(),
             trade_ids: AHashSet::<TradeId>::new(),
             buy_qty: Quantity::zero(instrument.size_precision()),
             sell_qty: Quantity::zero(instrument.size_precision()),
@@ -151,14 +183,64 @@ impl Position {
             ts_opened: fill.ts_event,
             ts_last: fill.ts_event,
             ts_closed: None,
-            duration_ns: 0,
+            duration_ns: DurationNanos::default(),
             avg_px_open: fill.last_px.as_f64(),
             avg_px_close: None,
             realized_return: 0.0,
             realized_pnl: None,
         };
-        item.apply(&fill);
-        item
+        item.apply_fill(&fill, true)?;
+        Ok(item)
+    }
+
+    /// Returns a copy without stored events, adjustments, replay events, fill voids, or trade IDs.
+    ///
+    /// # Warning
+    ///
+    /// Use this copy only as transient read state. Applying events or caching this copy can bypass
+    /// replay and duplicate-fill checks and discard position history.
+    #[must_use]
+    pub fn clone_without_events(&self) -> Self {
+        Self {
+            events: Vec::new(),
+            adjustments: Vec::new(),
+            replay_events: Vec::new(),
+            fill_voids: Vec::new(),
+            trader_id: self.trader_id,
+            strategy_id: self.strategy_id,
+            instrument_id: self.instrument_id,
+            id: self.id,
+            account_id: self.account_id,
+            opening_order_id: self.opening_order_id,
+            closing_order_id: self.closing_order_id,
+            entry: self.entry,
+            side: self.side,
+            signed_qty: self.signed_qty,
+            quantity: self.quantity,
+            peak_qty: self.peak_qty,
+            price_precision: self.price_precision,
+            size_precision: self.size_precision,
+            multiplier: self.multiplier,
+            is_inverse: self.is_inverse,
+            is_currency_pair: self.is_currency_pair,
+            instrument_class: self.instrument_class,
+            base_currency: self.base_currency,
+            quote_currency: self.quote_currency,
+            settlement_currency: self.settlement_currency,
+            ts_init: self.ts_init,
+            ts_opened: self.ts_opened,
+            ts_last: self.ts_last,
+            ts_closed: self.ts_closed,
+            duration_ns: self.duration_ns,
+            avg_px_open: self.avg_px_open,
+            avg_px_close: self.avg_px_close,
+            realized_return: self.realized_return,
+            realized_pnl: self.realized_pnl,
+            trade_ids: AHashSet::new(),
+            buy_qty: self.buy_qty,
+            sell_qty: self.sell_qty,
+            commissions: self.commissions.clone(),
+        }
     }
 
     /// Purges all order fill events for the given client order ID and recalculates derived state.
@@ -172,11 +254,17 @@ impl Position {
     ///
     /// Panics if after purging, no fills remain and the position cannot be reconstructed.
     pub fn purge_events_for_order(&mut self, client_order_id: ClientOrderId) {
+        self.replay_events.retain(|event| {
+            !matches!(event, PositionReplayEvent::Filled(fill) if fill.client_order_id == client_order_id)
+        });
+        self.fill_voids
+            .retain(|record| record.event.client_order_id != client_order_id);
+
         let filtered_events: Vec<OrderFilled> = self
             .events
             .iter()
             .filter(|e| e.client_order_id != client_order_id)
-            .copied()
+            .cloned()
             .collect();
 
         // Preserve non-commission adjustments (funding, manual adjustments, etc.)
@@ -214,29 +302,13 @@ impl Position {
             self.ts_opened = UnixNanos::default();
             self.ts_last = UnixNanos::default();
             self.ts_closed = Some(UnixNanos::default());
-            self.duration_ns = 0;
+            self.duration_ns = DurationNanos::default();
             return;
         }
 
         // Recalculate position from scratch
         let position_id = self.id;
-        let size_precision = self.size_precision;
-
-        // Reset mutable state
-        self.events = Vec::new();
-        self.trade_ids = AHashSet::new();
-        self.adjustments = Vec::new();
-        self.buy_qty = Quantity::zero(size_precision);
-        self.sell_qty = Quantity::zero(size_precision);
-        self.commissions.clear();
-        self.signed_qty = 0.0;
-        self.quantity = Quantity::zero(size_precision);
-        self.peak_qty = Quantity::zero(size_precision);
-        self.side = PositionSide::Flat;
-        self.avg_px_open = 0.0;
-        self.avg_px_close = None;
-        self.realized_pnl = None;
-        self.realized_return = 0.0;
+        self.reset_derived_state();
 
         // Use the first remaining event to set opening state
         let first_event = &filtered_events[0];
@@ -246,16 +318,16 @@ impl Position {
         self.ts_init = first_event.ts_init;
         self.closing_order_id = None;
         self.ts_closed = None;
-        self.duration_ns = 0;
+        self.duration_ns = DurationNanos::default();
 
         // Reapply all remaining fills to reconstruct state
         for event in filtered_events {
-            self.apply(&event);
+            self.apply_fill(&event, false).expect_display(FAILED);
         }
 
         // Reapply preserved adjustments to maintain full state
         for adjustment in preserved_adjustments {
-            self.apply_adjustment(adjustment);
+            self.apply_adjustment_state(adjustment, false);
         }
 
         log::info!(
@@ -272,13 +344,57 @@ impl Position {
     ///
     /// # Panics
     ///
-    /// Panics if the `fill.trade_id` is already present in the position’s `trade_ids`.
+    /// Panics if the `fill.trade_id` is already present in the position's `trade_ids`.
     pub fn apply(&mut self, fill: &OrderFilled) {
-        check_predicate_true(
-            !self.trade_ids.contains(&fill.trade_id),
-            "`fill.trade_id` already contained in `trade_ids",
+        self.apply_fill(fill, true).expect_display(FAILED);
+    }
+
+    /// Applies an `OrderFilled` event to this position with correctness checking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fill instrument or position identity does not match this position,
+    /// the fill has no position ID, or an ordinary duplicate trade ID is applied. An error leaves
+    /// the position unchanged.
+    pub fn try_apply(&mut self, fill: &OrderFilled) -> CorrectnessResult<()> {
+        Self::check_fill_instrument(self.instrument_id, "self.instrument_id", fill)?;
+        let position_id = Self::fill_position_id(fill)?;
+        check_equal(&self.id, &position_id, "self.id", "fill.position_id")?;
+        self.apply_fill(fill, true)
+    }
+
+    fn check_fill_instrument(
+        instrument_id: InstrumentId,
+        instrument_param: &str,
+        fill: &OrderFilled,
+    ) -> CorrectnessResult<()> {
+        check_equal(
+            &instrument_id,
+            &fill.instrument_id,
+            instrument_param,
+            "fill.instrument_id",
         )
-        .expect(FAILED);
+    }
+
+    fn fill_position_id(fill: &OrderFilled) -> CorrectnessResult<PositionId> {
+        fill.position_id
+            .ok_or_else(|| CorrectnessError::PredicateViolation {
+                message: "`fill.position_id` was None".to_string(),
+            })
+    }
+
+    fn apply_fill(&mut self, fill: &OrderFilled, record_replay: bool) -> CorrectnessResult<()> {
+        if record_replay
+            && (self.side == PositionSide::Flat || !self.trade_ids.contains(&fill.trade_id))
+            && self.is_duplicate_replay_fill(fill)
+        {
+            log::warn!(
+                "Ignoring historical duplicate fill {} for position {}; durable replay already contains this trade",
+                fill.trade_id,
+                self.id,
+            );
+            return Ok(());
+        }
 
         if fill.ts_event < self.ts_opened {
             log::warn!(
@@ -290,45 +406,35 @@ impl Position {
         }
 
         if self.side == PositionSide::Flat {
-            // Reopening position after close
-            self.events.clear();
-            self.trade_ids.clear();
-            self.adjustments.clear();
-            self.buy_qty = Quantity::zero(self.size_precision);
-            self.sell_qty = Quantity::zero(self.size_precision);
-            self.commissions.clear();
-            self.opening_order_id = fill.client_order_id;
-            self.closing_order_id = None;
-            self.peak_qty = Quantity::zero(self.size_precision);
-            self.ts_init = fill.ts_init;
-            self.ts_opened = fill.ts_event;
-            self.ts_closed = None;
-            self.duration_ns = 0;
-            self.avg_px_open = fill.last_px.as_f64();
-            self.avg_px_close = None;
-            self.realized_return = 0.0;
-            self.realized_pnl = None;
+            self.reset_cycle(fill);
         }
 
-        self.events.push(*fill);
+        if record_replay {
+            check_predicate_true(
+                !self.trade_ids.contains(&fill.trade_id),
+                "`fill.trade_id` already contained in `trade_ids`",
+            )?;
+            self.replay_events
+                .push(PositionReplayEvent::Filled(fill.clone()));
+        }
+
+        self.events.push(fill.clone());
         self.trade_ids.insert(fill.trade_id);
 
         // Calculate cumulative commissions
         if let Some(commission) = fill.commission {
-            let commission_currency = commission.currency;
-            if let Some(existing_commission) = self.commissions.get_mut(&commission_currency) {
-                *existing_commission = *existing_commission + commission;
-            } else {
-                self.commissions.insert(commission_currency, commission);
-            }
+            self.commissions
+                .entry(commission.currency)
+                .and_modify(|total| *total = *total + commission)
+                .or_insert(commission);
         }
 
         // Calculate avg prices, points, return, PnL
-        match fill.specified_side() {
-            OrderSideSpecified::Buy => {
+        match fill.order_side {
+            OrderSide::Buy => {
                 self.handle_buy_order_fill(fill);
             }
-            OrderSideSpecified::Sell => {
+            OrderSide::Sell => {
                 self.handle_sell_order_fill(fill);
             }
         }
@@ -339,24 +445,7 @@ impl Position {
             && let Some(base_currency) = self.base_currency
             && commission.currency == base_currency
         {
-            let mut adjustment_id = fill.event_id.as_bytes();
-            adjustment_id[15] ^= 0x01;
-
-            let adjustment = PositionAdjusted::new(
-                self.trader_id,
-                self.strategy_id,
-                self.instrument_id,
-                self.id,
-                self.account_id,
-                PositionAdjustmentType::Commission,
-                Some(-commission.as_decimal()),
-                None,
-                Some(fill.client_order_id.inner()),
-                UUID4::from_bytes(adjustment_id),
-                fill.ts_event,
-                fill.ts_init,
-            );
-            self.apply_adjustment(adjustment);
+            self.apply_base_commission_adjustment(fill, commission);
         }
 
         // size_precision is valid from instrument
@@ -370,11 +459,7 @@ impl Position {
             self.signed_qty = 0.0; // Normalize
             self.closing_order_id = Some(fill.client_order_id);
             self.ts_closed = Some(fill.ts_event);
-            self.duration_ns = if let Some(ts_closed) = self.ts_closed {
-                ts_closed.as_u64() - self.ts_opened.as_u64()
-            } else {
-                0
-            };
+            self.duration_ns = fill.ts_event.saturating_duration_since(self.ts_opened);
         } else if self.signed_qty > 0.0 {
             self.entry = OrderSide::Buy;
             self.side = PositionSide::Long;
@@ -385,23 +470,73 @@ impl Position {
 
         self.ts_last = fill.ts_event;
 
-        debug_assert!(
-            match self.side {
-                PositionSide::Long => self.signed_qty > 0.0,
-                PositionSide::Short => self.signed_qty < 0.0,
-                PositionSide::Flat => self.signed_qty == 0.0,
-                PositionSide::NoPositionSide => false,
-            },
-            "Invariant: position side must match signed_qty sign (side={:?}, signed_qty={})",
-            self.side,
-            self.signed_qty,
-        );
-        debug_assert!(
-            self.peak_qty >= self.quantity,
-            "Invariant: peak_qty must not be less than current quantity (peak={}, quantity={})",
-            self.peak_qty,
-            self.quantity,
-        );
+        self.debug_assert_invariants();
+
+        Ok(())
+    }
+
+    fn reset_cycle(&mut self, fill: &OrderFilled) {
+        self.events.clear();
+        self.trade_ids.clear();
+        self.adjustments.clear();
+        self.buy_qty = Quantity::zero(self.size_precision);
+        self.sell_qty = Quantity::zero(self.size_precision);
+        self.commissions.clear();
+        self.opening_order_id = fill.client_order_id;
+        self.closing_order_id = None;
+        self.peak_qty = Quantity::zero(self.size_precision);
+        self.ts_init = fill.ts_init;
+        self.ts_opened = fill.ts_event;
+        self.ts_closed = None;
+        self.duration_ns = DurationNanos::default();
+        self.avg_px_open = fill.last_px.as_f64();
+        self.avg_px_close = None;
+        self.realized_return = 0.0;
+        self.realized_pnl = None;
+    }
+
+    fn is_duplicate_replay_fill(&self, fill: &OrderFilled) -> bool {
+        let continues_latest_fill = fill.causation_id.is_some_and(|source_id| {
+            self.events.last().is_some_and(|latest| {
+                latest.trade_id == fill.trade_id && latest.event_id == source_id
+            })
+        });
+
+        if self.trade_ids.contains(&fill.trade_id) {
+            return !continues_latest_fill
+                || self.replay_events.iter().any(|event| {
+                    matches!(
+                        event,
+                        PositionReplayEvent::Filled(replayed)
+                            if replayed.trade_id == fill.trade_id
+                                && replayed.causation_id == fill.causation_id
+                    )
+                });
+        }
+
+        let replay_starts_current_cycle = self.replay_events.is_empty()
+            || matches!(
+                (self.replay_events.first(), self.events.first()),
+                (
+                    Some(PositionReplayEvent::Filled(replayed)),
+                    Some(current),
+                ) if replayed.event_id == current.event_id
+            );
+        let corrected_trade = self
+            .fill_voids
+            .iter()
+            .any(|record| record.event.trade_id == fill.trade_id);
+        let current_cycle_only = replay_starts_current_cycle && !corrected_trade;
+        if current_cycle_only {
+            return false;
+        }
+
+        self.replay_events.iter().any(|event| {
+            matches!(
+                event,
+                PositionReplayEvent::Filled(replayed) if replayed.trade_id == fill.trade_id
+            )
+        })
     }
 
     fn handle_buy_order_fill(&mut self, fill: &OrderFilled) {
@@ -451,7 +586,7 @@ impl Position {
         self.buy_qty = self.buy_qty + last_qty_object;
 
         // Position reversed from short to long
-        if was_short && self.signed_qty > 0.0 {
+        if was_short && last_qty_object > self.quantity {
             self.avg_px_open = last_px;
         }
     }
@@ -503,7 +638,7 @@ impl Position {
         self.sell_qty = self.sell_qty + last_qty_object;
 
         // Position reversed from long to short
-        if was_long && self.signed_qty < 0.0 {
+        if was_long && last_qty_object > self.quantity {
             self.avg_px_open = last_px;
         }
     }
@@ -521,6 +656,15 @@ impl Position {
     ///
     /// Panics if the adjustment's `quantity_change` cannot be converted to f64.
     pub fn apply_adjustment(&mut self, adjustment: PositionAdjusted) {
+        self.apply_adjustment_state(adjustment, true);
+    }
+
+    fn apply_adjustment_state(&mut self, adjustment: PositionAdjusted, record_replay: bool) {
+        if record_replay {
+            self.replay_events
+                .push(PositionReplayEvent::Adjusted(adjustment));
+        }
+
         // Apply quantity change if present
         if let Some(quantity_change) = adjustment.quantity_change {
             self.signed_qty += quantity_change
@@ -549,27 +693,22 @@ impl Position {
             self.signed_qty = 0.0; // Normalize
         } else if self.signed_qty > 0.0 {
             self.side = PositionSide::Long;
-
-            if self.entry == OrderSide::NoOrderSide {
-                self.entry = OrderSide::Buy;
-            }
         } else {
             self.side = PositionSide::Short;
-
-            if self.entry == OrderSide::NoOrderSide {
-                self.entry = OrderSide::Sell;
-            }
         }
 
         self.adjustments.push(adjustment);
         self.ts_last = adjustment.ts_event;
 
+        self.debug_assert_invariants();
+    }
+
+    fn debug_assert_invariants(&self) {
         debug_assert!(
             match self.side {
                 PositionSide::Long => self.signed_qty > 0.0,
                 PositionSide::Short => self.signed_qty < 0.0,
                 PositionSide::Flat => self.signed_qty == 0.0,
-                PositionSide::NoPositionSide => false,
             },
             "Invariant: position side must match signed_qty sign (side={:?}, signed_qty={})",
             self.side,
@@ -581,6 +720,298 @@ impl Position {
             self.peak_qty,
             self.quantity,
         );
+    }
+
+    /// Applies a cumulative fill correction allocated to this position and rebuilds derived state.
+    ///
+    /// Returns the realized PnL of the cycles the rebuild closed before the current one, which
+    /// [`Self::realized_pnl`] no longer holds because reopening from flat resets it. A caller
+    /// archiving closed cycles needs this to keep their PnL once the correction has moved the
+    /// cycle boundaries its existing archive describes. `None` when the corrected history never
+    /// goes flat, so the current cycle covers all of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the allocation is stale, duplicated, or exceeds known fragments.
+    pub fn apply_fill_void(
+        &mut self,
+        event: OrderFillVoided,
+        voided_qty: Quantity,
+        commission_voided: Option<Money>,
+    ) -> anyhow::Result<Option<Money>> {
+        let fragment_qty = self
+            .fill_fragments(event.client_order_id, event.trade_id)
+            .iter()
+            .fold(Quantity::zero(self.size_precision), |total, fill| {
+                total + fill.last_qty
+            });
+        anyhow::ensure!(
+            !voided_qty.is_zero() && voided_qty <= fragment_qty,
+            "position fill void exceeds known fragments for {}",
+            event.trade_id,
+        );
+
+        if let Some(previous) = self.fill_voids.iter().rev().find(|record| {
+            record.event.client_order_id == event.client_order_id
+                && record.event.trade_id == event.trade_id
+        }) {
+            anyhow::ensure!(
+                voided_qty >= previous.voided_qty,
+                "stale position fill void for {}",
+                event.trade_id,
+            );
+            anyhow::ensure!(
+                voided_qty != previous.voided_qty
+                    || commission_voided != previous.commission_voided,
+                "duplicate position fill void for {}",
+                event.trade_id,
+            );
+        }
+
+        self.fill_voids.push(PositionFillVoid {
+            event,
+            voided_qty,
+            commission_voided,
+        });
+
+        Ok(self.rebuild_from_replay())
+    }
+
+    /// Returns durable fill fragments matching an order trade in local application order.
+    #[must_use]
+    pub fn fill_fragments(
+        &self,
+        client_order_id: ClientOrderId,
+        trade_id: TradeId,
+    ) -> Vec<&OrderFilled> {
+        self.replay_events
+            .iter()
+            .filter_map(|event| match event {
+                PositionReplayEvent::Filled(fill)
+                    if fill.client_order_id == client_order_id && fill.trade_id == trade_id =>
+                {
+                    Some(fill)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    // The banked total assumes `replay_events` spans every cycle this position archived, since
+    // settling replaces all of its frames with one worth that total. Bounding the log has to
+    // preserve it at trim time; `Cache::settle_position_snapshots` documents the two ways.
+    fn rebuild_from_replay(&mut self) -> Option<Money> {
+        let replay_events = self.replay_events.clone();
+        let mut quantity_removed = AHashMap::<usize, Quantity>::new();
+        let mut commission_removed = AHashMap::<usize, Money>::new();
+
+        for correction in self.latest_fill_voids() {
+            let mut remaining_qty = correction.voided_qty;
+            let mut remaining_commission = correction.commission_voided;
+
+            for (index, replay_event) in replay_events.iter().enumerate().rev() {
+                let PositionReplayEvent::Filled(fill) = replay_event else {
+                    continue;
+                };
+
+                if fill.client_order_id != correction.event.client_order_id
+                    || fill.trade_id != correction.event.trade_id
+                {
+                    continue;
+                }
+
+                if !remaining_qty.is_zero() {
+                    let removed = remaining_qty.min(fill.last_qty);
+                    quantity_removed.insert(index, removed);
+                    remaining_qty = remaining_qty - removed;
+                }
+
+                if let (Some(remaining), Some(commission)) = (remaining_commission, fill.commission)
+                {
+                    let removed_raw = remaining.raw.abs().min(commission.raw.abs());
+                    let removed =
+                        Money::from_raw(removed_raw * remaining.raw.signum(), remaining.currency);
+                    commission_removed.insert(index, removed);
+                    let next = remaining - removed;
+                    remaining_commission = (!next.is_zero()).then_some(next);
+                }
+            }
+        }
+
+        self.reset_derived_state();
+
+        let mut closed_cycles_pnl: Option<Money> = None;
+
+        for (index, replay_event) in replay_events.iter().enumerate() {
+            match replay_event {
+                PositionReplayEvent::Filled(fill) => {
+                    let removed = quantity_removed
+                        .get(&index)
+                        .copied()
+                        .unwrap_or_else(|| Quantity::zero(fill.last_qty.precision));
+                    let effective_qty = fill.last_qty - removed;
+                    let effective_commission =
+                        match (fill.commission, commission_removed.get(&index).copied()) {
+                            (Some(commission), Some(removed)) => Some(commission - removed),
+                            (commission, None) => commission,
+                            (None, Some(_)) => None,
+                        };
+
+                    if effective_qty.is_zero() {
+                        if let Some(commission) =
+                            effective_commission.filter(|commission| !commission.is_zero())
+                            && let Some(realized_pnl) =
+                                self.apply_surviving_fill_commission(fill, commission)
+                        {
+                            closed_cycles_pnl = Some(
+                                closed_cycles_pnl
+                                    .map_or(realized_pnl, |total| total + realized_pnl),
+                            );
+                        }
+                        continue;
+                    }
+
+                    // `apply_fill` clears realized PnL when it reopens from flat, so bank the
+                    // closing cycle's total before it goes
+                    if self.side == PositionSide::Flat
+                        && let Some(realized_pnl) = self.realized_pnl
+                    {
+                        closed_cycles_pnl = Some(
+                            closed_cycles_pnl.map_or(realized_pnl, |total| total + realized_pnl),
+                        );
+                    }
+
+                    let mut effective = fill.clone();
+                    effective.last_qty = effective_qty;
+                    effective.commission = effective_commission;
+                    self.apply_fill(&effective, false).expect_display(FAILED);
+                }
+                PositionReplayEvent::Adjusted(adjustment) => {
+                    self.apply_adjustment_state(*adjustment, false);
+                }
+            }
+        }
+
+        closed_cycles_pnl
+    }
+
+    fn apply_surviving_fill_commission(
+        &mut self,
+        fill: &OrderFilled,
+        commission: Money,
+    ) -> Option<Money> {
+        let is_base_commission =
+            self.is_currency_pair && self.base_currency == Some(commission.currency);
+        let reopens = self.side == PositionSide::Flat
+            && is_base_commission
+            && !Quantity::new(commission.as_f64().abs(), self.size_precision).is_zero();
+        let closed_cycles_pnl_previous = reopens.then_some(self.realized_pnl).flatten();
+
+        if reopens {
+            self.reset_cycle(fill);
+        }
+
+        self.commissions
+            .entry(commission.currency)
+            .and_modify(|total| *total = *total + commission)
+            .or_insert(commission);
+
+        if commission.currency == self.settlement_currency {
+            let pnl_change = Money::zero(self.settlement_currency) - commission;
+            self.realized_pnl = Some(match self.realized_pnl {
+                Some(current) => current + pnl_change,
+                None => pnl_change,
+            });
+        }
+
+        if is_base_commission {
+            let previous_side = self.side;
+            self.apply_base_commission_adjustment(fill, commission);
+            self.finalize_surviving_base_commission(fill, previous_side);
+        } else {
+            self.ts_last = fill.ts_event;
+        }
+
+        closed_cycles_pnl_previous
+    }
+
+    fn finalize_surviving_base_commission(
+        &mut self,
+        fill: &OrderFilled,
+        previous_side: PositionSide,
+    ) {
+        if self.side == PositionSide::Flat {
+            if previous_side != PositionSide::Flat {
+                self.closing_order_id = Some(fill.client_order_id);
+                self.ts_closed = Some(fill.ts_event);
+                self.duration_ns = fill.ts_event.saturating_duration_since(self.ts_opened);
+            }
+        } else {
+            self.entry = match self.side {
+                PositionSide::Long => OrderSide::Buy,
+                PositionSide::Short => OrderSide::Sell,
+                PositionSide::Flat => unreachable!(),
+            };
+
+            if previous_side != PositionSide::Flat && previous_side != self.side {
+                self.avg_px_open = fill.last_px.as_f64();
+            }
+        }
+    }
+
+    fn apply_base_commission_adjustment(&mut self, fill: &OrderFilled, commission: Money) {
+        let mut adjustment_id = fill.event_id.as_bytes();
+        adjustment_id[15] ^= 0x01;
+        self.apply_adjustment_state(
+            PositionAdjusted::new(
+                self.trader_id,
+                self.strategy_id,
+                self.instrument_id,
+                self.id,
+                self.account_id,
+                PositionAdjustmentType::Commission,
+                Some(-commission.as_decimal()),
+                None,
+                Some(fill.client_order_id.inner()),
+                UUID4::from_bytes(adjustment_id),
+                fill.ts_event,
+                fill.ts_init,
+            ),
+            false,
+        );
+    }
+
+    fn latest_fill_voids(&self) -> Vec<&PositionFillVoid> {
+        let mut latest = IndexMap::<(ClientOrderId, TradeId), &PositionFillVoid>::new();
+        for correction in &self.fill_voids {
+            latest.insert(
+                (correction.event.client_order_id, correction.event.trade_id),
+                correction,
+            );
+        }
+        latest.into_values().collect()
+    }
+
+    fn reset_derived_state(&mut self) {
+        self.events.clear();
+        self.adjustments.clear();
+        self.trade_ids.clear();
+        self.buy_qty = Quantity::zero(self.size_precision);
+        self.sell_qty = Quantity::zero(self.size_precision);
+        self.commissions.clear();
+        self.signed_qty = 0.0;
+        self.quantity = Quantity::zero(self.size_precision);
+        self.peak_qty = Quantity::zero(self.size_precision);
+        self.side = PositionSide::Flat;
+        self.closing_order_id = None;
+        self.ts_opened = UnixNanos::default();
+        self.ts_last = UnixNanos::default();
+        self.ts_closed = Some(UnixNanos::default());
+        self.duration_ns = DurationNanos::default();
+        self.avg_px_open = 0.0;
+        self.avg_px_close = None;
+        self.realized_pnl = None;
+        self.realized_return = 0.0;
     }
 
     /// Calculates the average price using f64 arithmetic.
@@ -693,7 +1124,7 @@ impl Position {
         match self.side {
             PositionSide::Long => avg_px_close - avg_px_open,
             PositionSide::Short => avg_px_open - avg_px_close,
-            _ => 0.0, // FLAT
+            PositionSide::Flat => 0.0,
         }
     }
 
@@ -701,16 +1132,15 @@ impl Position {
         // Epsilon at the limit of IEEE f64 precision before rounding errors (f64::EPSILON ≈ 2.22e-16)
         const EPSILON: f64 = 1e-15;
 
-        // Invalid state: zero or near-zero prices should never occur in valid market data
-        if avg_px_open.abs() < EPSILON {
+        if avg_px_open <= 0.0 || avg_px_open.abs() < EPSILON {
             anyhow::bail!(
-                "Cannot calculate inverse points: open price is zero or too small ({avg_px_open})"
+                "Cannot calculate inverse points: open price is not positive or is too small ({avg_px_open})"
             );
         }
 
-        if avg_px_close.abs() < EPSILON {
+        if avg_px_close <= 0.0 || avg_px_close.abs() < EPSILON {
             anyhow::bail!(
-                "Cannot calculate inverse points: close price is zero or too small ({avg_px_close})"
+                "Cannot calculate inverse points: close price is not positive or is too small ({avg_px_close})"
             );
         }
 
@@ -719,7 +1149,7 @@ impl Position {
         let result = match self.side {
             PositionSide::Long => inverse_open - inverse_close,
             PositionSide::Short => inverse_close - inverse_open,
-            _ => 0.0, // FLAT - this is a valid case
+            PositionSide::Flat => 0.0,
         };
         Ok(result)
     }
@@ -742,6 +1172,11 @@ impl Position {
     ) -> anyhow::Result<f64> {
         let quantity = quantity.min(self.signed_qty.abs());
         let result = if self.is_inverse {
+            anyhow::ensure!(
+                self.base_currency.is_some(),
+                "inverse position {} has no base currency",
+                self.instrument_id
+            );
             let points = self.calculate_points_inverse(avg_px_open, avg_px_close)?;
             quantity * self.multiplier.as_f64() * points
         } else {
@@ -751,53 +1186,95 @@ impl Position {
     }
 
     /// Calculates profit and loss from the given prices and quantity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if inverse P&L cannot be calculated or the result cannot be represented as
+    /// [`Money`].
+    pub fn try_calculate_pnl(
+        &self,
+        avg_px_open: f64,
+        avg_px_close: f64,
+        quantity: Quantity,
+    ) -> anyhow::Result<Money> {
+        let pnl_raw = self.calculate_pnl_raw(avg_px_open, avg_px_close, quantity.as_f64())?;
+        Money::new_checked(pnl_raw, self.settlement_currency).map_err(Into::into)
+    }
+
+    /// Calculates profit and loss from the given prices and quantity.
     #[must_use]
     pub fn calculate_pnl(&self, avg_px_open: f64, avg_px_close: f64, quantity: Quantity) -> Money {
-        let pnl_raw = self
-            .calculate_pnl_raw(avg_px_open, avg_px_close, quantity.as_f64())
+        self.try_calculate_pnl(avg_px_open, avg_px_close, quantity)
             .unwrap_or_else(|e| {
                 log::error!("Error calculating PnL: {e}");
-                0.0
-            });
-        Money::new(pnl_raw, self.settlement_currency)
+                Money::zero(self.settlement_currency)
+            })
+    }
+
+    /// Returns total P&L (realized + unrealized) based on the last price.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if unrealized P&L cannot be calculated, the realized and unrealized
+    /// currencies differ, or the total cannot be represented as [`Money`].
+    pub fn try_total_pnl(&self, last: Price) -> anyhow::Result<Money> {
+        let unrealized = self.try_unrealized_pnl(last)?;
+
+        match self.realized_pnl {
+            Some(realized) => {
+                anyhow::ensure!(
+                    realized.currency == unrealized.currency,
+                    "realized and unrealized PnL currencies differ"
+                );
+                realized
+                    .checked_add(unrealized)
+                    .ok_or_else(|| anyhow::anyhow!("total PnL overflow"))
+            }
+            None => Ok(unrealized),
+        }
     }
 
     /// Returns total P&L (realized + unrealized) based on the last price.
     #[must_use]
     pub fn total_pnl(&self, last: Price) -> Money {
-        let unrealized = self.unrealized_pnl(last);
-        match self.realized_pnl {
-            Some(realized) => realized + unrealized,
-            None => unrealized,
+        self.try_total_pnl(last).unwrap_or_else(|e| {
+            log::error!("Error calculating total PnL: {e}");
+            Money::zero(self.settlement_currency)
+        })
+    }
+
+    /// Returns unrealized P&L based on the last price.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if inverse P&L cannot be calculated or the result cannot be represented as
+    /// [`Money`].
+    pub fn try_unrealized_pnl(&self, last: Price) -> anyhow::Result<Money> {
+        if self.side == PositionSide::Flat {
+            Ok(Money::zero(self.settlement_currency))
+        } else {
+            let pnl =
+                self.calculate_pnl_raw(self.avg_px_open, last.as_f64(), self.quantity.as_f64())?;
+            Money::new_checked(pnl, self.settlement_currency).map_err(Into::into)
         }
     }
 
     /// Returns unrealized P&L based on the last price.
     #[must_use]
     pub fn unrealized_pnl(&self, last: Price) -> Money {
-        if self.side == PositionSide::Flat {
+        self.try_unrealized_pnl(last).unwrap_or_else(|e| {
+            log::error!("Error calculating unrealized PnL: {e}");
             Money::zero(self.settlement_currency)
-        } else {
-            let avg_px_open = self.avg_px_open;
-            let avg_px_close = last.as_f64();
-            let quantity = self.quantity.as_f64();
-            let pnl = self
-                .calculate_pnl_raw(avg_px_open, avg_px_close, quantity)
-                .unwrap_or_else(|e| {
-                    log::error!("Error calculating unrealized PnL: {e}");
-                    0.0
-                });
-            Money::new(pnl, self.settlement_currency)
-        }
+        })
     }
 
     /// Returns the order side required to close this position.
     #[must_use]
-    pub fn closing_order_side(&self) -> OrderSide {
+    pub fn closing_order_side(&self) -> Option<OrderSide> {
         match self.side {
-            PositionSide::Long => OrderSide::Sell,
-            PositionSide::Short => OrderSide::Buy,
-            _ => OrderSide::NoOrderSide,
+            PositionSide::Long => Some(OrderSide::Sell),
+            PositionSide::Short => Some(OrderSide::Buy),
+            PositionSide::Flat => None,
         }
     }
 
@@ -871,34 +1348,47 @@ impl Position {
 
     /// Calculates the notional value based on the last price.
     ///
+    /// # Errors
+    ///
+    /// Returns an error if this is an inverse position without a base currency, the price is not
+    /// positive for inverse valuation, or the result cannot be represented as [`Money`].
+    pub fn try_notional_value(&self, last: Price) -> anyhow::Result<Money> {
+        let currency = if self.is_inverse {
+            self.base_currency.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "inverse position {} has no base currency",
+                    self.instrument_id
+                )
+            })?
+        } else {
+            self.settlement_currency
+        };
+
+        crate::instruments::try_notional_value(
+            self.quantity,
+            last,
+            self.multiplier,
+            self.is_inverse,
+            false,
+            currency,
+        )
+    }
+
+    /// Calculates the notional value based on the last price.
+    ///
     /// # Panics
     ///
-    /// Panics if `self.base_currency` is `None`, or if `last` is not a positive price for
-    /// inverse instruments.
+    /// Panics if [`Position::try_notional_value`] returns an error.
     #[must_use]
     pub fn notional_value(&self, last: Price) -> Money {
-        if self.is_inverse {
-            check_predicate_true(
-                last.is_positive(),
-                "last price must be positive for inverse instrument",
-            )
-            .expect(FAILED);
-            Money::new(
-                self.quantity.as_f64() * self.multiplier.as_f64() * (1.0 / last.as_f64()),
-                self.base_currency.unwrap(),
-            )
-        } else {
-            Money::new(
-                self.quantity.as_f64() * last.as_f64() * self.multiplier.as_f64(),
-                self.quote_currency,
-            )
-        }
+        self.try_notional_value(last)
+            .expect("invalid notional value")
     }
 
     /// Returns the last `OrderFilled` event for the position (if any after purging).
     #[must_use]
     pub fn last_event(&self) -> Option<OrderFilled> {
-        self.events.last().copied()
+        self.events.last().cloned()
     }
 
     /// Returns the last `TradeId` for the position (if any after purging).
@@ -996,10 +1486,7 @@ pub fn fold_net_position(legs: &[(Decimal, Decimal, u64)]) -> (Decimal, Decimal)
     let mut net_signed_qty = Decimal::ZERO;
     let mut net_avg_px = Decimal::ZERO;
 
-    for (p_qty, p_px, _) in sorted {
-        let p_qty = *p_qty;
-        let p_px = *p_px;
-
+    for &(p_qty, p_px, _) in sorted {
         if net_signed_qty.is_zero() {
             net_signed_qty = p_qty;
             net_avg_px = p_px;
@@ -1034,7 +1521,7 @@ mod tests {
     use std::str::FromStr;
 
     use ahash::AHashSet;
-    use nautilus_core::UnixNanos;
+    use nautilus_core::{DurationNanos, UnixNanos, correctness::CorrectnessError};
     use proptest::prelude::*;
     use rstest::rstest;
     use rust_decimal::{Decimal, prelude::ToPrimitive};
@@ -1042,13 +1529,19 @@ mod tests {
 
     use crate::{
         enums::{OrderSide, OrderType, PositionAdjustmentType, PositionSide},
-        events::{OrderEventAny, OrderFilled, PositionAdjusted, order::spec::OrderFilledSpec},
-        identifiers::{
-            AccountId, ClientOrderId, PositionId, StrategyId, TradeId, VenueOrderId, stubs::uuid4,
+        events::{
+            OrderEventAny, OrderFillVoided, OrderFilled, PositionAdjusted,
+            order::spec::{OrderFillVoidedSpec, OrderFilledSpec},
         },
-        instruments::{CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny, stubs::*},
+        identifiers::{
+            AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId, VenueOrderId,
+            stubs::uuid4,
+        },
+        instruments::{
+            CryptoFuture, CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny, stubs::*,
+        },
         orders::{Order, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
-        position::{Position, fold_net_position},
+        position::{Position, PositionFillVoid, fold_net_position},
         stubs::*,
         types::{Currency, Money, Price, Quantity},
     };
@@ -1066,7 +1559,190 @@ mod tests {
     }
 
     #[rstest]
-    #[should_panic(expected = "`fill.trade_id` already contained in `trade_ids")]
+    #[case::open(false)]
+    #[case::closed(true)]
+    fn test_clone_without_events_preserves_current_state(
+        mut stub_position_long: Position,
+        #[case] close: bool,
+    ) {
+        let adjustment = PositionAdjusted::new(
+            stub_position_long.trader_id,
+            stub_position_long.strategy_id,
+            stub_position_long.instrument_id,
+            stub_position_long.id,
+            stub_position_long.account_id,
+            PositionAdjustmentType::Funding,
+            None,
+            Some(Money::from_decimal(dec!(1.25), stub_position_long.settlement_currency).unwrap()),
+            Some("clone-test".into()),
+            uuid4(),
+            UnixNanos::from(2),
+            UnixNanos::from(2),
+        );
+        stub_position_long.apply_adjustment(adjustment);
+
+        if close {
+            let closing_fill = OrderFilledSpec::builder()
+                .trader_id(stub_position_long.trader_id)
+                .strategy_id(stub_position_long.strategy_id)
+                .instrument_id(stub_position_long.instrument_id)
+                .client_order_id(ClientOrderId::from("CLONE-CLOSE"))
+                .venue_order_id(VenueOrderId::from("CLONE-CLOSE"))
+                .account_id(stub_position_long.account_id)
+                .trade_id(TradeId::from("CLONE-CLOSE"))
+                .order_side(OrderSide::Sell)
+                .order_type(OrderType::Market)
+                .last_qty(stub_position_long.quantity)
+                .last_px(Price::from("1.0012"))
+                .currency(stub_position_long.settlement_currency)
+                .position_id(stub_position_long.id)
+                .ts_event(UnixNanos::from(3))
+                .ts_init(UnixNanos::from(3))
+                .build();
+            stub_position_long.apply(&closing_fill);
+        }
+
+        let source_fill = stub_position_long.events[0].clone();
+        let fill_voided = matching_fill_void(&source_fill, source_fill.last_qty, None);
+        stub_position_long.fill_voids.push(PositionFillVoid {
+            event: fill_voided,
+            voided_qty: source_fill.last_qty,
+            commission_voided: source_fill.commission,
+        });
+
+        let cloned = stub_position_long.clone_without_events();
+        let mut expected = stub_position_long.clone();
+        expected.events.clear();
+        expected.adjustments.clear();
+        expected.replay_events.clear();
+        expected.fill_voids.clear();
+        expected.trade_ids.clear();
+
+        assert!(!stub_position_long.events.is_empty());
+        assert!(!stub_position_long.adjustments.is_empty());
+        assert!(!stub_position_long.replay_events.is_empty());
+        assert!(!stub_position_long.fill_voids.is_empty());
+        assert!(!stub_position_long.trade_ids.is_empty());
+        assert!(cloned.events.is_empty());
+        assert!(cloned.adjustments.is_empty());
+        assert!(cloned.replay_events.is_empty());
+        assert!(cloned.fill_voids.is_empty());
+        assert!(cloned.trade_ids.is_empty());
+        assert_eq!(
+            serde_json::to_value(cloned).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    #[rstest]
+    fn test_new_checked_rejects_missing_position_id(audusd_sim: CurrencyPair) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .build();
+
+        let error = Position::new_checked(&instrument, fill).unwrap_err();
+
+        assert_eq!(
+            error,
+            CorrectnessError::PredicateViolation {
+                message: "`fill.position_id` was None".to_string(),
+            }
+        );
+    }
+
+    #[rstest]
+    fn test_new_checked_rejects_instrument_mismatch(audusd_sim: CurrencyPair) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(InstrumentId::from("GBP/USD.SIM"))
+            .position_id(PositionId::from("P-1"))
+            .build();
+
+        let error = Position::new_checked(&instrument, fill).unwrap_err();
+
+        assert_eq!(
+            error,
+            CorrectnessError::EqualityMismatch {
+                lhs_param: "instrument.id()".to_string(),
+                rhs_param: "fill.instrument_id".to_string(),
+                lhs: "AUD/USD.SIM".to_string(),
+                rhs: "GBP/USD.SIM".to_string(),
+                type_name: "value",
+            }
+        );
+    }
+
+    #[rstest]
+    #[case::instrument_mismatch(
+        "GBP/USD.SIM",
+        Some("P-1"),
+        "'self.instrument_id' value of AUD/USD.SIM was not equal to 'fill.instrument_id' value of GBP/USD.SIM"
+    )]
+    #[case::missing_position_id("AUD/USD.SIM", None, "`fill.position_id` was None")]
+    #[case::position_mismatch(
+        "AUD/USD.SIM",
+        Some("P-2"),
+        "'self.id' value of P-1 was not equal to 'fill.position_id' value of P-2"
+    )]
+    fn test_try_apply_rejects_invalid_fill_identity_without_mutation(
+        #[case] fill_instrument_id: &str,
+        #[case] fill_position_id: Option<&str>,
+        #[case] expected_error: &str,
+        audusd_sim: CurrencyPair,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let position_id = PositionId::from("P-1");
+        let fill_open = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .trade_id(TradeId::from("T-1"))
+            .position_id(position_id)
+            .build();
+        let mut fill_invalid = OrderFilledSpec::builder()
+            .instrument_id(InstrumentId::from(fill_instrument_id))
+            .trade_id(TradeId::from("T-2"))
+            .build();
+        fill_invalid.position_id = fill_position_id.map(PositionId::from);
+        let mut position = Position::new(&instrument, fill_open);
+        let state_before = serde_json::to_value(&position).unwrap();
+
+        let error = position.try_apply(&fill_invalid).unwrap_err();
+
+        assert_eq!(error.to_string(), expected_error);
+        assert_eq!(serde_json::to_value(&position).unwrap(), state_before);
+    }
+
+    #[rstest]
+    fn test_try_apply_rejects_duplicate_trade_without_mutation(audusd_sim: CurrencyPair) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let position_id = PositionId::from("P-1");
+        let fill_open = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .trade_id(TradeId::from("T-1"))
+            .position_id(position_id)
+            .build();
+        let fill_duplicate = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-2"))
+            .trade_id(TradeId::from("T-1"))
+            .position_id(position_id)
+            .build();
+        let mut position = Position::new(&instrument, fill_open);
+        let state_before = serde_json::to_value(&position).unwrap();
+
+        let error = position.try_apply(&fill_duplicate).unwrap_err();
+
+        assert_eq!(
+            error,
+            CorrectnessError::PredicateViolation {
+                message: "`fill.trade_id` already contained in `trade_ids`".to_string(),
+            }
+        );
+        assert_eq!(serde_json::to_value(&position).unwrap(), state_before);
+    }
+
+    #[rstest]
+    #[should_panic(expected = "`fill.trade_id` already contained in `trade_ids`")]
     fn test_two_trades_with_same_trade_id_error(audusd_sim: CurrencyPair) {
         let audusd_sim = InstrumentAny::CurrencyPair(audusd_sim);
         let order1 = OrderTestBuilder::new(OrderType::Market)
@@ -1105,6 +1781,124 @@ mod tests {
         );
         let mut position = Position::new(&audusd_sim, fill1.into());
         position.apply(&fill2.into());
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_historical_duplicate_trade_id_does_not_poison_fill_void_replay(
+        #[case] causal_duplicate: bool,
+        audusd_sim: CurrencyPair,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let position_id = PositionId::from("P-DUP");
+        let fill_open = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-1"))
+            .trade_id(TradeId::from("T-1"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(10))
+            .last_px(Price::from("1.00000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .ts_event(UnixNanos::from(1))
+            .build();
+        let fill_close = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-2"))
+            .trade_id(TradeId::from("T-2"))
+            .order_side(OrderSide::Sell)
+            .last_qty(Quantity::from(10))
+            .last_px(Price::from("1.00010"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .ts_event(UnixNanos::from(2))
+            .build();
+        let mut fill_duplicate = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-1"))
+            .trade_id(TradeId::from("T-1"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(10))
+            .last_px(Price::from("1.00020"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .ts_event(UnixNanos::from(3))
+            .build();
+
+        if causal_duplicate {
+            fill_duplicate.causation_id = Some(fill_open.event_id);
+        }
+        let fill_reopen = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-3"))
+            .trade_id(TradeId::from("T-3"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(5))
+            .last_px(Price::from("1.00000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .ts_event(UnixNanos::from(4))
+            .build();
+        let mut fill_duplicate_open = fill_duplicate.clone();
+        fill_duplicate_open.event_id = uuid4();
+        fill_duplicate_open.client_order_id = ClientOrderId::from("O-4");
+        fill_duplicate_open.ts_event = UnixNanos::from(5);
+        let fill_voided = matching_fill_void(&fill_close, Quantity::from(10), None);
+        let mut position = Position::new(&instrument, fill_open.clone());
+        position.try_apply(&fill_close).unwrap();
+
+        position.try_apply(&fill_duplicate).unwrap();
+
+        assert_eq!(position.side, PositionSide::Flat);
+        assert_eq!(position.quantity, Quantity::from(0));
+        assert_eq!(position.events, vec![fill_open.clone(), fill_close.clone()]);
+        assert_eq!(position.replay_events.len(), 2);
+        assert_eq!(position.trade_ids.len(), 2);
+        assert!(position.trade_ids.contains(&TradeId::from("T-1")));
+        assert!(position.trade_ids.contains(&TradeId::from("T-2")));
+
+        position.try_apply(&fill_reopen).unwrap();
+        position.try_apply(&fill_duplicate_open).unwrap();
+
+        assert_eq!(position.side, PositionSide::Long);
+        assert_eq!(position.quantity, Quantity::from(5));
+        assert_eq!(position.opening_order_id, ClientOrderId::from("O-3"));
+        assert_eq!(position.events, vec![fill_reopen.clone()]);
+        assert_eq!(position.replay_events.len(), 3);
+        assert_eq!(position.trade_ids.len(), 1);
+        assert!(position.trade_ids.contains(&TradeId::from("T-3")));
+
+        position
+            .apply_fill_void(fill_voided, Quantity::from(10), None)
+            .unwrap();
+
+        assert_eq!(position.side, PositionSide::Long);
+        assert_eq!(position.quantity, Quantity::from(15));
+        assert_eq!(position.opening_order_id, ClientOrderId::from("O-1"));
+        assert_eq!(position.closing_order_id, None);
+        assert_eq!(position.avg_px_open, 1.0);
+        assert_eq!(position.buy_qty, Quantity::from(15));
+        assert_eq!(position.sell_qty, Quantity::from(0));
+        assert_eq!(
+            position.events,
+            vec![fill_open.clone(), fill_reopen.clone()]
+        );
+        assert_eq!(position.replay_events.len(), 3);
+        assert_eq!(position.fill_voids.len(), 1);
+        assert_eq!(position.trade_ids.len(), 2);
+        assert!(position.trade_ids.contains(&TradeId::from("T-1")));
+        assert!(position.trade_ids.contains(&TradeId::from("T-3")));
+
+        let mut fill_close_duplicate = fill_close;
+        fill_close_duplicate.event_id = uuid4();
+        fill_close_duplicate.ts_event = UnixNanos::from(6);
+        position.try_apply(&fill_close_duplicate).unwrap();
+
+        assert_eq!(position.side, PositionSide::Long);
+        assert_eq!(position.quantity, Quantity::from(15));
+        assert_eq!(position.events, vec![fill_open, fill_reopen]);
+        assert_eq!(position.replay_events.len(), 3);
     }
 
     #[rstest]
@@ -1176,7 +1970,7 @@ mod tests {
         let position = Position::new(&audusd_sim, fill.into());
         assert_eq!(position.symbol(), audusd_sim.id().symbol);
         assert_eq!(position.venue(), audusd_sim.id().venue);
-        assert_eq!(position.closing_order_side(), OrderSide::Sell);
+        assert_eq!(position.closing_order_side(), Some(OrderSide::Sell));
         assert!(!position.is_opposite_side(OrderSide::Buy));
         assert_eq!(position, position); // equality operator test
         assert!(position.closing_order_id.is_none());
@@ -1187,7 +1981,7 @@ mod tests {
         assert_eq!(position.entry, OrderSide::Buy);
         assert_eq!(position.side, PositionSide::Long);
         assert_eq!(position.ts_opened.as_u64(), 0);
-        assert_eq!(position.duration_ns, 0);
+        assert_eq!(position.duration_ns, DurationNanos::default());
         assert_eq!(position.avg_px_open, 1.00001);
         assert_eq!(position.event_count(), 1);
         assert_eq!(position.id, PositionId::new("1"));
@@ -1231,7 +2025,7 @@ mod tests {
         let position = Position::new(&audusd_sim, fill.into());
         assert_eq!(position.symbol(), audusd_sim.id().symbol);
         assert_eq!(position.venue(), audusd_sim.id().venue);
-        assert_eq!(position.closing_order_side(), OrderSide::Buy);
+        assert_eq!(position.closing_order_side(), Some(OrderSide::Buy));
         assert!(!position.is_opposite_side(OrderSide::Sell));
         assert_eq!(position, position); // Equality operator test
         assert!(position.closing_order_id.is_none());
@@ -1415,7 +2209,7 @@ mod tests {
         assert_eq!(position.side, PositionSide::Flat);
         assert_eq!(position.ts_opened, 1_000_000_000);
         assert_eq!(position.ts_closed, Some(UnixNanos::from(2_000_000_000)));
-        assert_eq!(position.duration_ns, 1_000_000_000);
+        assert_eq!(position.duration_ns, DurationNanos::from_secs(1));
         assert_eq!(position.avg_px_open, 1.00001);
         assert_eq!(position.avg_px_close, Some(1.00011));
         assert!(!position.is_long());
@@ -1554,7 +2348,7 @@ mod tests {
             position.quantity,
             Quantity::zero(audusd_sim.price_precision())
         );
-        assert_eq!(position.closing_order_side(), OrderSide::NoOrderSide);
+        assert_eq!(position.closing_order_side(), None);
         assert_eq!(position.side, PositionSide::Flat);
         assert_eq!(position.ts_opened, 0);
         assert_eq!(position.avg_px_open, 1.0);
@@ -1858,9 +2652,8 @@ mod tests {
         assert_eq!(position.side, PositionSide::Long);
         assert_eq!(position.opening_order_id, fill3.client_order_id);
         assert_eq!(position.closing_order_id, None);
-        assert_eq!(position.closing_order_id, None);
         assert_eq!(position.ts_opened, 3_000_000_000);
-        assert_eq!(position.duration_ns, 0);
+        assert_eq!(position.duration_ns, DurationNanos::default());
         assert_eq!(position.avg_px_open, 1.00012);
         assert_eq!(position.event_count(), 1);
         assert_eq!(position.ts_closed, None);
@@ -1878,6 +2671,696 @@ mod tests {
             format!("{position}"),
             "Position(LONG 150_000 AUD/USD.SIM, id=P-123456)"
         );
+    }
+
+    #[rstest]
+    #[case::zero(Quantity::from(0))]
+    #[case::exceeds_fragments(Quantity::from(11))]
+    fn test_apply_fill_void_rejects_invalid_allocation_without_mutation(
+        #[case] voided_qty: Quantity,
+        audusd_sim: CurrencyPair,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let position_id = PositionId::from("P-VOID-INVALID");
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-VOID-INVALID"))
+            .trade_id(TradeId::from("T-VOID-INVALID"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(10))
+            .last_px(Price::from("1.00000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .build();
+        let fill_voided = matching_fill_void(&fill, voided_qty, None);
+        let mut position = Position::new(&instrument, fill);
+        let state_before = serde_json::to_value(&position).unwrap();
+
+        let error = position
+            .apply_fill_void(fill_voided, voided_qty, None)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "position fill void exceeds known fragments for T-VOID-INVALID"
+        );
+        assert_eq!(serde_json::to_value(&position).unwrap(), state_before);
+    }
+
+    #[rstest]
+    #[case::stale(
+        Quantity::from(4),
+        Money::from("0.40 USD"),
+        "stale position fill void for T-VOID-CUMULATIVE"
+    )]
+    #[case::duplicate(
+        Quantity::from(5),
+        Money::from("0.50 USD"),
+        "duplicate position fill void for T-VOID-CUMULATIVE"
+    )]
+    fn test_apply_fill_void_rejects_invalid_cumulative_update_without_mutation(
+        #[case] voided_qty: Quantity,
+        #[case] commission_voided: Money,
+        #[case] expected_error: &str,
+        audusd_sim: CurrencyPair,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let position_id = PositionId::from("P-VOID-CUMULATIVE");
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-VOID-CUMULATIVE"))
+            .trade_id(TradeId::from("T-VOID-CUMULATIVE"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(10))
+            .last_px(Price::from("1.00000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .commission(Money::from("1.00 USD"))
+            .build();
+        let fill_voided =
+            matching_fill_void(&fill, Quantity::from(5), Some(Money::from("0.50 USD")));
+        let mut position = Position::new(&instrument, fill);
+        position
+            .apply_fill_void(
+                fill_voided.clone(),
+                Quantity::from(5),
+                Some(Money::from("0.50 USD")),
+            )
+            .unwrap();
+        let state_before = serde_json::to_value(&position).unwrap();
+
+        let error = position
+            .apply_fill_void(fill_voided, voided_qty, Some(commission_voided))
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), expected_error);
+        assert_eq!(serde_json::to_value(&position).unwrap(), state_before);
+    }
+
+    #[rstest]
+    fn test_apply_fill_void_uses_latest_cumulative_commission(audusd_sim: CurrencyPair) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let position_id = PositionId::from("P-VOID-LATEST");
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-VOID-LATEST"))
+            .trade_id(TradeId::from("T-VOID-LATEST"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(10))
+            .last_px(Price::from("1.00000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .commission(Money::from("1.00 USD"))
+            .build();
+        let fill_voided =
+            matching_fill_void(&fill, Quantity::from(4), Some(Money::from("0.40 USD")));
+        let mut position = Position::new(&instrument, fill);
+        position
+            .apply_fill_void(
+                fill_voided.clone(),
+                Quantity::from(4),
+                Some(Money::from("0.40 USD")),
+            )
+            .unwrap();
+
+        position
+            .apply_fill_void(fill_voided, Quantity::from(7), None)
+            .unwrap();
+
+        assert_eq!(position.side, PositionSide::Long);
+        assert_eq!(position.quantity, Quantity::from(3));
+        assert_eq!(position.commissions(), vec![Money::from("1.00 USD")]);
+        assert_eq!(position.realized_pnl, Some(Money::from("-1.00 USD")));
+        assert_eq!(position.fill_voids.len(), 2);
+    }
+
+    #[rstest]
+    fn test_fill_void_replays_across_position_close_and_reopen(audusd_sim: CurrencyPair) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let position_id = PositionId::from("P-VOID-REPLAY");
+        let fill1 = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-OPEN"))
+            .trade_id(TradeId::from("T-OPEN"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(10))
+            .last_px(Price::from("1.00000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .commission(Money::from("1.00 USD"))
+            .ts_event(UnixNanos::from(1))
+            .build();
+        let fill2 = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-CLOSE"))
+            .trade_id(TradeId::from("T-CLOSE"))
+            .order_side(OrderSide::Sell)
+            .last_qty(Quantity::from(10))
+            .last_px(Price::from("1.10000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .commission(Money::from("1.00 USD"))
+            .ts_event(UnixNanos::from(2))
+            .build();
+        let fill3 = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-REOPEN"))
+            .trade_id(TradeId::from("T-REOPEN"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(5))
+            .last_px(Price::from("1.20000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .commission(Money::from("1.00 USD"))
+            .ts_event(UnixNanos::from(3))
+            .build();
+        let fill_voided =
+            matching_fill_void(&fill2, Quantity::from(5), Some(Money::from("0.50 USD")));
+        let mut position = Position::new(&instrument, fill1);
+        position.apply(&fill2);
+        position.apply(&fill3);
+
+        position
+            .apply_fill_void(
+                fill_voided,
+                Quantity::from(5),
+                Some(Money::from("0.50 USD")),
+            )
+            .unwrap();
+        let encoded = serde_json::to_string(&position).unwrap();
+        let restored: Position = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(position.side, PositionSide::Long);
+        assert_eq!(position.quantity, Quantity::from(10));
+        assert_eq!(position.opening_order_id, ClientOrderId::from("O-OPEN"));
+        assert_eq!(position.buy_qty, Quantity::from(15));
+        assert_eq!(position.sell_qty, Quantity::from(5));
+        assert_eq!(position.commissions(), vec![Money::from("2.50 USD")]);
+        assert_eq!(position.replay_events.len(), 3);
+        assert_eq!(position.fill_voids.len(), 1);
+        assert_eq!(restored.quantity, position.quantity);
+        assert_eq!(restored.opening_order_id, position.opening_order_id);
+        assert_eq!(restored.commissions(), position.commissions());
+        assert_eq!(restored.replay_events.len(), position.replay_events.len());
+        assert_eq!(restored.fill_voids.len(), position.fill_voids.len());
+    }
+
+    #[rstest]
+    fn test_fill_void_replays_manual_adjustment(audusd_sim: CurrencyPair) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let position_id = PositionId::from("P-VOID-ADJUSTMENT");
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-VOID-ADJUSTMENT"))
+            .trade_id(TradeId::from("T-VOID-ADJUSTMENT"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(10))
+            .last_px(Price::from("1.00000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .ts_event(UnixNanos::from(1))
+            .build();
+        let fill_voided = matching_fill_void(&fill, Quantity::from(2), None);
+        let adjustment = PositionAdjusted::new(
+            fill.trader_id,
+            fill.strategy_id,
+            fill.instrument_id,
+            position_id,
+            fill.account_id,
+            PositionAdjustmentType::Funding,
+            None,
+            Some(Money::from("5.00 USD")),
+            Some("funding".into()),
+            uuid4(),
+            UnixNanos::from(2),
+            UnixNanos::from(2),
+        );
+        let mut position = Position::new(&instrument, fill);
+        position.apply_adjustment(adjustment);
+
+        position
+            .apply_fill_void(fill_voided, Quantity::from(2), None)
+            .unwrap();
+
+        assert_eq!(position.side, PositionSide::Long);
+        assert_eq!(position.quantity, Quantity::from(8));
+        assert_eq!(position.realized_pnl, Some(Money::from("5.00 USD")));
+        assert_eq!(position.adjustments, vec![adjustment]);
+        assert_eq!(position.replay_events.len(), 2);
+        assert_eq!(position.fill_voids.len(), 1);
+        assert_eq!(position.ts_last, UnixNanos::from(2));
+    }
+
+    #[rstest]
+    fn test_fill_void_returns_all_closed_cycle_pnl(audusd_sim: CurrencyPair) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let position_id = PositionId::from("P-VOID-CYCLES");
+        let fill = |client_order_id: &str,
+                    trade_id: &str,
+                    order_side: OrderSide,
+                    quantity: u32,
+                    price: &str,
+                    ts_event: u64| {
+            OrderFilledSpec::builder()
+                .instrument_id(instrument.id())
+                .client_order_id(ClientOrderId::from(client_order_id))
+                .trade_id(TradeId::from(trade_id))
+                .order_side(order_side)
+                .last_qty(Quantity::from(quantity))
+                .last_px(Price::from(price))
+                .currency(Currency::USD())
+                .position_id(position_id)
+                .ts_event(UnixNanos::from(ts_event))
+                .build()
+        };
+        let fills = [
+            fill("O-OPEN-1", "T-OPEN-1", OrderSide::Buy, 10, "1.0", 1),
+            fill("O-CLOSE-1", "T-CLOSE-1", OrderSide::Sell, 10, "2.0", 2),
+            fill("O-OPEN-2", "T-OPEN-2", OrderSide::Buy, 10, "3.0", 3),
+            fill("O-CLOSE-2", "T-CLOSE-2", OrderSide::Sell, 10, "5.0", 4),
+            fill("O-CURRENT", "T-CURRENT", OrderSide::Buy, 5, "6.0", 5),
+        ];
+        let current = fills.last().unwrap();
+        let fill_voided = matching_fill_void(current, Quantity::from(1), None);
+        let mut position = Position::new(&instrument, fills[0].clone());
+        for fill in &fills[1..] {
+            position.apply(fill);
+        }
+
+        let closed_cycles_pnl = position
+            .apply_fill_void(fill_voided, Quantity::from(1), None)
+            .unwrap();
+
+        assert_eq!(closed_cycles_pnl, Some(Money::from("30.00 USD")));
+        assert_eq!(position.side, PositionSide::Long);
+        assert_eq!(position.quantity, Quantity::from(4));
+        assert_eq!(position.avg_px_open, 6.0);
+        assert_eq!(position.realized_pnl, Some(Money::from("0.00 USD")));
+        assert_eq!(position.events.len(), 1);
+        assert_eq!(position.replay_events.len(), 5);
+        assert_eq!(position.fill_voids.len(), 1);
+    }
+
+    #[rstest]
+    fn test_full_fill_void_preserves_unvoided_commission(audusd_sim: CurrencyPair) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let position_id = PositionId::from("P-FEE-VOID");
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-FEE"))
+            .trade_id(TradeId::from("T-FEE"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(10))
+            .last_px(Price::from("1.00000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .commission(Money::from("1.00 USD"))
+            .build();
+        let fill_voided = OrderFillVoidedSpec::builder()
+            .instrument_id(fill.instrument_id)
+            .client_order_id(fill.client_order_id)
+            .venue_order_id(fill.venue_order_id)
+            .account_id(fill.account_id)
+            .trade_id(fill.trade_id)
+            .voided_qty(fill.last_qty)
+            .order_side(fill.order_side)
+            .order_type(fill.order_type)
+            .last_px(fill.last_px)
+            .currency(fill.currency)
+            .liquidity_side(fill.liquidity_side)
+            .build();
+        let mut position = Position::new(&instrument, fill);
+
+        position
+            .apply_fill_void(fill_voided, Quantity::from(10), None)
+            .unwrap();
+
+        assert_eq!(position.side, PositionSide::Flat);
+        assert_eq!(position.quantity, Quantity::from(0));
+        assert_eq!(position.commissions(), vec![Money::from("1.00 USD")]);
+        assert_eq!(position.realized_pnl, Some(Money::from("-1.00 USD")));
+        assert!(position.events.is_empty());
+    }
+
+    #[rstest]
+    fn test_full_fill_void_preserves_unvoided_base_commission() {
+        let instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
+        let position_id = PositionId::from("P-BASE-FEE-VOID");
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-BASE-FEE"))
+            .trade_id(TradeId::from("T-BASE-FEE"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("1.000000"))
+            .last_px(Price::from("50000.00"))
+            .currency(Currency::USDT())
+            .position_id(position_id)
+            .commission(Money::from("0.00100000 BTC"))
+            .ts_event(UnixNanos::from(2_000))
+            .ts_init(UnixNanos::from(1_900))
+            .build();
+        let fill_voided = matching_fill_void(&fill, fill.last_qty, None);
+        let mut position = Position::new(&instrument, fill);
+
+        let closed_cycles_pnl = position
+            .apply_fill_void(fill_voided, Quantity::from("1.000000"), None)
+            .unwrap();
+
+        assert_eq!(closed_cycles_pnl, None);
+        assert_eq!(position.entry, OrderSide::Sell);
+        assert_eq!(position.side, PositionSide::Short);
+        assert_eq!(position.signed_decimal_qty(), dec!(-0.001));
+        assert_eq!(position.quantity.as_decimal(), dec!(0.001));
+        assert_eq!(position.buy_qty.as_decimal(), Decimal::ZERO);
+        assert_eq!(position.sell_qty.as_decimal(), Decimal::ZERO);
+        assert_eq!(position.commissions(), vec![Money::from("0.00100000 BTC")]);
+        assert_eq!(position.adjustments.len(), 1);
+        assert_eq!(
+            position.adjustments[0].adjustment_type,
+            PositionAdjustmentType::Commission
+        );
+        assert_eq!(position.adjustments[0].quantity_change, Some(dec!(-0.001)));
+        assert_eq!(position.opening_order_id, ClientOrderId::from("O-BASE-FEE"));
+        assert_eq!(position.closing_order_id, None);
+        assert_eq!(position.ts_init, UnixNanos::from(1_900));
+        assert_eq!(position.ts_opened, UnixNanos::from(2_000));
+        assert_eq!(position.ts_last, UnixNanos::from(2_000));
+        assert_eq!(position.ts_closed, None);
+        assert_eq!(position.duration_ns, DurationNanos::default());
+        assert_eq!(position.avg_px_open, 50_000.0);
+        assert_eq!(position.avg_px_close, None);
+        assert_eq!(position.realized_pnl, None);
+        assert!(position.events.is_empty());
+        assert!(position.is_open());
+        assert!(!position.is_closed());
+    }
+
+    #[rstest]
+    fn test_surviving_base_commission_can_close_position() {
+        let instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
+        let position_id = PositionId::from("P-BASE-FEE-CLOSE");
+        let opening = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-BASE-OPEN"))
+            .trade_id(TradeId::from("T-BASE-OPEN"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("0.001000"))
+            .last_px(Price::from("50000.00"))
+            .currency(Currency::USDT())
+            .position_id(position_id)
+            .ts_event(UnixNanos::from(1_000))
+            .ts_init(UnixNanos::from(900))
+            .build();
+        let fee_fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-BASE-FEE"))
+            .trade_id(TradeId::from("T-BASE-FEE"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("1.000000"))
+            .last_px(Price::from("51000.00"))
+            .currency(Currency::USDT())
+            .position_id(position_id)
+            .commission(Money::from("0.00100000 BTC"))
+            .ts_event(UnixNanos::from(2_000))
+            .ts_init(UnixNanos::from(1_900))
+            .build();
+        let fill_voided = matching_fill_void(&fee_fill, fee_fill.last_qty, None);
+        let mut position = Position::new(&instrument, opening);
+        position.apply(&fee_fill);
+
+        let closed_cycles_pnl = position
+            .apply_fill_void(fill_voided, Quantity::from("1.000000"), None)
+            .unwrap();
+
+        assert_eq!(closed_cycles_pnl, None);
+        assert_eq!(position.entry, OrderSide::Buy);
+        assert_eq!(position.side, PositionSide::Flat);
+        assert_eq!(position.signed_decimal_qty(), Decimal::ZERO);
+        assert_eq!(position.quantity.as_decimal(), Decimal::ZERO);
+        assert_eq!(position.buy_qty.as_decimal(), dec!(0.001));
+        assert_eq!(position.sell_qty.as_decimal(), Decimal::ZERO);
+        assert_eq!(position.commissions(), vec![Money::from("0.00100000 BTC")]);
+        assert_eq!(position.events.len(), 1);
+        assert_eq!(position.adjustments.len(), 1);
+        assert_eq!(
+            position.opening_order_id,
+            ClientOrderId::from("O-BASE-OPEN")
+        );
+        assert_eq!(
+            position.closing_order_id,
+            Some(ClientOrderId::from("O-BASE-FEE"))
+        );
+        assert_eq!(position.ts_init, UnixNanos::from(900));
+        assert_eq!(position.ts_opened, UnixNanos::from(1_000));
+        assert_eq!(position.ts_last, UnixNanos::from(2_000));
+        assert_eq!(position.ts_closed, Some(UnixNanos::from(2_000)));
+        assert_eq!(position.duration_ns, DurationNanos::new(1_000));
+        assert_eq!(position.avg_px_open, 50_000.0);
+        assert_eq!(position.avg_px_close, None);
+        assert_eq!(position.realized_pnl, Some(Money::from("0.00 USDT")));
+        assert!(!position.is_open());
+        assert!(position.is_closed());
+    }
+
+    #[rstest]
+    fn test_surviving_base_commission_reopen_returns_previous_cycle_pnl() {
+        let instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
+        let position_id = PositionId::from("P-BASE-FEE-REOPEN");
+        let opening = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-OPEN"))
+            .trade_id(TradeId::from("T-OPEN"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("1.000000"))
+            .last_px(Price::from("50000.00"))
+            .currency(Currency::USDT())
+            .position_id(position_id)
+            .ts_event(UnixNanos::from(1_000))
+            .build();
+        let closing = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-CLOSE"))
+            .trade_id(TradeId::from("T-CLOSE"))
+            .order_side(OrderSide::Sell)
+            .last_qty(Quantity::from("1.000000"))
+            .last_px(Price::from("51000.00"))
+            .currency(Currency::USDT())
+            .position_id(position_id)
+            .ts_event(UnixNanos::from(2_000))
+            .build();
+        let reopening = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-REOPEN"))
+            .trade_id(TradeId::from("T-REOPEN"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("1.000000"))
+            .last_px(Price::from("52000.00"))
+            .currency(Currency::USDT())
+            .position_id(position_id)
+            .commission(Money::from("0.00100000 BTC"))
+            .ts_event(UnixNanos::from(3_000))
+            .ts_init(UnixNanos::from(2_900))
+            .build();
+        let fill_voided = matching_fill_void(&reopening, reopening.last_qty, None);
+        let mut position = Position::new(&instrument, opening);
+        position.apply(&closing);
+        position.apply(&reopening);
+
+        let closed_cycles_pnl = position
+            .apply_fill_void(fill_voided, Quantity::from("1.000000"), None)
+            .unwrap();
+
+        assert_eq!(closed_cycles_pnl, Some(Money::from("1000.00 USDT")));
+        assert_eq!(position.entry, OrderSide::Sell);
+        assert_eq!(position.side, PositionSide::Short);
+        assert_eq!(position.signed_decimal_qty(), dec!(-0.001));
+        assert_eq!(position.quantity.as_decimal(), dec!(0.001));
+        assert_eq!(position.buy_qty.as_decimal(), Decimal::ZERO);
+        assert_eq!(position.sell_qty.as_decimal(), Decimal::ZERO);
+        assert_eq!(position.commissions(), vec![Money::from("0.00100000 BTC")]);
+        assert!(position.events.is_empty());
+        assert_eq!(position.adjustments.len(), 1);
+        assert_eq!(position.opening_order_id, ClientOrderId::from("O-REOPEN"));
+        assert_eq!(position.closing_order_id, None);
+        assert_eq!(position.ts_init, UnixNanos::from(2_900));
+        assert_eq!(position.ts_opened, UnixNanos::from(3_000));
+        assert_eq!(position.ts_last, UnixNanos::from(3_000));
+        assert_eq!(position.ts_closed, None);
+        assert_eq!(position.duration_ns, DurationNanos::default());
+        assert_eq!(position.avg_px_open, 52_000.0);
+        assert_eq!(position.avg_px_close, None);
+        assert_eq!(position.realized_pnl, None);
+        assert!(position.is_open());
+        assert!(!position.is_closed());
+    }
+
+    #[rstest]
+    fn test_surviving_base_commission_can_flip_position() {
+        let instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
+        let position_id = PositionId::from("P-BASE-FEE-FLIP");
+        let opening = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-BASE-OPEN"))
+            .trade_id(TradeId::from("T-BASE-OPEN"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("0.000500"))
+            .last_px(Price::from("50000.00"))
+            .currency(Currency::USDT())
+            .position_id(position_id)
+            .ts_event(UnixNanos::from(1_000))
+            .ts_init(UnixNanos::from(900))
+            .build();
+        let fee_fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-BASE-FEE"))
+            .trade_id(TradeId::from("T-BASE-FEE"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("1.000000"))
+            .last_px(Price::from("52000.00"))
+            .currency(Currency::USDT())
+            .position_id(position_id)
+            .commission(Money::from("0.00100000 BTC"))
+            .ts_event(UnixNanos::from(2_000))
+            .ts_init(UnixNanos::from(1_900))
+            .build();
+        let fill_voided = matching_fill_void(&fee_fill, fee_fill.last_qty, None);
+        let mut position = Position::new(&instrument, opening);
+        position.apply(&fee_fill);
+
+        let closed_cycles_pnl = position
+            .apply_fill_void(fill_voided, Quantity::from("1.000000"), None)
+            .unwrap();
+
+        assert_eq!(closed_cycles_pnl, None);
+        assert_eq!(position.entry, OrderSide::Sell);
+        assert_eq!(position.side, PositionSide::Short);
+        assert_eq!(position.signed_decimal_qty(), dec!(-0.0005));
+        assert_eq!(position.quantity.as_decimal(), dec!(0.0005));
+        assert_eq!(position.buy_qty.as_decimal(), dec!(0.0005));
+        assert_eq!(position.sell_qty.as_decimal(), Decimal::ZERO);
+        assert_eq!(position.commissions(), vec![Money::from("0.00100000 BTC")]);
+        assert_eq!(position.events.len(), 1);
+        assert_eq!(position.adjustments.len(), 1);
+        assert_eq!(
+            position.opening_order_id,
+            ClientOrderId::from("O-BASE-OPEN")
+        );
+        assert_eq!(position.closing_order_id, None);
+        assert_eq!(position.ts_init, UnixNanos::from(900));
+        assert_eq!(position.ts_opened, UnixNanos::from(1_000));
+        assert_eq!(position.ts_last, UnixNanos::from(2_000));
+        assert_eq!(position.ts_closed, None);
+        assert_eq!(position.duration_ns, DurationNanos::default());
+        assert_eq!(position.avg_px_open, 52_000.0);
+        assert_eq!(position.avg_px_close, None);
+        assert_eq!(position.realized_pnl, Some(Money::from("0.00 USDT")));
+        assert!(position.is_open());
+        assert!(!position.is_closed());
+    }
+
+    #[rstest]
+    fn test_fill_void_replays_netting_flip_fragments_with_one_trade_id(audusd_sim: CurrencyPair) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let position_id = PositionId::from("P-FLIP-VOID");
+        let opening = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-OPEN"))
+            .trade_id(TradeId::from("T-OPEN"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(10))
+            .last_px(Price::from("1.00000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .build();
+        let closing = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-FLIP"))
+            .trade_id(TradeId::from("T-FLIP"))
+            .order_side(OrderSide::Sell)
+            .last_qty(Quantity::from(10))
+            .last_px(Price::from("1.10000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .build();
+        let mut reopening = closing.clone();
+        reopening.last_qty = Quantity::from(5);
+        reopening.event_id = uuid4();
+        reopening.causation_id = Some(closing.event_id);
+        let fill_voided = matching_fill_void(&closing, Quantity::from(12), None);
+        let mut position = Position::new(&instrument, opening);
+        position.apply(&closing);
+        assert!(!position.is_duplicate_replay_fill(&reopening));
+        position.apply(&reopening);
+
+        position
+            .apply_fill_void(fill_voided, Quantity::from(12), None)
+            .unwrap();
+
+        assert_eq!(position.side, PositionSide::Long);
+        assert_eq!(position.quantity, Quantity::from(7));
+        assert_eq!(position.buy_qty, Quantity::from(10));
+        assert_eq!(position.sell_qty, Quantity::from(3));
+        assert_eq!(position.replay_events.len(), 3);
+        assert!(position.is_duplicate_replay_fill(&reopening));
+    }
+
+    #[rstest]
+    fn test_fill_void_replays_split_fragments_in_one_corrected_cycle(audusd_sim: CurrencyPair) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let position_id = PositionId::from("P-FLIP-CYCLE-VOID");
+        let opening = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-SELL-1"))
+            .trade_id(TradeId::from("T-SELL-1"))
+            .order_side(OrderSide::Sell)
+            .last_qty(Quantity::from(17))
+            .last_px(Price::from("1.00000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .build();
+        let second_sell = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-SELL-2"))
+            .trade_id(TradeId::from("T-SELL-2"))
+            .order_side(OrderSide::Sell)
+            .last_qty(Quantity::from(17))
+            .last_px(Price::from("1.00000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .build();
+        let closing = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from("O-FLIP"))
+            .trade_id(TradeId::from("T-FLIP"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(34))
+            .last_px(Price::from("1.10000"))
+            .currency(Currency::USD())
+            .position_id(position_id)
+            .build();
+        let mut reopening = closing.clone();
+        reopening.last_qty = Quantity::from(591);
+        reopening.event_id = uuid4();
+        reopening.causation_id = Some(closing.event_id);
+        let fill_voided = matching_fill_void(&second_sell, Quantity::from(2), None);
+        let mut position = Position::new(&instrument, opening);
+        position.apply(&second_sell);
+        position.apply(&closing);
+        position.apply(&reopening);
+
+        position
+            .apply_fill_void(fill_voided, Quantity::from(2), None)
+            .unwrap();
+
+        assert_eq!(position.side, PositionSide::Long);
+        assert_eq!(position.quantity, Quantity::from(593));
+        assert_eq!(position.buy_qty, Quantity::from(625));
+        assert_eq!(position.sell_qty, Quantity::from(32));
+        assert_eq!(position.events.len(), 4);
+        assert_eq!(position.replay_events.len(), 4);
+        assert_eq!(position.fill_voids.len(), 1);
+        assert_eq!(position.trade_ids.len(), 3);
+        assert!(position.trade_ids.contains(&TradeId::from("T-FLIP")));
     }
 
     #[rstest]
@@ -2231,6 +3714,67 @@ mod tests {
     }
 
     #[rstest]
+    fn test_try_notional_value_for_inverse_zero_price_returns_error(
+        xbtusd_bitmex: CryptoPerpetual,
+    ) {
+        let xbtusd_bitmex = InstrumentAny::CryptoPerpetual(xbtusd_bitmex);
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(xbtusd_bitmex.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("100000"))
+            .build();
+        let fill = TestOrderEventStubs::filled(
+            &order,
+            &xbtusd_bitmex,
+            None,
+            Some(PositionId::from("P-ZERO-PRICE")),
+            Some(Price::from("10000.0")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut position = Position::new(&xbtusd_bitmex, fill.into());
+
+        let result = position.try_notional_value(Price::new(0.0, 1));
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "price must be positive for inverse notional valuation"
+        );
+        assert!(
+            position
+                .try_calculate_pnl(10_000.0, 0.0, position.quantity)
+                .is_err()
+        );
+        assert!(position.try_unrealized_pnl(Price::new(0.0, 1)).is_err());
+        assert!(position.try_total_pnl(Price::new(0.0, 1)).is_err());
+        assert!(position.try_unrealized_pnl(Price::new(-1.0, 1)).is_err());
+        assert_eq!(
+            position.calculate_pnl(10_000.0, 0.0, position.quantity),
+            Money::zero(position.settlement_currency)
+        );
+        assert_eq!(
+            position.unrealized_pnl(Price::new(0.0, 1)),
+            Money::zero(position.settlement_currency)
+        );
+        assert_eq!(
+            position.total_pnl(Price::new(0.0, 1)),
+            Money::zero(position.settlement_currency)
+        );
+
+        position.base_currency = None;
+        let result = position.try_notional_value(Price::from("10000.0"));
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "inverse position BTCUSDT.BITMEX has no base currency"
+        );
+        assert!(position.try_unrealized_pnl(Price::from("10000.0")).is_err());
+    }
+
+    #[rstest]
     fn test_calculate_pnl_for_inverse2(ethusdt_bitmex: CryptoPerpetual) {
         let ethusdt_bitmex = InstrumentAny::CryptoPerpetual(ethusdt_bitmex);
         let order = OrderTestBuilder::new(OrderType::Market)
@@ -2266,6 +3810,36 @@ mod tests {
             position.notional_value(Price::from("370.00")),
             Money::from("270.27027027 ETH")
         );
+    }
+
+    #[rstest]
+    fn test_notional_value_for_quanto_uses_settlement_currency(ethbtc_quanto: CryptoFuture) {
+        let instrument = InstrumentAny::CryptoFuture(ethbtc_quanto);
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("5"))
+            .build();
+        let price = Price::from("0.03600");
+        let fill = TestOrderEventStubs::filled(
+            &order,
+            &instrument,
+            None,
+            Some(PositionId::from("P-QUANTO-NOTIONAL")),
+            Some(price),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let position = Position::new(&instrument, fill.into());
+        let position_notional = position.notional_value(price);
+        let instrument_notional =
+            instrument.calculate_notional_value(position.quantity, price, None);
+
+        assert_eq!(position_notional, instrument_notional);
+        assert_eq!(position_notional, Money::from("0.18 USDT"));
     }
 
     #[rstest]
@@ -2591,7 +4165,7 @@ mod tests {
         assert_eq!(position.ts_opened, UnixNanos::default());
         assert_eq!(position.ts_last, UnixNanos::default());
         assert_eq!(position.ts_closed, Some(UnixNanos::default()));
-        assert_eq!(position.duration_ns, 0);
+        assert_eq!(position.duration_ns, DurationNanos::default());
 
         // Verify empty shell reports as closed (this was the bug we fixed!)
         // is_closed() must return true so cache purge logic recognizes empty shells
@@ -2740,7 +4314,8 @@ mod tests {
             "INV4: Empty shell ts_last must be 0"
         );
         assert_eq!(
-            position.duration_ns, 0,
+            position.duration_ns,
+            DurationNanos::default(),
             "INV4: Empty shell duration_ns must be 0"
         );
 
@@ -2915,7 +4490,7 @@ mod tests {
         assert_eq!(position.quantity, Quantity::from(1000));
 
         // Verify commissions accumulated (should be 100 * 0.01 = 1.0 USD)
-        let total_commission: f64 = position.commissions().iter().map(|c| c.as_f64()).sum();
+        let total_commission: f64 = position.commissions().iter().map(Money::as_f64).sum();
         assert!(
             (total_commission - 1.0).abs() < 1e-10,
             "Commission accumulation should be accurate: expected 1.0, was {total_commission}"
@@ -3080,7 +4655,7 @@ mod tests {
             _ => unreachable!(),
         };
 
-        let position = Position::new(&btc_usdt, fill);
+        let position = Position::new(&btc_usdt, fill.clone());
         let replayed_position = Position::new(&btc_usdt, fill);
 
         // Position quantity should be 1.0 - 0.001 = 0.999 BTC
@@ -3763,6 +5338,199 @@ mod tests {
     }
 
     #[rstest]
+    #[case(OrderSide::Buy, OrderSide::Sell, "162.50", "176.50", 171.5)]
+    #[case(OrderSide::Sell, OrderSide::Buy, "140.00", "126.00", 131.0)]
+    fn test_position_exact_close_after_partial_fills_preserves_open_average(
+        #[case] entry: OrderSide,
+        #[case] exit: OrderSide,
+        #[case] first_close_px: &str,
+        #[case] final_close_px: &str,
+        #[case] expected_avg_close: f64,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
+        let position_id = PositionId::new("P-PARTIAL-CLOSE");
+        let open_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::new("O-OPEN"))
+            .side(entry)
+            .quantity(Quantity::from("0.7"))
+            .build();
+        let open_fill = TestOrderEventStubs::filled(
+            &open_order,
+            &instrument,
+            Some(TradeId::new("T-OPEN")),
+            Some(position_id),
+            Some(Price::from("151.25")),
+            None,
+            None,
+            Some(Money::from("0 USDT")),
+            Some(UnixNanos::from(1_000)),
+            None,
+        );
+        let mut position = Position::new(&instrument, open_fill.into());
+
+        for (client_order_id, trade_id, quantity, price, ts_event) in [
+            ("O-CLOSE-1", "T-CLOSE-1", "0.25", first_close_px, 1_100),
+            ("O-CLOSE-2", "T-CLOSE-2", "0.45", final_close_px, 1_250),
+        ] {
+            let close_order = OrderTestBuilder::new(OrderType::Market)
+                .instrument_id(instrument.id())
+                .client_order_id(ClientOrderId::new(client_order_id))
+                .side(exit)
+                .quantity(Quantity::from(quantity))
+                .build();
+            let close_fill = TestOrderEventStubs::filled(
+                &close_order,
+                &instrument,
+                Some(TradeId::new(trade_id)),
+                Some(position_id),
+                Some(Price::from(price)),
+                None,
+                None,
+                Some(Money::from("0 USDT")),
+                Some(UnixNanos::from(ts_event)),
+                None,
+            );
+            position.apply(&close_fill.into());
+        }
+
+        assert_eq!(position.entry, entry);
+        assert_eq!(position.side, PositionSide::Flat);
+        assert_eq!(position.signed_qty, 0.0);
+        assert_eq!(position.quantity, Quantity::zero(6));
+        assert_eq!(position.peak_qty, Quantity::from("0.7"));
+        assert_eq!(position.buy_qty, Quantity::from("0.7"));
+        assert_eq!(position.sell_qty, Quantity::from("0.7"));
+        assert_eq!(position.avg_px_open, 151.25);
+        assert_eq!(position.avg_px_close, Some(expected_avg_close));
+        assert_eq!(position.realized_return, 0.133_884_297_520_661_17);
+        assert_eq!(position.realized_pnl, Some(Money::from("14.17500000 USDT")));
+        assert_eq!(position.commissions(), vec![Money::from("0 USDT")]);
+        assert_eq!(position.opening_order_id, ClientOrderId::new("O-OPEN"));
+        assert_eq!(
+            position.closing_order_id,
+            Some(ClientOrderId::new("O-CLOSE-2"))
+        );
+        assert_eq!(position.ts_opened, UnixNanos::from(1_000));
+        assert_eq!(position.ts_last, UnixNanos::from(1_250));
+        assert_eq!(position.ts_closed, Some(UnixNanos::from(1_250)));
+        assert_eq!(position.duration_ns, DurationNanos::new(250));
+        assert_eq!(position.event_count(), 3);
+        assert!(position.is_closed());
+    }
+
+    #[rstest]
+    #[case(
+        OrderSide::Buy,
+        OrderSide::Sell,
+        "140.00",
+        "126.00",
+        PositionSide::Short,
+        -0.000_001
+    )]
+    #[case(
+        OrderSide::Sell,
+        OrderSide::Buy,
+        "162.50",
+        "176.50",
+        PositionSide::Long,
+        0.000_001
+    )]
+    fn test_position_true_reversal_uses_fill_price(
+        #[case] entry: OrderSide,
+        #[case] exit: OrderSide,
+        #[case] first_close_px: &str,
+        #[case] reversal_px: &str,
+        #[case] expected_side: PositionSide,
+        #[case] expected_signed_qty: f64,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
+        let position_id = PositionId::new("P-REVERSAL");
+        let open_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::new("O-REVERSAL-OPEN"))
+            .side(entry)
+            .quantity(Quantity::from("0.7"))
+            .build();
+        let open_fill = TestOrderEventStubs::filled(
+            &open_order,
+            &instrument,
+            Some(TradeId::new("T-REVERSAL-OPEN")),
+            Some(position_id),
+            Some(Price::from("151.25")),
+            None,
+            None,
+            Some(Money::from("0 USDT")),
+            Some(UnixNanos::from(2_000)),
+            None,
+        );
+        let mut position = Position::new(&instrument, open_fill.into());
+
+        let close_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::new("O-REVERSAL-CLOSE"))
+            .side(exit)
+            .quantity(Quantity::from("0.25"))
+            .build();
+        let close_fill = TestOrderEventStubs::filled(
+            &close_order,
+            &instrument,
+            Some(TradeId::new("T-REVERSAL-CLOSE")),
+            Some(position_id),
+            Some(Price::from(first_close_px)),
+            None,
+            None,
+            Some(Money::from("0 USDT")),
+            Some(UnixNanos::from(2_050)),
+            None,
+        );
+        position.apply(&close_fill.into());
+
+        let reversal_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::new("O-REVERSAL"))
+            .side(exit)
+            .quantity(Quantity::from("0.450001"))
+            .build();
+        let reversal_fill = TestOrderEventStubs::filled(
+            &reversal_order,
+            &instrument,
+            Some(TradeId::new("T-REVERSAL")),
+            Some(position_id),
+            Some(Price::from(reversal_px)),
+            None,
+            None,
+            Some(Money::from("0 USDT")),
+            Some(UnixNanos::from(2_100)),
+            None,
+        );
+        position.apply(&reversal_fill.into());
+
+        assert_eq!(position.entry, exit);
+        assert_eq!(position.side, expected_side);
+        assert!((position.signed_qty - expected_signed_qty).abs() < 1e-12);
+        assert_eq!(position.quantity, Quantity::from("0.000001"));
+        assert_eq!(position.peak_qty, Quantity::from("0.7"));
+        assert_eq!(position.avg_px_open, Price::from(reversal_px).as_f64());
+        assert_eq!(
+            position.realized_pnl,
+            Some(Money::from("-14.17500000 USDT"))
+        );
+        assert_eq!(position.commissions(), vec![Money::from("0 USDT")]);
+        assert_eq!(
+            position.opening_order_id,
+            ClientOrderId::new("O-REVERSAL-OPEN")
+        );
+        assert_eq!(position.closing_order_id, None);
+        assert_eq!(position.ts_opened, UnixNanos::from(2_000));
+        assert_eq!(position.ts_last, UnixNanos::from(2_100));
+        assert_eq!(position.ts_closed, None);
+        assert_eq!(position.duration_ns, DurationNanos::default());
+        assert_eq!(position.event_count(), 3);
+        assert!(position.is_open());
+    }
+
+    #[rstest]
     fn test_position_adjustment_floating_point_precision_edge_case() {
         // Test that apply_adjustment handles precision edge cases correctly
         let btc_usdt = currency_pair_btcusdt();
@@ -4158,6 +5926,57 @@ mod tests {
     }
 
     #[rstest]
+    fn test_position_close_before_open_clamps_duration(audusd_sim: CurrencyPair) {
+        let audusd_sim = InstrumentAny::CurrencyPair(audusd_sim);
+        let opening_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(audusd_sim.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .build();
+        let closing_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(audusd_sim.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from(100_000))
+            .build();
+        let opening_fill = TestOrderEventStubs::filled(
+            &opening_order,
+            &audusd_sim,
+            Some(TradeId::new("OPEN")),
+            None,
+            Some(Price::from("1.00001")),
+            None,
+            None,
+            None,
+            Some(UnixNanos::from(2_000u64)),
+            None,
+        );
+        let closing_fill = TestOrderEventStubs::filled(
+            &closing_order,
+            &audusd_sim,
+            Some(TradeId::new("CLOSE")),
+            None,
+            Some(Price::from("1.00002")),
+            None,
+            None,
+            None,
+            Some(UnixNanos::from(1_000u64)),
+            None,
+        );
+        let mut position = Position::new(&audusd_sim, opening_fill.into());
+
+        position.apply(&closing_fill.into());
+
+        assert_eq!(position.side, PositionSide::Flat);
+        assert_eq!(position.ts_opened, UnixNanos::from(2_000u64));
+        assert_eq!(position.ts_closed, Some(UnixNanos::from(1_000u64)));
+        assert_eq!(position.duration_ns, DurationNanos::default());
+        assert_eq!(
+            position.closing_order_id,
+            Some(closing_order.client_order_id())
+        );
+    }
+
+    #[rstest]
     fn test_position_commissions_multi_currency_insertion_order(audusd_sim: CurrencyPair) {
         // Locks in IndexMap iteration order for Position::commissions:
         // new currencies append to the end, existing currencies accumulate
@@ -4512,5 +6331,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn matching_fill_void(
+        fill: &OrderFilled,
+        voided_qty: Quantity,
+        commission_voided: Option<Money>,
+    ) -> OrderFillVoided {
+        OrderFillVoidedSpec::builder()
+            .trader_id(fill.trader_id)
+            .strategy_id(fill.strategy_id)
+            .instrument_id(fill.instrument_id)
+            .client_order_id(fill.client_order_id)
+            .venue_order_id(fill.venue_order_id)
+            .account_id(fill.account_id)
+            .trade_id(fill.trade_id)
+            .voided_qty(voided_qty)
+            .order_side(fill.order_side)
+            .order_type(fill.order_type)
+            .last_px(fill.last_px)
+            .currency(fill.currency)
+            .liquidity_side(fill.liquidity_side)
+            .maybe_position_id(fill.position_id)
+            .maybe_commission_voided(commission_voided)
+            .build()
     }
 }

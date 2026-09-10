@@ -186,10 +186,19 @@ pub trait Component {
     /// # Errors
     ///
     /// Returns an error if the component fails to fault.
+    ///
+    /// # Notes
+    ///
+    /// Subscriptions are released whether or not `on_fault` succeeds. This applies to faults
+    /// initiated through this method; a failed `on_dispose` reaches `Faulted` without invoking
+    /// `on_fault` and retains subscriptions until a later retirement.
     fn fault(&mut self) -> anyhow::Result<()> {
         self.transition_state(ComponentTrigger::Fault)?; // -> Faulting
 
-        if let Err(e) = self.on_fault() {
+        let result = self.on_fault();
+        self.release_subscriptions();
+
+        if let Err(e) = result {
             log_error(self.component_id(), &e);
             return Err(e); // Halt state transition
         }
@@ -204,6 +213,12 @@ pub trait Component {
     /// # Errors
     ///
     /// Returns an error if the component fails to reset.
+    ///
+    /// # Notes
+    ///
+    /// A successful reset releases retained subscriptions so the component can acquire fresh
+    /// subscriptions when it next starts. A failing `on_reset` retains subscriptions and leaves
+    /// the component in `Resetting`.
     fn reset(&mut self) -> anyhow::Result<()> {
         self.transition_state(ComponentTrigger::Reset)?; // -> Resetting
 
@@ -212,6 +227,7 @@ pub trait Component {
             return Err(e); // Halt state transition
         }
 
+        self.release_subscriptions();
         self.transition_state(ComponentTrigger::ResetCompleted)?;
 
         Ok(())
@@ -222,18 +238,40 @@ pub trait Component {
     /// # Errors
     ///
     /// Returns an error if the component fails to dispose.
+    ///
+    /// # Notes
+    ///
+    /// A failing `on_dispose` moves the component to `Faulted` and returns the error without
+    /// releasing subscriptions. The trader keeps its registry entries, clock, bookkeeping, and
+    /// retained Python wrapper, if any, so the failed retirement leaves the component reachable
+    /// and can be retried without a partially dismantled registration.
+    ///
+    /// `on_fault` does not run, since invoking a second user hook immediately after `on_dispose`
+    /// failed can fail again.
     fn dispose(&mut self) -> anyhow::Result<()> {
         self.transition_state(ComponentTrigger::Dispose)?; // -> Disposing
 
         if let Err(e) = self.on_dispose() {
             log_error(self.component_id(), &e);
-            return Err(e); // Halt state transition
+
+            self.transition_state(ComponentTrigger::Fault)?; // -> Faulting
+            self.transition_state(ComponentTrigger::FaultCompleted)?; // -> Faulted
+
+            return Err(e);
         }
 
+        self.release_subscriptions();
         self.transition_state(ComponentTrigger::DisposeCompleted)?;
 
         Ok(())
     }
+
+    /// Releases the message bus registrations this component installed.
+    ///
+    /// Runs after successful `on_reset` and `on_dispose` hooks, after `on_fault` returns, and during
+    /// explicit retirement cleanup. An override must handle every route and be idempotent so a
+    /// failed disposal can release its subscriptions during a later retirement.
+    fn release_subscriptions(&mut self) {}
 
     /// Actions to be performed on start.
     ///
@@ -347,6 +385,7 @@ impl ComponentState {
             (Self::Resuming, ComponentTrigger::ResumeCompleted) => Self::Running,
             (Self::Resuming, ComponentTrigger::Fault) => Self::Faulting,
             (Self::Stopping, ComponentTrigger::StopCompleted) => Self::Stopped,
+            (Self::Stopping, ComponentTrigger::Dispose) => Self::Disposing,
             (Self::Stopping, ComponentTrigger::Fault) => Self::Faulting,
             (Self::Stopped, ComponentTrigger::Reset) => Self::Resetting,
             (Self::Stopped, ComponentTrigger::Resume) => Self::Resuming,
@@ -357,6 +396,8 @@ impl ComponentState {
             (Self::Degraded, ComponentTrigger::Stop) => Self::Stopping,
             (Self::Degraded, ComponentTrigger::Fault) => Self::Faulting,
             (Self::Disposing, ComponentTrigger::DisposeCompleted) => Self::Disposed,
+            (Self::Disposing, ComponentTrigger::Fault) => Self::Faulting,
+            (Self::Faulting, ComponentTrigger::Dispose) => Self::Disposing,
             (Self::Faulting, ComponentTrigger::FaultCompleted) => Self::Faulted,
             _ => anyhow::bail!("Invalid state trigger {self} -> {trigger}"),
         };
@@ -408,6 +449,11 @@ impl ComponentRegistry {
 
     pub fn get(&self, id: &Ustr) -> Option<Rc<UnsafeCell<dyn Component>>> {
         self.components.borrow().get(id).cloned()
+    }
+
+    /// Removes the component with `id`, returning it when it was registered.
+    pub fn remove(&self, id: &Ustr) -> Option<Rc<UnsafeCell<dyn Component>>> {
+        self.components.borrow_mut().remove(id)
     }
 
     /// Checks if a component is currently borrowed.
@@ -523,6 +569,37 @@ pub fn start_component(id: &Ustr) -> anyhow::Result<()> {
     }
 }
 
+/// Returns the state of a component in the global registry.
+///
+/// # Errors
+///
+/// - Returns an error if the component is not found.
+/// - Returns an error if the component is already borrowed.
+pub fn component_state(id: &Ustr) -> anyhow::Result<ComponentState> {
+    let component_ref = with_component_registry(|registry| {
+        let component_ref = registry
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Component '{id}' not found in global registry"))?;
+
+        if !registry.try_borrow(*id) {
+            anyhow::bail!(
+                "Component '{id}' is already mutably borrowed. \
+                 This would create aliasing mutable references (undefined behavior)."
+            );
+        }
+
+        Ok::<_, anyhow::Error>(component_ref)
+    })?;
+
+    let _guard = BorrowGuard::new(*id);
+
+    // SAFETY: Borrow tracking ensures there is no concurrent mutable lifecycle access.
+    unsafe {
+        let component = &*component_ref.get();
+        Ok(component.state())
+    }
+}
+
 /// Safely calls `stop()` on a component in the global registry.
 ///
 /// # Errors
@@ -619,9 +696,53 @@ pub fn dispose_component(id: &Ustr) -> anyhow::Result<()> {
     }
 }
 
+/// Releases subscriptions for a component in the global registry.
+///
+/// This is used when retiring a component whose earlier `on_dispose` failed after the framework
+/// left its registration intact.
+///
+/// # Errors
+///
+/// - Returns an error if the component is not found.
+/// - Returns an error if the component is already borrowed.
+pub fn release_component_subscriptions(id: &Ustr) -> anyhow::Result<()> {
+    let component_ref = with_component_registry(|registry| {
+        let component_ref = registry
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("Component '{id}' not found in global registry"))?;
+
+        if !registry.try_borrow(*id) {
+            anyhow::bail!(
+                "Component '{id}' is already mutably borrowed. \
+                 This would create aliasing mutable references (undefined behavior)."
+            );
+        }
+
+        Ok::<_, anyhow::Error>(component_ref)
+    })?;
+
+    let _guard = BorrowGuard::new(*id);
+
+    // SAFETY: Borrow tracking ensures exclusive access
+    unsafe {
+        let component = &mut *component_ref.get();
+        component.release_subscriptions();
+    }
+
+    Ok(())
+}
+
 /// Returns a component from the global registry by ID.
 pub fn get_component(id: &Ustr) -> Option<Rc<UnsafeCell<dyn Component>>> {
     with_component_registry(|registry| registry.get(id))
+}
+
+/// Removes the component with `id` from the global registry.
+///
+/// Only the exact ID is removed, so unrelated components sharing the thread-local registry
+/// are untouched.
+pub fn deregister_component(id: &Ustr) {
+    with_component_registry(|registry| registry.remove(id));
 }
 
 #[cfg(test)]

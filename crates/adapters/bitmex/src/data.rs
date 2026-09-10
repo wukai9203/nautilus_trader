@@ -33,7 +33,8 @@ use nautilus_common::{
     messages::{
         DataEvent,
         data::{
-            BarsResponse, DataResponse, InstrumentResponse, InstrumentsResponse, RequestBars,
+            BarsResponse, BookResponse, DataResponse, FundingRatesResponse, InstrumentResponse,
+            InstrumentsResponse, RequestBars, RequestBookSnapshot, RequestFundingRates,
             RequestInstrument, RequestInstruments, RequestTrades, SubscribeBars,
             SubscribeBookDeltas, SubscribeBookDepth10, SubscribeFundingRates, SubscribeIndexPrices,
             SubscribeInstrument, SubscribeInstrumentStatus, SubscribeInstruments,
@@ -49,6 +50,7 @@ use nautilus_core::{
     datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::SocketControlFactory;
 use nautilus_model::{
     data::{Data, InstrumentStatus},
     enums::{BookType, MarketStatusAction},
@@ -91,6 +93,7 @@ pub struct BitmexDataClient {
     config: BitmexDataClientConfig,
     http_client: BitmexHttpClient,
     ws_client: Option<BitmexWebSocketClient>,
+    socket_factory: SocketControlFactory,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
@@ -109,11 +112,24 @@ impl BitmexDataClient {
     pub fn new(client_id: ClientId, config: BitmexDataClientConfig) -> anyhow::Result<Self> {
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
+        let socket_factory = SocketControlFactory::new(client_id, Some(*BITMEX_VENUE));
+        let api_key = config
+            .api_key
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
+        let api_secret = config
+            .api_secret
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
+        let proxy_url = config
+            .proxy_url
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
 
         let http_client = BitmexHttpClient::new(
             Some(config.http_base_url()),
-            config.api_key.clone(),
-            config.api_secret.clone(),
+            api_key,
+            api_secret,
             config.environment,
             config.http_timeout_secs,
             config.max_retries,
@@ -122,7 +138,7 @@ impl BitmexDataClient {
             config.recv_window_ms,
             config.max_requests_per_second,
             config.max_requests_per_minute,
-            config.proxy_url.clone(),
+            proxy_url,
         )
         .context("failed to construct BitMEX HTTP client")?;
 
@@ -132,6 +148,7 @@ impl BitmexDataClient {
             config,
             http_client,
             ws_client: None,
+            socket_factory,
             is_connected: AtomicBool::new(false),
             cancellation_token: CancellationToken::new(),
             tasks: Vec::new(),
@@ -480,7 +497,7 @@ impl BitmexDataClient {
                 }
             }
             BitmexAction::Delete => {
-                log::info!(
+                log::debug!(
                     "Received instrument delete action for {} instrument(s)",
                     data.len(),
                 );
@@ -645,15 +662,26 @@ impl DataClient for BitmexDataClient {
         if self.ws_client.is_none() {
             let ws = BitmexWebSocketClient::new_with_env(
                 Some(self.config.ws_url()),
-                self.config.api_key.clone(),
-                self.config.api_secret.clone(),
+                self.config
+                    .api_key
+                    .as_ref()
+                    .map(|value| value.expose_secret().to_owned()),
+                self.config
+                    .api_secret
+                    .as_ref()
+                    .map(|value| value.expose_secret().to_owned()),
                 None,
                 self.config.heartbeat_interval_secs.unwrap_or(5),
+                self.config.auth_timeout_secs,
                 self.config.environment,
                 self.config.transport_backend,
-                self.config.proxy_url.clone(),
+                self.config
+                    .proxy_url
+                    .as_ref()
+                    .map(|value| value.expose_secret().to_owned()),
             )
-            .context("failed to construct BitMEX websocket client")?;
+            .context("failed to construct BitMEX websocket client")?
+            .with_socket_control(self.socket_factory.control("bitmex-data-streams"));
             self.ws_client = Some(ws);
         }
 
@@ -760,7 +788,7 @@ impl DataClient for BitmexDataClient {
         let depth = cmd.depth.map_or(0, |d| d.get());
         let channel = if depth > 0 && depth <= 25 {
             if depth != 25 {
-                log::info!(
+                log::debug!(
                     "BitMEX only supports depth 25 for L2 deltas, using L2_25 for requested depth {depth}"
                 );
             }
@@ -1182,6 +1210,45 @@ impl DataClient for BitmexDataClient {
         Ok(())
     }
 
+    fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
+        let http = self.http_client.clone();
+        let sender = self.data_sender.clone();
+        let instrument_id = request.instrument_id;
+        let depth = request.depth.map(|n| n.get().min(u32::MAX as usize) as u32);
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let params = request.params;
+        let clock = self.clock;
+
+        get_runtime().spawn(async move {
+            match http
+                .request_book_snapshot(instrument_id, depth)
+                .await
+                .context("failed to request book snapshot from BitMEX")
+            {
+                Ok(book) => {
+                    let response = DataResponse::Book(BookResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        book,
+                        None,
+                        None,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send book snapshot response: {e}");
+                    }
+                }
+                Err(e) => log::error!("Book snapshot request failed: {e:?}"),
+            }
+        });
+
+        Ok(())
+    }
+
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
@@ -1219,6 +1286,49 @@ impl DataClient for BitmexDataClient {
                     }
                 }
                 Err(e) => log::error!("Trade request failed: {e:?}"),
+            }
+        });
+
+        Ok(())
+    }
+
+    fn request_funding_rates(&self, request: RequestFundingRates) -> anyhow::Result<()> {
+        let http = self.http_client.clone();
+        let sender = self.data_sender.clone();
+        let instrument_id = request.instrument_id;
+        let start = request.start;
+        let end = request.end;
+        let limit = request.limit.map(|n| n.get().min(u32::MAX as usize) as u32);
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let params = request.params;
+        let clock = self.clock;
+        let start_nanos = datetime_to_unix_nanos(start);
+        let end_nanos = datetime_to_unix_nanos(end);
+
+        get_runtime().spawn(async move {
+            match http
+                .request_funding_rates(instrument_id, start, end, limit)
+                .await
+                .context("failed to request funding rates from BitMEX")
+            {
+                Ok(rates) => {
+                    let response = DataResponse::FundingRates(FundingRatesResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        rates,
+                        start_nanos,
+                        end_nanos,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send funding rates response: {e}");
+                    }
+                }
+                Err(e) => log::error!("Funding rates request failed: {e:?}"),
             }
         });
 

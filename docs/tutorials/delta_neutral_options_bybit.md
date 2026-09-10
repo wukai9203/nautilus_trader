@@ -1,7 +1,7 @@
 # Delta-Neutral Options Strategy (Bybit)
 
 :::note
-This is a **Rust-only** v2 system tutorial. It runs a live delta-neutral
+This is a **Rust-only** system tutorial. It runs a live delta-neutral
 short-volatility strategy on Bybit using the Rust `LiveNode`.
 :::
 
@@ -112,13 +112,16 @@ configures the strategy:
 ```rust
 let hedge_instrument_id = InstrumentId::from("BTCUSDT-LINEAR.BYBIT");
 
-let strategy_config =
-    DeltaNeutralVolConfig::new("BTC".to_string(), hedge_instrument_id, client_id)
-        .with_contracts(1)
-        .with_rehedge_delta_threshold(0.5)
-        .with_rehedge_interval_secs(30)
-        .with_enter_strangle(false)
-        .with_iv_param_key("order_iv".to_string());
+let strategy_config = DeltaNeutralVolConfig::builder()
+    .option_family("BTC".to_string())
+    .hedge_instrument_id(hedge_instrument_id)
+    .client_id(client_id)
+    .contracts(1)
+    .rehedge_delta_threshold(0.5)
+    .rehedge_interval_secs(30)
+    .enter_strangle(false)
+    .iv_param_key("order_iv".to_string())
+    .build();
 
 let strategy = DeltaNeutralVol::new(strategy_config);
 ```
@@ -127,19 +130,19 @@ Parameters (defaults shown are the struct defaults; the example
 overrides `enter_strangle` to `false` and `iv_param_key` to
 `"order_iv"`):
 
-| Parameter                 | Default    | Example          | Description                                  |
-|---------------------------|------------|------------------|----------------------------------------------|
-| `option_family`           | required   | `"BTC"`          | Underlying filter for instrument discovery.  |
-| `hedge_instrument_id`     | required   | `BTCUSDT-LINEAR` | Perpetual used for delta hedging.            |
-| `client_id`               | required   | `"BYBIT"`        | Data and execution client identifier.        |
-| `target_call_delta`       | `0.20`     | -                | Target call delta for strike selection.      |
-| `target_put_delta`        | `-0.20`    | -                | Target put delta for strike selection.       |
-| `contracts`               | `1`        | -                | Contracts per leg.                           |
-| `rehedge_delta_threshold` | `0.5`      | -                | Portfolio delta that triggers a hedge.       |
-| `rehedge_interval_secs`   | `30`       | -                | Periodic rehedge timer interval.             |
-| `enter_strangle`          | `true`     | `false`          | Place entry orders when Greeks arrive.       |
-| `entry_iv_offset`         | `0.0`      | -                | Vol points below mark IV for entry pricing.  |
-| `iv_param_key`            | `"px_vol"` | `"order_iv"`     | Adapter‑specific IV parameter key.           |
+| Parameter                 | Default    | Example          | Description                                 |
+| ------------------------- | ---------- | ---------------- | ------------------------------------------- |
+| `option_family`           | required   | `"BTC"`          | Underlying filter for instrument discovery. |
+| `hedge_instrument_id`     | required   | `BTCUSDT-LINEAR` | Perpetual used for delta hedging.           |
+| `client_id`               | required   | `"BYBIT"`        | Data and execution client identifier.       |
+| `target_call_delta`       | `0.20`     | -                | Target call delta for strike selection.     |
+| `target_put_delta`        | `-0.20`    | -                | Target put delta for strike selection.      |
+| `contracts`               | `1`        | -                | Contracts per leg.                          |
+| `rehedge_delta_threshold` | `0.5`      | -                | Portfolio delta that triggers a hedge.      |
+| `rehedge_interval_secs`   | `30`       | -                | Periodic rehedge timer interval.            |
+| `enter_strangle`          | `true`     | `false`          | Place entry orders when Greeks arrive.      |
+| `entry_iv_offset`         | `0.0`      | -                | Vol points below mark IV for entry pricing. |
+| `iv_param_key`            | `"px_vol"` | `"order_iv"`     | Adapter-specific IV parameter key.          |
 
 The `iv_param_key` is the key difference between venues. Bybit uses
 `order_iv`, which the adapter maps to the `orderIv` field in the
@@ -159,7 +162,7 @@ let data_config = BybitDataClientConfig {
     ..Default::default()
 };
 
-let exec_config = BybitExecClientConfig {
+let exec_config = BybitExecutionClientConfig {
     api_key: None,
     api_secret: None,
     product_types: vec![BybitProductType::Option, BybitProductType::Linear],
@@ -272,8 +275,8 @@ Selected put: BTC-28APR26-75000-P-USDT-OPTION.BYBIT (strike=75000)
 Strangle: 1 contracts per leg, hedge on BTCUSDT-LINEAR.BYBIT
 ```
 
-That is enough to reason about the strategy's structural behaviour. The
-panels below visualise the mechanics around the actual selected strikes
+That is enough to reason about the strategy's structural behavior. The
+panels below visualize the mechanics around the actual selected strikes
 (75,000 / 81,000) at the captured underlying.
 
 ![Short strangle payoff at expiry](./assets/delta_neutral_options_bybit/panel_a_strangle_payoff.png)
@@ -306,12 +309,16 @@ deltas around the underlying.*
 
 ### Regenerate the panels
 
+After building NautilusTrader from source, run these commands from the repository root:
+
 ```bash
+make sync
+
 timeout 30 ./target/release/examples/bybit-delta-neutral > /tmp/bybit_dn.log 2>&1
 
-uv sync --extra visualization
 DN_LOG=/tmp/bybit_dn.log \
-    python3 docs/tutorials/assets/delta_neutral_options_bybit/render_panels.py
+    uv run --project python --no-sync \
+        python docs/tutorials/assets/delta_neutral_options_bybit/render_panels.py
 ```
 
 The renderer parses selected strikes from the log; the panels themselves

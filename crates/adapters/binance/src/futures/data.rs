@@ -18,7 +18,7 @@
 use std::{
     str::FromStr,
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
@@ -29,16 +29,16 @@ use anyhow::Context;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
     clients::DataClient,
-    live::{runner::get_data_event_sender, runtime::get_runtime},
+    live::runner::get_data_event_sender,
     messages::{
         DataEvent,
         data::{
-            BarsResponse, CustomDataResponse, DataResponse, FundingRatesResponse,
-            InstrumentResponse, InstrumentsResponse, RequestBars, RequestCustomData,
-            RequestFundingRates, RequestInstrument, RequestInstruments, RequestTrades,
-            SubscribeBars, SubscribeBookDeltas, SubscribeCustomData, SubscribeFundingRates,
-            SubscribeIndexPrices, SubscribeInstrument, SubscribeInstruments, SubscribeMarkPrices,
-            SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
+            BarsResponse, BookResponse, CustomDataResponse, DataResponse, FundingRatesResponse,
+            InstrumentResponse, InstrumentsResponse, RequestBars, RequestBookSnapshot,
+            RequestCustomData, RequestFundingRates, RequestInstrument, RequestInstruments,
+            RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeCustomData,
+            SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument, SubscribeInstruments,
+            SubscribeMarkPrices, SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
             UnsubscribeBookDeltas, UnsubscribeCustomData, UnsubscribeFundingRates,
             UnsubscribeIndexPrices, UnsubscribeMarkPrices, UnsubscribeQuotes, UnsubscribeTrades,
             subscribe::SubscribeInstrumentStatus, unsubscribe::UnsubscribeInstrumentStatus,
@@ -46,32 +46,40 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    AtomicMap, MUTEX_POISONED, Params,
-    datetime::{NANOSECONDS_IN_MILLISECOND, datetime_to_unix_nanos},
+    AtomicMap, Params,
+    datetime::datetime_to_unix_nanos,
     nanos::UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::{
+    SocketControlFactory,
+    task::{TaskGroup, TaskGroupGuard, TaskSpawner},
+};
 use nautilus_model::{
-    data::{
-        BookOrder, CustomData, Data, DataType, OrderBookDelta, OrderBookDeltas, OrderBookDeltas_API,
+    data::{BookOrder, CustomData, Data, DataType, OrderBookDelta, OrderBookDeltas, QuoteTick},
+    enums::{
+        AggregationSource, BookAction, BookType, MarketStatusAction, OrderSide, PriceType,
+        RecordFlag,
     },
-    enums::{BookAction, BookType, MarketStatusAction, OrderSide, RecordFlag},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
 };
+use parking_lot::{Mutex, RwLock};
 use rust_decimal::Decimal;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use crate::{
     common::{
-        consts::{BINANCE_BOOK_DEPTHS, BINANCE_VENUE},
+        bar::{binance_bar_data_type, parse_binance_bar_type},
+        consts::{BINANCE_BOOK_DEPTHS, BINANCE_VENUE, BINANCE_WS_HEARTBEAT_SECS},
         enums::{BinanceEnvironment, BinanceProductType},
         parse::{
-            bar_spec_to_binance_interval, parse_price_at_precision, parse_quantity_at_precision,
+            bar_spec_to_binance_interval, parse_millis, parse_millis_or_init,
+            parse_price_at_precision, parse_quantity_at_precision,
             parse_required_price_at_precision, parse_required_quantity_at_precision,
+            quote_to_l1_deltas,
         },
         status::diff_and_emit_statuses,
         symbol::{format_binance_stream_symbol, format_binance_symbol},
@@ -84,7 +92,7 @@ use crate::{
     },
     futures::{
         http::{
-            client::BinanceFuturesHttpClient,
+            client::{BinanceFuturesHttpClient, BinanceFuturesInstrument},
             models::BinanceOrderBook,
             query::{BinanceDepthParams, BinanceOpenInterestHistParams, BinanceOpenInterestParams},
         },
@@ -92,8 +100,8 @@ use crate::{
             client::BinanceFuturesWebSocketClient,
             messages::BinanceFuturesWsStreamsMessage,
             parse_data::{
-                parse_agg_trade, parse_book_ticker, parse_depth_update, parse_kline,
-                parse_mark_price, parse_ticker, parse_trade,
+                parse_agg_trade, parse_book_ticker, parse_depth_snapshot, parse_depth_update,
+                parse_kline, parse_mark_price, parse_ticker, parse_trade,
             },
         },
     },
@@ -103,29 +111,8 @@ const MAX_SNAPSHOT_RETRIES: u32 = 5;
 const MAX_BUFFERED_DEPTH_UPDATES: usize = 10_000;
 const SNAPSHOT_RETRY_BACKOFF_BASE_MS: u64 = 250;
 const SNAPSHOT_RETRY_BACKOFF_CAP_MS: u64 = 3_000;
-
-#[derive(Debug, Clone)]
-struct BufferedDepthUpdate {
-    deltas: OrderBookDeltas,
-    first_update_id: u64,
-    final_update_id: u64,
-    prev_final_update_id: u64,
-}
-
-#[derive(Debug, Clone)]
-struct BookBuffer {
-    updates: Vec<BufferedDepthUpdate>,
-    epoch: u64,
-}
-
-impl BookBuffer {
-    fn new(epoch: u64) -> Self {
-        Self {
-            updates: Vec::new(),
-            epoch,
-        }
-    }
-}
+const MARKET_STREAMS_ENDPOINT: &str = "binance-futures-market-streams";
+const PUBLIC_STREAMS_ENDPOINT: &str = "binance-futures-public-streams";
 
 /// Binance Futures data client for USD-M and COIN-M markets.
 #[derive(Debug)]
@@ -140,11 +127,17 @@ pub struct BinanceFuturesDataClient {
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     is_connected: AtomicBool,
     cancellation_token: CancellationToken,
-    tasks: Vec<JoinHandle<()>>,
+    session_tasks: TaskGroup,
+    command_tasks: TaskGroup,
+    shutdown_errors: Vec<String>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     status_cache: Arc<AtomicMap<InstrumentId, MarketStatusAction>>,
     book_buffers: Arc<AtomicMap<InstrumentId, BookBuffer>>,
     book_subscriptions: Arc<AtomicMap<InstrumentId, u32>>,
+    book_unsubscribes_pending: Arc<AtomicMap<InstrumentId, Vec<BookDrain>>>,
+    l1_book_subscriptions: Arc<AtomicMap<InstrumentId, u32>>,
+    quote_refs: Arc<AtomicMap<InstrumentId, u32>>,
+    // Mark, index, and funding subscriptions share one ref-counted `@markPrice@1s` stream
     mark_price_refs: Arc<AtomicMap<InstrumentId, u32>>,
     ticker_refs: Arc<AtomicMap<InstrumentId, u32>>,
     force_order_refs: Arc<AtomicMap<InstrumentId, u32>>,
@@ -152,6 +145,8 @@ pub struct BinanceFuturesDataClient {
     force_order_all_market_stream_active: Arc<AtomicBool>,
     force_order_ws_lock: Arc<tokio::sync::Mutex<()>>,
     book_epoch: Arc<RwLock<u64>>,
+    book_command_tail: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    book_drain_generation: u64,
 }
 
 impl BinanceFuturesDataClient {
@@ -166,6 +161,8 @@ impl BinanceFuturesDataClient {
         config: BinanceDataClientConfig,
         product_type: BinanceProductType,
     ) -> anyhow::Result<Self> {
+        config.validate()?;
+
         match product_type {
             BinanceProductType::UsdM | BinanceProductType::CoinM => {}
             _ => {
@@ -177,19 +174,33 @@ impl BinanceFuturesDataClient {
 
         let clock = get_atomic_clock_realtime();
         let data_sender = get_data_event_sender();
+        let socket_factory = SocketControlFactory::new(client_id, Some(*BINANCE_VENUE));
+        let api_key = config
+            .api_key
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
+        let api_secret = config
+            .api_secret
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
+        let proxy_url = config
+            .proxy_url
+            .as_ref()
+            .map(|value| value.expose_secret().to_owned());
 
         let http_client = BinanceFuturesHttpClient::new(
             product_type,
             config.environment,
             clock,
-            config.api_key.clone(),
-            config.api_secret.clone(),
+            api_key.clone(),
+            api_secret.clone(),
             config.base_url_http.clone(),
-            None,  // recv_window
-            None,  // timeout_secs
-            None,  // proxy_url
+            Some(config.recv_window_ms),
+            None, // timeout_secs
+            proxy_url.clone(),
             false, // treat_expired_as_canceled
-        )?;
+        )?
+        .with_retry_config(config.retry_config());
 
         let market_url = config.base_url_ws.clone().map(|url| {
             if product_type == BinanceProductType::UsdM
@@ -204,12 +215,14 @@ impl BinanceFuturesDataClient {
         let ws_client = BinanceFuturesWebSocketClient::new(
             product_type,
             config.environment,
-            config.api_key.clone(),
-            config.api_secret.clone(),
+            api_key,
+            api_secret,
             market_url,
-            Some(20), // Heartbeat interval
+            Some(BINANCE_WS_HEARTBEAT_SECS),
             config.transport_backend,
-        )?;
+        )?
+        .with_proxy(proxy_url.clone())
+        .with_socket_control(socket_factory.clone(), MARKET_STREAMS_ENDPOINT);
 
         let public_url = config.base_url_ws.clone().map_or_else(
             || get_ws_public_base_url(product_type, config.environment).to_string(),
@@ -223,15 +236,21 @@ impl BinanceFuturesDataClient {
                 }
             },
         );
+
         let ws_public_client = BinanceFuturesWebSocketClient::new(
             product_type,
             config.environment,
             None,
             None,
             Some(public_url),
-            Some(20),
+            Some(BINANCE_WS_HEARTBEAT_SECS),
             config.transport_backend,
-        )?;
+        )?
+        .with_proxy(proxy_url)
+        .with_socket_control(socket_factory, PUBLIC_STREAMS_ENDPOINT);
+
+        let session_tasks = TaskGroup::new();
+        let command_tasks = TaskGroup::new();
 
         Ok(Self {
             clock,
@@ -243,12 +262,17 @@ impl BinanceFuturesDataClient {
             ws_public_client,
             data_sender,
             is_connected: AtomicBool::new(false),
-            cancellation_token: CancellationToken::new(),
-            tasks: Vec::new(),
+            cancellation_token: session_tasks.cancellation_token(),
+            session_tasks,
+            command_tasks,
+            shutdown_errors: Vec::new(),
             instruments: Arc::new(AtomicMap::new()),
             status_cache: Arc::new(AtomicMap::new()),
             book_buffers: Arc::new(AtomicMap::new()),
             book_subscriptions: Arc::new(AtomicMap::new()),
+            book_unsubscribes_pending: Arc::new(AtomicMap::new()),
+            l1_book_subscriptions: Arc::new(AtomicMap::new()),
+            quote_refs: Arc::new(AtomicMap::new()),
             mark_price_refs: Arc::new(AtomicMap::new()),
             ticker_refs: Arc::new(AtomicMap::new()),
             force_order_refs: Arc::new(AtomicMap::new()),
@@ -256,6 +280,8 @@ impl BinanceFuturesDataClient {
             force_order_all_market_stream_active: Arc::new(AtomicBool::new(false)),
             force_order_ws_lock: Arc::new(tokio::sync::Mutex::new(())),
             book_epoch: Arc::new(RwLock::new(0)),
+            book_command_tail: Arc::new(Mutex::new(None)),
+            book_drain_generation: 0,
         })
     }
 
@@ -273,11 +299,174 @@ impl BinanceFuturesDataClient {
     where
         F: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        get_runtime().spawn(async move {
+        let future = async move {
             if let Err(e) = fut.await {
                 log::error!("{context}: {e:?}");
             }
-        });
+        };
+
+        if let Err(e) = self.command_tasks.spawn(future) {
+            log::warn!("Skipping Binance Futures {context} after shutdown began: {e}");
+        }
+    }
+
+    fn spawn_command<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if let Err(e) = self.command_tasks.spawn(future) {
+            log::warn!("Skipping Binance Futures data command after shutdown began: {e}");
+        }
+    }
+
+    // Links a book stream pool command to its predecessor so registration and
+    // unregistration reach the pool in command order even though the tasks are detached
+    fn chain_book_command(
+        &self,
+    ) -> (
+        impl Future<Output = ()> + Send + 'static,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let previous = self.book_command_tail.lock().replace(done_rx);
+        let wait = async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+        };
+        (wait, done_tx)
+    }
+
+    async fn finish_tasks(&self) -> anyhow::Result<()> {
+        let (session_result, command_result) = tokio::join!(
+            self.session_tasks
+                .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2)),
+            self.command_tasks
+                .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2)),
+        );
+        let mut errors = Vec::new();
+        if let Err(e) = session_result {
+            errors.push(format!(
+                "failed to finish Binance Futures data session tasks: {e}"
+            ));
+        }
+
+        if let Err(e) = command_result {
+            errors.push(format!(
+                "failed to finish Binance Futures data command tasks: {e}"
+            ));
+        }
+
+        if !errors.is_empty() {
+            anyhow::bail!(errors.join("; "));
+        }
+        Ok(())
+    }
+
+    async fn prepare_task_groups(&mut self) -> anyhow::Result<()> {
+        if !self.session_tasks.is_open() || !self.command_tasks.is_open() {
+            self.teardown_partial_connect().await?;
+            self.session_tasks
+                .start_generation()
+                .context("failed to start Binance Futures data session task generation")?;
+            self.command_tasks
+                .start_generation()
+                .context("failed to start Binance Futures data command task generation")?;
+            self.cancellation_token = self.session_tasks.cancellation_token();
+        }
+        Ok(())
+    }
+
+    async fn teardown_partial_connect(&mut self) -> anyhow::Result<()> {
+        self.session_tasks.begin_shutdown();
+        self.command_tasks.begin_shutdown();
+        self.ws_client.begin_shutdown();
+        self.ws_public_client.begin_shutdown();
+
+        if let Err(e) = self.ws_client.close().await {
+            self.shutdown_errors
+                .push(format!("market WebSocket close failed: {e}"));
+        }
+
+        if let Err(e) = self.ws_public_client.close().await {
+            self.shutdown_errors
+                .push(format!("public WebSocket close failed: {e}"));
+        }
+
+        if let Err(e) = self.finish_tasks().await {
+            self.shutdown_errors.push(e.to_string());
+        }
+        self.is_connected.store(false, Ordering::Release);
+
+        if !self.shutdown_errors.is_empty() {
+            let errors = std::mem::take(&mut self.shutdown_errors);
+            anyhow::bail!(
+                "Binance Futures data teardown failed: {}",
+                errors.join("; ")
+            );
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn refresh_instrument_catalog(
+        http: &BinanceFuturesHttpClient,
+        provider: &crate::config::BinanceInstrumentProviderConfig,
+        instruments_cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+        status_cache: &Arc<AtomicMap<InstrumentId, MarketStatusAction>>,
+        ws: &BinanceFuturesWebSocketClient,
+        ws_public: &BinanceFuturesWebSocketClient,
+        sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        clock: &'static AtomicTime,
+        emit_status_changes: bool,
+    ) -> anyhow::Result<Vec<InstrumentAny>> {
+        let instruments = http
+            .request_instruments_with_config(provider)
+            .await
+            .context("failed to request Binance Futures instruments")?;
+        let venue_statuses = http
+            .request_symbol_statuses()
+            .await
+            .context("failed to request Binance Futures instrument statuses")?;
+
+        let instrument_map = instruments
+            .iter()
+            .map(|instrument| (instrument.id(), instrument.clone()))
+            .collect::<AHashMap<_, _>>();
+        let raw_to_id = instrument_map
+            .values()
+            .map(|instrument| (instrument.raw_symbol().inner(), instrument.id()))
+            .collect::<AHashMap<_, _>>();
+        let status_map = venue_statuses
+            .into_iter()
+            .filter_map(|(symbol, action)| {
+                raw_to_id
+                    .get(&symbol)
+                    .copied()
+                    .map(|instrument_id| (instrument_id, action))
+            })
+            .collect::<AHashMap<_, _>>();
+
+        instruments_cache.store(instrument_map);
+        ws.replace_instruments(&instruments);
+        ws_public.replace_instruments(&instruments);
+
+        if emit_status_changes {
+            let mut cached_statuses = (**status_cache.load()).clone();
+            let ts = clock.get_time_ns();
+            diff_and_emit_statuses(&status_map, &mut cached_statuses, sender, ts, ts);
+            status_cache.store(cached_statuses);
+        } else {
+            status_cache.store(status_map);
+        }
+
+        for instrument in &instruments {
+            if let Err(e) = sender.send(DataEvent::Instrument(instrument.clone())) {
+                log::warn!("Failed to send refreshed Binance Futures instrument: {e}");
+            }
+        }
+
+        Ok(instruments)
     }
 
     fn custom_liquidation_instrument_id(
@@ -331,30 +520,28 @@ impl BinanceFuturesDataClient {
         Ok(period.to_string())
     }
 
-    /// Returns COIN-M historical OI request parameters for the current
-    /// perpetual-only Binance futures instrument surface.
     fn coinm_open_interest_hist_params(
+        http: &BinanceFuturesHttpClient,
         instrument_id: &InstrumentId,
     ) -> anyhow::Result<(String, String)> {
         let symbol = format_binance_symbol(instrument_id);
-        let Some(pair) = symbol.strip_suffix("_PERP") else {
-            anyhow::bail!(
-                "COIN-M open interest history requires a perpetual instrument, received {instrument_id}"
-            );
+        if let Some(pair) = symbol.strip_suffix("_PERP") {
+            return Ok((pair.to_string(), "PERPETUAL".to_string()));
+        }
+
+        let definition = http
+            .instrument_metadata(*instrument_id)
+            .with_context(|| format!("missing COIN-M definition for {instrument_id}"))?;
+        let BinanceFuturesInstrument::CoinM(definition) = definition else {
+            anyhow::bail!("expected a COIN-M definition for {instrument_id}");
         };
 
-        Ok((pair.to_string(), "PERPETUAL".to_string()))
+        Ok((definition.pair.to_string(), definition.contract_type))
     }
 
     fn parse_open_interest_decimal(field: &str, value: &str) -> anyhow::Result<Decimal> {
         Decimal::from_str_exact(value)
             .with_context(|| format!("invalid Binance open interest `{field}` value `{value}`"))
-    }
-
-    fn unix_nanos_from_millis_i64(field: &str, value: i64) -> anyhow::Result<UnixNanos> {
-        let millis = u64::try_from(value)
-            .with_context(|| format!("invalid Binance open interest `{field}` value `{value}`"))?;
-        Ok(UnixNanos::from_millis(millis))
     }
 
     fn liquidation_data_type(instrument_id: InstrumentId) -> DataType {
@@ -467,6 +654,8 @@ impl BinanceFuturesDataClient {
         ws_instruments: &Arc<AtomicMap<Ustr, InstrumentAny>>,
         book_buffers: &Arc<AtomicMap<InstrumentId, BookBuffer>>,
         book_subscriptions: &Arc<AtomicMap<InstrumentId, u32>>,
+        book_unsubscribes_pending: &Arc<AtomicMap<InstrumentId, Vec<BookDrain>>>,
+        l1_book_subscriptions: &Arc<AtomicMap<InstrumentId, u32>>,
         force_order_refs: &Arc<AtomicMap<InstrumentId, u32>>,
         ticker_refs: &Arc<AtomicMap<InstrumentId, u32>>,
         force_order_all_market_refs: &Arc<AtomicU32>,
@@ -474,6 +663,7 @@ impl BinanceFuturesDataClient {
         book_epoch: &Arc<RwLock<u64>>,
         http_client: &BinanceFuturesHttpClient,
         clock: &'static AtomicTime,
+        command_spawner: &TaskSpawner,
     ) {
         let ts_init = clock.get_time_ns();
         let cache = ws_instruments.load();
@@ -498,14 +688,42 @@ impl BinanceFuturesDataClient {
             BinanceFuturesWsStreamsMessage::BookTicker(ref ticker_msg) => {
                 if let Some(instrument) = cache.get(&ticker_msg.symbol) {
                     match parse_book_ticker(ticker_msg, instrument, ts_init) {
-                        Ok(quote) => Self::send_data(data_sender, Data::Quote(quote)),
+                        Ok(quote) => Self::send_top_of_book(
+                            data_sender,
+                            l1_book_subscriptions,
+                            quote,
+                            ticker_msg.update_id,
+                        ),
                         Err(e) => log::warn!("Failed to parse book ticker: {e}"),
                     }
                 }
             }
             BinanceFuturesWsStreamsMessage::DepthUpdate(ref depth_msg) => {
                 if let Some(instrument) = cache.get(&depth_msg.symbol) {
-                    match parse_depth_update(depth_msg, instrument, ts_init) {
+                    let Some(depth) = book_subscriptions.load().get(&instrument.id()).copied()
+                    else {
+                        return;
+                    };
+
+                    // Depth frames carry no stream identity on the wire; drop them until
+                    // the venue confirms the prior stream's unsubscribe, so an in-flight
+                    // frame from the old stream cannot be parsed with the new
+                    // subscription's semantics
+                    if book_drain_active(book_unsubscribes_pending, instrument.id()) {
+                        log::debug!(
+                            "Dropping depth frame for {} with unsubscribe confirmation pending",
+                            instrument.id()
+                        );
+                        return;
+                    }
+
+                    let parsed = if is_partial_book_depth(depth) {
+                        parse_depth_snapshot(depth_msg, instrument, ts_init)
+                    } else {
+                        parse_depth_update(depth_msg, instrument, ts_init)
+                    };
+
+                    match parsed {
                         Ok(deltas) => {
                             let instrument_id = deltas.instrument_id;
                             let final_update_id = deltas.sequence;
@@ -534,10 +752,7 @@ impl BinanceFuturesDataClient {
                                 }
                             }
 
-                            Self::send_data(
-                                data_sender,
-                                Data::Deltas(OrderBookDeltas_API::new(deltas)),
-                            );
+                            Self::send_data(data_sender, Data::BookDeltas(Box::new(deltas)));
                         }
                         Err(e) => log::warn!("Failed to parse depth update: {e}"),
                     }
@@ -546,13 +761,18 @@ impl BinanceFuturesDataClient {
             BinanceFuturesWsStreamsMessage::MarkPrice(ref mark_msg) => {
                 if let Some(instrument) = cache.get(&mark_msg.symbol) {
                     match parse_mark_price(mark_msg, instrument, ts_init) {
-                        Ok((mark_update, index_update, funding_update)) => {
-                            Self::send_data(data_sender, Data::MarkPriceUpdate(mark_update));
-                            Self::send_data(data_sender, Data::IndexPriceUpdate(index_update));
+                        Ok((mark_update, index_update, funding_update, custom_update)) => {
+                            Self::send_data(data_sender, Data::MarkPrice(mark_update));
+                            Self::send_data(data_sender, Data::IndexPrice(index_update));
                             if let Err(e) = data_sender.send(DataEvent::FundingRate(funding_update))
                             {
                                 log::error!("Failed to emit funding rate: {e}");
                             }
+                            let data_type = mark_price_data_type(instrument.id());
+                            Self::send_data(
+                                data_sender,
+                                Data::Custom(CustomData::new(Arc::new(custom_update), data_type)),
+                            );
                         }
                         Err(e) => log::warn!("Failed to parse mark price: {e}"),
                     }
@@ -561,7 +781,14 @@ impl BinanceFuturesDataClient {
             BinanceFuturesWsStreamsMessage::Kline(ref kline_msg) => {
                 if let Some(instrument) = cache.get(&kline_msg.symbol) {
                     match parse_kline(kline_msg, instrument, ts_init) {
-                        Ok(Some(bar)) => Self::send_data(data_sender, Data::Bar(bar)),
+                        Ok(Some(bar)) => {
+                            Self::send_data(data_sender, Data::Bar(bar.bar()));
+                            let data_type = binance_bar_data_type(bar.bar_type);
+                            Self::send_data(
+                                data_sender,
+                                Data::Custom(CustomData::new(Arc::new(bar), data_type)),
+                            );
+                        }
                         Ok(None) => {} // Kline not closed yet
                         Err(e) => log::warn!("Failed to parse kline: {e}"),
                     }
@@ -569,6 +796,11 @@ impl BinanceFuturesDataClient {
             }
             BinanceFuturesWsStreamsMessage::ForceOrder(ref liq_msg) => {
                 if let Some(instrument) = cache.get(&liq_msg.order.symbol) {
+                    let ts_event = parse_millis_or_init(
+                        liq_msg.event_time,
+                        "Futures liquidation event time",
+                        ts_init,
+                    );
                     let parse_price = |value: &str, field: &str| -> anyhow::Result<Price> {
                         parse_required_price_at_precision(
                             value,
@@ -604,7 +836,7 @@ impl BinanceFuturesDataClient {
                                 average_price,
                                 last_filled_qty,
                                 accumulated_qty,
-                                UnixNanos::from_millis(liq_msg.event_time as u64),
+                                ts_event,
                                 ts_init,
                             ));
 
@@ -668,7 +900,6 @@ impl BinanceFuturesDataClient {
                     }
                 }
             }
-            // Execution messages ignored by data client
             BinanceFuturesWsStreamsMessage::AccountUpdate(_)
             | BinanceFuturesWsStreamsMessage::OrderUpdate(_)
             | BinanceFuturesWsStreamsMessage::TradeLite(_)
@@ -683,11 +914,17 @@ impl BinanceFuturesDataClient {
                     e.msg
                 );
             }
-            BinanceFuturesWsStreamsMessage::Reconnected => {
+            BinanceFuturesWsStreamsMessage::Reconnected(abandoned) => {
                 log::info!("WebSocket reconnected, rebuilding order book snapshots");
 
+                // Only unsubscribe lifecycles the reconnecting connection abandoned are
+                // resolved; their confirmations can no longer arrive
+                for generation in abandoned {
+                    remove_book_drain(book_unsubscribes_pending, generation);
+                }
+
                 let epoch = {
-                    let mut guard = book_epoch.write().expect(MUTEX_POISONED);
+                    let mut guard = book_epoch.write();
                     *guard = guard.wrapping_add(1);
                     *guard
                 };
@@ -698,9 +935,13 @@ impl BinanceFuturesDataClient {
                 };
 
                 for (instrument_id, depth) in subs {
+                    if is_partial_book_depth(depth) {
+                        continue;
+                    }
+
                     book_buffers.insert(instrument_id, BookBuffer::new(epoch));
 
-                    log::info!(
+                    log::debug!(
                         "OrderBook snapshot rebuild for {instrument_id} @ depth {depth} \
                         starting (reconnect, epoch={epoch})"
                     );
@@ -710,7 +951,7 @@ impl BinanceFuturesDataClient {
                     let buffers = book_buffers.clone();
                     let insts = instruments.clone();
 
-                    get_runtime().spawn(async move {
+                    if let Err(e) = command_spawner.spawn(async move {
                         Self::fetch_and_emit_snapshot(
                             http,
                             sender,
@@ -722,9 +963,36 @@ impl BinanceFuturesDataClient {
                             clock,
                         )
                         .await;
-                    });
+                    }) {
+                        log::warn!(
+                            "Skipping Binance Futures snapshot rebuild after shutdown began: {e}"
+                        );
+                    }
                 }
             }
+            BinanceFuturesWsStreamsMessage::Unsubscribed {
+                streams,
+                correlation,
+            } => {
+                log::debug!("Unsubscribe confirmed for streams {streams:?}");
+
+                if let Some(correlation) = correlation {
+                    remove_book_drain(book_unsubscribes_pending, correlation);
+                }
+            }
+        }
+    }
+
+    fn send_top_of_book(
+        data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+        l1_book_subscriptions: &Arc<AtomicMap<InstrumentId, u32>>,
+        quote: QuoteTick,
+        sequence: u64,
+    ) {
+        Self::send_data(data_sender, Data::Quote(quote));
+        if l1_book_subscriptions.contains_key(&quote.instrument_id) {
+            let deltas = quote_to_l1_deltas(quote, sequence);
+            Self::send_data(data_sender, Data::BookDeltas(Box::new(deltas)));
         }
     }
 
@@ -783,7 +1051,6 @@ impl BinanceFuturesDataClient {
                 let ts_init = clock.get_time_ns();
                 let last_update_id = order_book.last_update_id as u64;
 
-                // Check if subscription was cancelled or epoch changed
                 {
                     let guard = buffers.load();
                     match guard.get(&instrument_id) {
@@ -806,7 +1073,6 @@ impl BinanceFuturesDataClient {
                     }
                 }
 
-                // Get instrument for precision
                 let (price_precision, size_precision) = {
                     let guard = instruments.load();
                     match guard.get(&instrument_id) {
@@ -902,7 +1168,6 @@ impl BinanceFuturesDataClient {
                     taken
                 };
 
-                // Replay buffered updates with continuity validation
                 let mut replayed = 0;
                 let mut last_final_update_id = last_update_id;
                 let mut is_first = true;
@@ -963,16 +1228,16 @@ impl BinanceFuturesDataClient {
                     replay_ready.push(update);
                 }
 
-                if let Err(e) = sender.send(DataEvent::Data(Data::Deltas(
-                    OrderBookDeltas_API::new(snapshot_deltas),
-                ))) {
+                if let Err(e) =
+                    sender.send(DataEvent::Data(Data::BookDeltas(Box::new(snapshot_deltas))))
+                {
                     log::error!("Failed to send snapshot: {e}");
                 }
 
                 for update in replay_ready {
-                    if let Err(e) = sender.send(DataEvent::Data(Data::Deltas(
-                        OrderBookDeltas_API::new(update.deltas),
-                    ))) {
+                    if let Err(e) =
+                        sender.send(DataEvent::Data(Data::BookDeltas(Box::new(update.deltas))))
+                    {
                         log::error!("Failed to send replayed deltas: {e}");
                     }
                 }
@@ -1048,15 +1313,15 @@ impl BinanceFuturesDataClient {
                         last_final_update_id = update.final_update_id;
                         replayed += 1;
 
-                        if let Err(e) = sender.send(DataEvent::Data(Data::Deltas(
-                            OrderBookDeltas_API::new(update.deltas),
-                        ))) {
+                        if let Err(e) =
+                            sender.send(DataEvent::Data(Data::BookDeltas(Box::new(update.deltas))))
+                        {
                             log::error!("Failed to send replayed deltas: {e}");
                         }
                     }
                 }
 
-                log::info!(
+                log::debug!(
                     "OrderBook snapshot rebuild for {instrument_id} completed \
                     (lastUpdateId={last_update_id}, replayed={replayed})"
                 );
@@ -1199,14 +1464,17 @@ fn parse_order_book_snapshot(
     ts_init: UnixNanos,
 ) -> OrderBookDeltas {
     let sequence = order_book.last_update_id as u64;
-    let ts_event = order_book.transaction_time.map_or(ts_init, |t| {
-        UnixNanos::from((t as u64) * NANOSECONDS_IN_MILLISECOND)
+    let ts_event = order_book.transaction_time.map_or(ts_init, |value| {
+        parse_millis_or_init(
+            value,
+            "Futures order book snapshot transaction time",
+            ts_init,
+        )
     });
 
     let total_levels = order_book.bids.len() + order_book.asks.len();
     let mut deltas = Vec::with_capacity(total_levels + 1);
 
-    // First delta is CLEAR to reset the book
     deltas.push(OrderBookDelta::clear(
         instrument_id,
         sequence,
@@ -1301,7 +1569,10 @@ impl DataClient for BinanceFuturesDataClient {
 
     fn stop(&mut self) -> anyhow::Result<()> {
         log::info!("Stopping {id}", id = self.client_id);
-        self.cancellation_token.cancel();
+        self.session_tasks.begin_shutdown();
+        self.command_tasks.begin_shutdown();
+        self.ws_client.begin_shutdown();
+        self.ws_public_client.begin_shutdown();
         self.is_connected.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -1309,16 +1580,11 @@ impl DataClient for BinanceFuturesDataClient {
     fn reset(&mut self) -> anyhow::Result<()> {
         log::debug!("Resetting {id}", id = self.client_id);
 
-        self.cancellation_token.cancel();
-
-        for task in self.tasks.drain(..) {
-            task.abort();
-        }
-
-        let mut ws = self.ws_client.clone();
-        get_runtime().spawn(async move {
-            let _ = ws.close().await;
-        });
+        self.session_tasks.begin_shutdown();
+        self.command_tasks.begin_shutdown();
+        self.ws_client.begin_shutdown();
+        self.ws_public_client.begin_shutdown();
+        self.is_connected.store(false, Ordering::Relaxed);
 
         // Clear subscription state so resubscribes issue fresh WS subscribes
         self.mark_price_refs.store(AHashMap::new());
@@ -1328,10 +1594,11 @@ impl DataClient for BinanceFuturesDataClient {
         self.force_order_all_market_stream_active
             .store(false, Ordering::Release);
         self.book_subscriptions.store(AHashMap::new());
+        self.book_unsubscribes_pending.store(AHashMap::new());
+        self.l1_book_subscriptions.store(AHashMap::new());
+        self.quote_refs.store(AHashMap::new());
         self.book_buffers.store(AHashMap::new());
 
-        self.is_connected.store(false, Ordering::Relaxed);
-        self.cancellation_token = CancellationToken::new();
         Ok(())
     }
 
@@ -1341,253 +1608,291 @@ impl DataClient for BinanceFuturesDataClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.is_connected() {
+        if self.is_connected() && self.session_tasks.is_open() && self.command_tasks.is_open() {
             return Ok(());
         }
 
         register_binance_custom_data();
 
-        // Reinitialize token in case of reconnection after disconnect
-        self.cancellation_token = CancellationToken::new();
+        self.prepare_task_groups().await?;
+        let ws_client = self.ws_client.clone();
+        let ws_public_client = self.ws_public_client.clone();
+        let setup_guard =
+            TaskGroupGuard::new(&[&self.session_tasks, &self.command_tasks], move || {
+                ws_client.begin_shutdown();
+                ws_public_client.begin_shutdown();
+            });
 
-        let instruments = self
-            .http_client
-            .request_instruments()
-            .await
-            .context("failed to request Binance Futures instruments")?;
+        Self::refresh_instrument_catalog(
+            &self.http_client,
+            &self.config.instrument_provider,
+            &self.instruments,
+            &self.status_cache,
+            &self.ws_client,
+            &self.ws_public_client,
+            &self.data_sender,
+            self.clock,
+            false,
+        )
+        .await?;
 
-        // Seed the status cache from the HTTP client's instruments cache
-        {
-            let mut inst_map = AHashMap::new();
-            let mut status_map = AHashMap::new();
+        let session_result = async {
+            log::info!("Connecting to Binance Futures market WebSocket...");
+            self.ws_client.connect().await.map_err(|e| {
+                log::error!("Binance Futures market WebSocket connection failed: {e:?}");
+                anyhow::anyhow!("failed to connect Binance Futures market WebSocket: {e}")
+            })?;
+            log::info!("Binance Futures market WebSocket connected");
 
-            for instrument in &instruments {
-                inst_map.insert(instrument.id(), instrument.clone());
-            }
+            log::info!("Connecting to Binance Futures public WebSocket...");
+            self.ws_public_client.connect().await.map_err(|e| {
+                log::error!("Binance Futures public WebSocket connection failed: {e:?}");
+                anyhow::anyhow!("failed to connect Binance Futures public WebSocket: {e}")
+            })?;
+            log::info!("Binance Futures public WebSocket connected");
 
-            let http_instruments = self.http_client.instruments_cache();
-            for entry in http_instruments.iter() {
-                let raw_symbol = entry.key();
-                let action = match entry.value() {
-                    crate::futures::http::client::BinanceFuturesInstrument::UsdM(s) => {
-                        MarketStatusAction::from(s.status)
-                    }
-                    crate::futures::http::client::BinanceFuturesInstrument::CoinM(s) => s
-                        .contract_status
-                        .map_or(MarketStatusAction::NotAvailableForTrading, Into::into),
-                };
+            let stream = self.ws_client.stream();
+            let sender = self.data_sender.clone();
+            let insts = self.instruments.clone();
+            let ws_insts = self.ws_client.instruments_cache();
+            let buffers = self.book_buffers.clone();
+            let book_subs = self.book_subscriptions.clone();
+            let book_unsubscribes_pending = self.book_unsubscribes_pending.clone();
+            let l1_book_subs = self.l1_book_subscriptions.clone();
+            let force_order_refs = self.force_order_refs.clone();
+            let ticker_refs = self.ticker_refs.clone();
+            let force_order_all_market_refs = self.force_order_all_market_refs.clone();
+            let force_order_all_market_stream_active =
+                self.force_order_all_market_stream_active.clone();
+            let book_epoch = self.book_epoch.clone();
+            let http = self.http_client.clone();
+            let clock = self.clock;
+            let cancel = self.cancellation_token.clone();
+            let command_spawner = self
+                .command_tasks
+                .spawner()
+                .context("Binance Futures command task admission is closed")?;
 
-                for instrument in &instruments {
-                    if instrument.raw_symbol().as_str() == raw_symbol.as_str() {
-                        status_map.insert(instrument.id(), action);
-                        break;
-                    }
-                }
-            }
-
-            self.instruments.store(inst_map);
-            self.status_cache.store(status_map);
-        }
-
-        for instrument in instruments.clone() {
-            if let Err(e) = self.data_sender.send(DataEvent::Instrument(instrument)) {
-                log::warn!("Failed to send instrument: {e}");
-            }
-        }
-
-        self.ws_client.cache_instruments(&instruments);
-        self.ws_public_client.cache_instruments(&instruments);
-
-        log::info!("Connecting to Binance Futures market WebSocket...");
-        self.ws_client.connect().await.map_err(|e| {
-            log::error!("Binance Futures market WebSocket connection failed: {e:?}");
-            anyhow::anyhow!("failed to connect Binance Futures market WebSocket: {e}")
-        })?;
-        log::info!("Binance Futures market WebSocket connected");
-
-        log::info!("Connecting to Binance Futures public WebSocket...");
-        self.ws_public_client.connect().await.map_err(|e| {
-            log::error!("Binance Futures public WebSocket connection failed: {e:?}");
-            anyhow::anyhow!("failed to connect Binance Futures public WebSocket: {e}")
-        })?;
-        log::info!("Binance Futures public WebSocket connected");
-
-        // Spawn market stream handler
-        let stream = self.ws_client.stream();
-        let sender = self.data_sender.clone();
-        let insts = self.instruments.clone();
-        let ws_insts = self.ws_client.instruments_cache();
-        let buffers = self.book_buffers.clone();
-        let book_subs = self.book_subscriptions.clone();
-        let force_order_refs = self.force_order_refs.clone();
-        let ticker_refs = self.ticker_refs.clone();
-        let force_order_all_market_refs = self.force_order_all_market_refs.clone();
-        let force_order_all_market_stream_active =
-            self.force_order_all_market_stream_active.clone();
-        let book_epoch = self.book_epoch.clone();
-        let http = self.http_client.clone();
-        let clock = self.clock;
-        let cancel = self.cancellation_token.clone();
-
-        let handle = get_runtime().spawn(async move {
-            pin_mut!(stream);
-
-            loop {
-                tokio::select! {
-                    Some(message) = stream.next() => {
-                        Self::handle_ws_message(
-                            message,
-                            &sender,
-                            &insts,
-                            &ws_insts,
-                            &buffers,
-                            &book_subs,
-                            &force_order_refs,
-                            &ticker_refs,
-                            &force_order_all_market_refs,
-                            &force_order_all_market_stream_active,
-                            &book_epoch,
-                            &http,
-                            clock,
-                        );
-                    }
-                    () = cancel.cancelled() => {
-                        log::debug!("Market WebSocket stream task cancelled");
-                        break;
-                    }
-                }
-            }
-        });
-        self.tasks.push(handle);
-
-        // Spawn public stream handler (book data)
-        let pub_stream = self.ws_public_client.stream();
-        let pub_sender = self.data_sender.clone();
-        let pub_insts = self.instruments.clone();
-        let pub_ws_insts = self.ws_public_client.instruments_cache();
-        let pub_buffers = self.book_buffers.clone();
-        let pub_book_subs = self.book_subscriptions.clone();
-        let pub_force_order_refs = self.force_order_refs.clone();
-        let pub_ticker_refs = self.ticker_refs.clone();
-        let pub_force_order_all_market_refs = self.force_order_all_market_refs.clone();
-        let pub_force_order_all_market_stream_active =
-            self.force_order_all_market_stream_active.clone();
-        let pub_book_epoch = self.book_epoch.clone();
-        let pub_http = self.http_client.clone();
-        let pub_cancel = self.cancellation_token.clone();
-
-        let pub_handle = get_runtime().spawn(async move {
-            pin_mut!(pub_stream);
-
-            loop {
-                tokio::select! {
-                    Some(message) = pub_stream.next() => {
-                        Self::handle_ws_message(
-                            message,
-                            &pub_sender,
-                            &pub_insts,
-                            &pub_ws_insts,
-                            &pub_buffers,
-                            &pub_book_subs,
-                            &pub_force_order_refs,
-                            &pub_ticker_refs,
-                            &pub_force_order_all_market_refs,
-                            &pub_force_order_all_market_stream_active,
-                            &pub_book_epoch,
-                            &pub_http,
-                            clock,
-                        );
-                    }
-                    () = pub_cancel.cancelled() => {
-                        log::debug!("Public WebSocket stream task cancelled");
-                        break;
-                    }
-                }
-            }
-        });
-        self.tasks.push(pub_handle);
-
-        // Spawn instrument status polling task
-        let poll_secs = self.config.instrument_status_poll_secs;
-        if poll_secs > 0 {
-            let poll_http = self.http_client.clone();
-            let poll_sender = self.data_sender.clone();
-            let poll_instruments = self.instruments.clone();
-            let poll_status_cache = self.status_cache.clone();
-            let poll_cancel = self.cancellation_token.clone();
-            let poll_clock = self.clock;
-
-            let poll_handle = get_runtime().spawn(async move {
-                let mut interval =
-                    tokio::time::interval(tokio::time::Duration::from_secs(poll_secs));
-                interval.tick().await; // Skip first immediate tick
+            let future = async move {
+                pin_mut!(stream);
 
                 loop {
                     tokio::select! {
-                        _ = interval.tick() => {
-                            match poll_http.request_symbol_statuses().await {
-                                Ok(symbol_statuses) => {
-                                    let ts = poll_clock.get_time_ns();
-                                    let inst_guard = poll_instruments.load();
-
-                                    // Build raw_symbol -> InstrumentId lookup
-                                    let raw_to_id: AHashMap<Ustr, InstrumentId> = inst_guard
-                                        .values()
-                                        .map(|inst| (inst.raw_symbol().inner(), inst.id()))
-                                        .collect();
-
-                                    let mut new_statuses = AHashMap::new();
-
-                                    for (raw_symbol, action) in &symbol_statuses {
-                                        if let Some(&id) = raw_to_id.get(raw_symbol) {
-                                            new_statuses.insert(id, *action);
-                                        }
-                                    }
-                                    drop(inst_guard);
-
-                                    let mut cache = (**poll_status_cache.load()).clone();
-                                    diff_and_emit_statuses(
-                                        &new_statuses, &mut cache, &poll_sender, ts, ts,
-                                    );
-                                    poll_status_cache.store(cache);
-                                }
-                                Err(e) => {
-                                    log::warn!("Futures instrument status poll failed: {e}");
-                                }
-                            }
+                        Some(message) = stream.next() => {
+                            Self::handle_ws_message(
+                                message,
+                                &sender,
+                                &insts,
+                                &ws_insts,
+                                &buffers,
+                                &book_subs,
+                                &book_unsubscribes_pending,
+                                &l1_book_subs,
+                                &force_order_refs,
+                                &ticker_refs,
+                                &force_order_all_market_refs,
+                                &force_order_all_market_stream_active,
+                                &book_epoch,
+                                &http,
+                                clock,
+                                &command_spawner,
+                            );
                         }
-                        () = poll_cancel.cancelled() => {
-                            log::debug!("Futures instrument status polling task cancelled");
+                        () = cancel.cancelled() => {
+                            log::debug!("Market WebSocket stream task cancelled");
                             break;
                         }
                     }
                 }
-            });
-            self.tasks.push(poll_handle);
-            log::info!("Futures instrument status polling started: interval={poll_secs}s");
+            };
+            self.session_tasks
+                .spawn(future)
+                .context("failed to register Binance Futures market stream task")?;
+
+            let pub_stream = self.ws_public_client.stream();
+            let pub_sender = self.data_sender.clone();
+            let pub_insts = self.instruments.clone();
+            let pub_ws_insts = self.ws_public_client.instruments_cache();
+            let pub_buffers = self.book_buffers.clone();
+            let pub_book_subs = self.book_subscriptions.clone();
+            let pub_book_unsubscribes_pending = self.book_unsubscribes_pending.clone();
+            let pub_l1_book_subs = self.l1_book_subscriptions.clone();
+            let pub_force_order_refs = self.force_order_refs.clone();
+            let pub_ticker_refs = self.ticker_refs.clone();
+            let pub_force_order_all_market_refs = self.force_order_all_market_refs.clone();
+            let pub_force_order_all_market_stream_active =
+                self.force_order_all_market_stream_active.clone();
+            let pub_book_epoch = self.book_epoch.clone();
+            let pub_http = self.http_client.clone();
+            let pub_cancel = self.cancellation_token.clone();
+            let pub_command_spawner = self
+                .command_tasks
+                .spawner()
+                .context("Binance Futures command task admission is closed")?;
+
+            let future = async move {
+                pin_mut!(pub_stream);
+
+                loop {
+                    tokio::select! {
+                        Some(message) = pub_stream.next() => {
+                            Self::handle_ws_message(
+                                message,
+                                &pub_sender,
+                                &pub_insts,
+                                &pub_ws_insts,
+                                &pub_buffers,
+                                &pub_book_subs,
+                                &pub_book_unsubscribes_pending,
+                                &pub_l1_book_subs,
+                                &pub_force_order_refs,
+                                &pub_ticker_refs,
+                                &pub_force_order_all_market_refs,
+                                &pub_force_order_all_market_stream_active,
+                                &pub_book_epoch,
+                                &pub_http,
+                                clock,
+                                &pub_command_spawner,
+                            );
+                        }
+                        () = pub_cancel.cancelled() => {
+                            log::debug!("Public WebSocket stream task cancelled");
+                            break;
+                        }
+                    }
+                }
+            };
+            self.session_tasks
+                .spawn(future)
+                .context("failed to register Binance Futures public stream task")?;
+
+            let poll_secs = self.config.instrument_status_poll_secs;
+            if poll_secs > 0 {
+                let poll_http = self.http_client.clone();
+                let poll_sender = self.data_sender.clone();
+                let poll_instruments = self.instruments.clone();
+                let poll_status_cache = self.status_cache.clone();
+                let poll_cancel = self.cancellation_token.clone();
+                let poll_clock = self.clock;
+
+                let future = async move {
+                    let mut interval =
+                        tokio::time::interval(tokio::time::Duration::from_secs(poll_secs));
+                    interval.tick().await; // Skip first immediate tick
+
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                match poll_http.request_symbol_statuses().await {
+                                    Ok(symbol_statuses) => {
+                                        let ts = poll_clock.get_time_ns();
+                                        let inst_guard = poll_instruments.load();
+
+                                        let raw_to_id: AHashMap<Ustr, InstrumentId> = inst_guard
+                                            .values()
+                                            .map(|inst| (inst.raw_symbol().inner(), inst.id()))
+                                            .collect();
+
+                                        let mut new_statuses = AHashMap::new();
+
+                                        for (raw_symbol, action) in &symbol_statuses {
+                                            if let Some(&id) = raw_to_id.get(raw_symbol) {
+                                                new_statuses.insert(id, *action);
+                                            }
+                                        }
+                                        drop(inst_guard);
+
+                                        let mut cache = (**poll_status_cache.load()).clone();
+                                        diff_and_emit_statuses(
+                                            &new_statuses, &mut cache, &poll_sender, ts, ts,
+                                        );
+                                        poll_status_cache.store(cache);
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Futures instrument status poll failed: {e}");
+                                    }
+                                }
+                            }
+                            () = poll_cancel.cancelled() => {
+                                log::debug!("Futures instrument status polling task cancelled");
+                                break;
+                            }
+                        }
+                    }
+                };
+                self.session_tasks
+                    .spawn(future)
+                    .context("failed to register Binance Futures status polling task")?;
+                log::debug!("Futures instrument status polling started: interval={poll_secs}s");
+            }
+
+            let refresh_secs = self.config.instrument_refresh_interval_secs;
+            if refresh_secs > 0 {
+                let http = self.http_client.clone();
+                let provider = self.config.instrument_provider.clone();
+                let instruments = self.instruments.clone();
+                let statuses = self.status_cache.clone();
+                let ws = self.ws_client.clone();
+                let ws_public = self.ws_public_client.clone();
+                let sender = self.data_sender.clone();
+                let clock = self.clock;
+                let cancel = self.cancellation_token.clone();
+
+                let future = async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(refresh_secs));
+                    interval.tick().await;
+
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                if let Err(e) = Self::refresh_instrument_catalog(
+                                    &http,
+                                    &provider,
+                                    &instruments,
+                                    &statuses,
+                                    &ws,
+                                    &ws_public,
+                                    &sender,
+                                    clock,
+                                    true,
+                                ).await {
+                                    log::warn!("Binance Futures instrument refresh failed: {e}");
+                                }
+                            }
+                            () = cancel.cancelled() => {
+                                log::debug!("Binance Futures instrument refresh task cancelled");
+                                break;
+                            }
+                        }
+                    }
+                };
+                self.session_tasks
+                    .spawn(future)
+                    .context("failed to register Binance Futures instrument refresh task")?;
+                log::debug!("Futures instrument refresh started: interval={refresh_secs}s");
+            }
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(e) = session_result {
+            if let Err(teardown_error) = self.teardown_partial_connect().await {
+                return Err(e.context(format!(
+                    "Binance Futures data startup teardown failed: {teardown_error}"
+                )));
+            }
+            return Err(e);
         }
 
+        setup_guard.disarm();
         self.is_connected.store(true, Ordering::Release);
         log::info!("Connected: client_id={}", self.client_id);
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        if self.is_disconnected() {
-            return Ok(());
-        }
-
-        self.cancellation_token.cancel();
-
-        let _ = self.ws_client.close().await;
-        let _ = self.ws_public_client.close().await;
-
-        let handles: Vec<_> = self.tasks.drain(..).collect();
-        for handle in handles {
-            if let Err(e) = handle.await {
-                log::error!("Error joining WebSocket task: {e}");
-            }
-        }
+        self.teardown_partial_connect().await?;
 
         // Clear subscription state so resubscribes issue fresh WS subscribes
         self.mark_price_refs.store(AHashMap::new());
@@ -1597,6 +1902,9 @@ impl DataClient for BinanceFuturesDataClient {
         self.force_order_all_market_stream_active
             .store(false, Ordering::Release);
         self.book_subscriptions.store(AHashMap::new());
+        self.book_unsubscribes_pending.store(AHashMap::new());
+        self.l1_book_subscriptions.store(AHashMap::new());
+        self.quote_refs.store(AHashMap::new());
         self.book_buffers.store(AHashMap::new());
 
         self.is_connected.store(false, Ordering::Release);
@@ -1616,6 +1924,42 @@ impl DataClient for BinanceFuturesDataClient {
         let data_type = cmd.data_type.type_name();
         if data_type == "BinanceFuturesTicker" {
             return subscribe_ticker(self, &cmd.data_type);
+        }
+
+        if data_type == "BinanceFuturesMarkPriceUpdate" {
+            let instrument_id = Self::required_instrument_id_metadata(&cmd.data_type)?;
+            anyhow::ensure!(
+                instrument_id.venue == self.venue(),
+                "Futures mark price requires a BINANCE instrument"
+            );
+            let should_subscribe = {
+                let previous = self
+                    .mark_price_refs
+                    .load()
+                    .get(&instrument_id)
+                    .copied()
+                    .unwrap_or(0);
+                self.mark_price_refs
+                    .rcu(|refs| *refs.entry(instrument_id).or_insert(0) += 1);
+                previous == 0
+            };
+
+            if should_subscribe {
+                let ws = self.ws_client.clone();
+                let stream = format!(
+                    "{}@markPrice@1s",
+                    format_binance_stream_symbol(&instrument_id)
+                );
+                self.spawn_ws(
+                    async move {
+                        ws.subscribe(vec![stream])
+                            .await
+                            .context("mark price custom subscription")
+                    },
+                    "mark price custom subscription",
+                );
+            }
+            return Ok(());
         }
 
         if data_type != "BinanceFuturesLiquidation" {
@@ -1696,9 +2040,29 @@ impl DataClient for BinanceFuturesDataClient {
     }
 
     fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
-        if cmd.book_type != BookType::L2_MBP {
-            anyhow::bail!("Binance Futures only supports L2_MBP order book deltas");
+        if cmd.book_type == BookType::L1_MBP {
+            anyhow::ensure!(
+                cmd.depth.is_none_or(|depth| depth.get() == 1),
+                "Binance Futures L1_MBP supports depth 1 only"
+            );
+            anyhow::ensure!(
+                !self.book_subscriptions.contains_key(&cmd.instrument_id),
+                "cannot subscribe L1_MBP and L2_MBP for the same Binance Futures instrument"
+            );
+            self.l1_book_subscriptions.rcu(|subscriptions| {
+                *subscriptions.entry(cmd.instrument_id).or_insert(0) += 1;
+            });
+            self.subscribe_top_of_book(cmd.instrument_id);
+            return Ok(());
         }
+
+        if cmd.book_type != BookType::L2_MBP {
+            anyhow::bail!("Binance Futures supports L1_MBP and L2_MBP order book subscriptions");
+        }
+        anyhow::ensure!(
+            !self.l1_book_subscriptions.contains_key(&cmd.instrument_id),
+            "cannot subscribe L1_MBP and L2_MBP for the same Binance Futures instrument"
+        );
 
         let instrument_id = cmd.instrument_id;
         let depth = cmd.depth.map_or(1000, |d| d.get() as u32);
@@ -1710,43 +2074,78 @@ impl DataClient for BinanceFuturesDataClient {
             );
         }
 
-        // Track subscription for reconnect handling
+        if let Some(existing) = self.book_subscriptions.load().get(&instrument_id) {
+            anyhow::ensure!(
+                *existing == depth,
+                "Binance Futures book depth cannot change while subscribed"
+            );
+        }
+
+        // Establish gate protection before publishing the new semantics, so a
+        // concurrent consumer cannot parse an old-stream frame with them
+        let stream = book_stream(&instrument_id, depth);
+        revive_book_drains(&self.book_unsubscribes_pending, instrument_id, &stream);
+
         self.book_subscriptions.insert(instrument_id, depth);
+
+        // A resubscription to the drained stream carries identical frame semantics, so
+        // the gate no longer needs to hold for it; its confirmation may never arrive
+        satisfy_book_drain(&self.book_unsubscribes_pending, instrument_id, &stream);
+
+        if is_partial_book_depth(depth) {
+            let ws = self.ws_public_client.clone();
+            let (wait, done) = self.chain_book_command();
+            self.spawn_ws(
+                async move {
+                    wait.await;
+                    let result = ws
+                        .subscribe(vec![stream])
+                        .await
+                        .context("book deltas subscription");
+                    let _ = done.send(());
+                    result
+                },
+                "order book subscription",
+            );
+            return Ok(());
+        }
 
         // Bump epoch to invalidate any in-flight snapshot from a prior subscription
         let epoch = {
-            let mut guard = self.book_epoch.write().expect(MUTEX_POISONED);
+            let mut guard = self.book_epoch.write();
             *guard = guard.wrapping_add(1);
             *guard
         };
 
-        // Start buffering deltas for this instrument
         self.book_buffers
             .insert(instrument_id, BookBuffer::new(epoch));
 
-        log::info!("OrderBook snapshot rebuild for {instrument_id} @ depth {depth} starting");
+        log::debug!("OrderBook snapshot rebuild for {instrument_id} @ depth {depth} starting");
 
         // Subscribe to the unthrottled diff depth stream for Futures.
         let ws = self.ws_public_client.clone();
-        let stream = format!("{}@depth@0ms", format_binance_stream_symbol(&instrument_id));
+        let (wait, done) = self.chain_book_command();
 
         self.spawn_ws(
             async move {
-                ws.subscribe(vec![stream])
+                wait.await;
+                let result = ws
+                    .subscribe(vec![stream])
                     .await
-                    .context("book deltas subscription")
+                    .context("book deltas subscription");
+                let _ = done.send(());
+                result
             },
             "order book subscription",
         );
 
-        // Spawn task to fetch HTTP snapshot and replay buffered deltas
         let http = self.http_client.clone();
         let sender = self.data_sender.clone();
         let buffers = self.book_buffers.clone();
         let instruments = self.instruments.clone();
         let clock = self.clock;
 
-        get_runtime().spawn(async move {
+        self.spawn_command(async move {
             Self::fetch_and_emit_snapshot(
                 http,
                 sender,
@@ -1764,23 +2163,7 @@ impl DataClient for BinanceFuturesDataClient {
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
-        let ws = self.ws_public_client.clone();
-
-        // Binance Futures uses bookTicker for best bid/ask (public endpoint)
-        let stream = format!(
-            "{}@bookTicker",
-            format_binance_stream_symbol(&instrument_id)
-        );
-
-        self.spawn_ws(
-            async move {
-                ws.subscribe(vec![stream])
-                    .await
-                    .context("quotes subscription")
-            },
-            "quote subscription",
-        );
+        self.subscribe_top_of_book(cmd.instrument_id);
         Ok(())
     }
 
@@ -1806,6 +2189,10 @@ impl DataClient for BinanceFuturesDataClient {
         let bar_type = cmd.bar_type;
         let ws = self.ws_client.clone();
         let interval = bar_spec_to_binance_interval(bar_type.spec())?;
+        anyhow::ensure!(
+            interval != crate::common::enums::BinanceKlineInterval::Second1,
+            "Binance Futures does not support second-level kline intervals"
+        );
 
         let stream = format!(
             "{}@kline_{}",
@@ -1827,7 +2214,6 @@ impl DataClient for BinanceFuturesDataClient {
     fn subscribe_mark_prices(&mut self, cmd: SubscribeMarkPrices) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
 
-        // Mark/index/funding share the same stream - use ref counting
         let should_subscribe = {
             let prev = self
                 .mark_price_refs
@@ -1864,7 +2250,6 @@ impl DataClient for BinanceFuturesDataClient {
     fn subscribe_index_prices(&mut self, cmd: SubscribeIndexPrices) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
 
-        // Mark/index/funding share the same stream - use ref counting
         let should_subscribe = {
             let prev = self
                 .mark_price_refs
@@ -1947,27 +2332,72 @@ impl DataClient for BinanceFuturesDataClient {
 
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
+
+        if let Some(count) = self
+            .l1_book_subscriptions
+            .load()
+            .get(&instrument_id)
+            .copied()
+        {
+            if count == 1 {
+                self.l1_book_subscriptions.remove(&instrument_id);
+            } else {
+                self.l1_book_subscriptions.rcu(|subscriptions| {
+                    if let Some(existing) = subscriptions.get_mut(&instrument_id) {
+                        *existing -= 1;
+                    }
+                });
+            }
+            self.unsubscribe_top_of_book(instrument_id);
+            return Ok(());
+        }
         let ws = self.ws_public_client.clone();
 
-        // Remove subscription tracking
+        let Some(depth) = self.book_subscriptions.load().get(&instrument_id).copied() else {
+            return Ok(());
+        };
         self.book_subscriptions.remove(&instrument_id);
 
         // Remove buffer to prevent snapshot task from emitting after unsubscribe
         self.book_buffers.remove(&instrument_id);
 
-        let symbol_lower = format_binance_stream_symbol(&instrument_id);
-        let streams = vec![
-            format!("{symbol_lower}@depth"),
-            format!("{symbol_lower}@depth@0ms"),
-            format!("{symbol_lower}@depth@100ms"),
-            format!("{symbol_lower}@depth@500ms"),
-        ];
+        let stream = book_stream(&instrument_id, depth);
+        let generation = self.book_drain_generation;
+        self.book_drain_generation += 1;
 
+        // Gate depth frames on the venue's unsubscribe confirmation. Arm eagerly so a
+        // not-yet-registered subscribe cannot slip frames past the gate; the spawned
+        // task disarms when the pool reports no unsubscribe was sent
+        arm_book_drain(
+            &self.book_unsubscribes_pending,
+            instrument_id,
+            generation,
+            &stream,
+        );
+
+        let book_unsubscribes_pending = self.book_unsubscribes_pending.clone();
+        let (wait, done) = self.chain_book_command();
         self.spawn_ws(
             async move {
-                ws.unsubscribe(streams)
+                wait.await;
+                let sent = ws
+                    .unsubscribe_correlated(vec![stream.clone()], generation)
                     .await
-                    .context("book deltas unsubscribe")
+                    .context("book deltas unsubscribe");
+
+                let result = match sent {
+                    Ok(sent) if sent.contains(&stream) => Ok(()),
+                    Ok(_) => {
+                        remove_book_drain(&book_unsubscribes_pending, generation);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        remove_book_drain(&book_unsubscribes_pending, generation);
+                        Err(e)
+                    }
+                };
+                let _ = done.send(());
+                result
             },
             "order book unsubscribe",
         );
@@ -1975,22 +2405,7 @@ impl DataClient for BinanceFuturesDataClient {
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
-        let instrument_id = cmd.instrument_id;
-        let ws = self.ws_public_client.clone();
-
-        let stream = format!(
-            "{}@bookTicker",
-            format_binance_stream_symbol(&instrument_id)
-        );
-
-        self.spawn_ws(
-            async move {
-                ws.unsubscribe(vec![stream])
-                    .await
-                    .context("quotes unsubscribe")
-            },
-            "quote unsubscribe",
-        );
+        self.unsubscribe_top_of_book(cmd.instrument_id);
         Ok(())
     }
 
@@ -2005,6 +2420,7 @@ impl DataClient for BinanceFuturesDataClient {
                 ws.unsubscribe(vec![stream])
                     .await
                     .context("trades unsubscribe")
+                    .map(|_| ())
             },
             "trade unsubscribe",
         );
@@ -2015,6 +2431,44 @@ impl DataClient for BinanceFuturesDataClient {
         let data_type = cmd.data_type.type_name();
         if data_type == "BinanceFuturesTicker" {
             return unsubscribe_ticker(self, &cmd.data_type);
+        }
+
+        if data_type == "BinanceFuturesMarkPriceUpdate" {
+            let instrument_id = Self::required_instrument_id_metadata(&cmd.data_type)?;
+            let should_unsubscribe = match self.mark_price_refs.load().get(&instrument_id).copied()
+            {
+                Some(1) => {
+                    self.mark_price_refs.remove(&instrument_id);
+                    true
+                }
+                Some(count) if count > 1 => {
+                    self.mark_price_refs.rcu(|refs| {
+                        if let Some(existing) = refs.get_mut(&instrument_id) {
+                            *existing -= 1;
+                        }
+                    });
+                    false
+                }
+                _ => false,
+            };
+
+            if should_unsubscribe {
+                let ws = self.ws_client.clone();
+                let stream = format!(
+                    "{}@markPrice@1s",
+                    format_binance_stream_symbol(&instrument_id)
+                );
+                self.spawn_ws(
+                    async move {
+                        ws.unsubscribe(vec![stream])
+                            .await
+                            .context("mark price custom unsubscribe")
+                            .map(|_| ())
+                    },
+                    "mark price custom unsubscribe",
+                );
+            }
+            return Ok(());
         }
 
         if data_type != "BinanceFuturesLiquidation" {
@@ -2069,6 +2523,7 @@ impl DataClient for BinanceFuturesDataClient {
                         ws.unsubscribe(vec![stream])
                             .await
                             .context("forceOrder unsubscribe")
+                            .map(|_| ())
                     },
                     "forceOrder unsubscribe",
                 );
@@ -2079,7 +2534,7 @@ impl DataClient for BinanceFuturesDataClient {
 
         let should_unsubscribe = self
             .force_order_all_market_refs
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 if current == 0 {
                     None
                 } else {
@@ -2087,6 +2542,7 @@ impl DataClient for BinanceFuturesDataClient {
                 }
             })
             .is_ok_and(|prev| prev == 1);
+
         if should_unsubscribe {
             self.spawn_liquidation_stream_reconcile("all-market forceOrder unsubscribe");
         }
@@ -2110,6 +2566,7 @@ impl DataClient for BinanceFuturesDataClient {
                 ws.unsubscribe(vec![stream])
                     .await
                     .context("bars unsubscribe")
+                    .map(|_| ())
             },
             "bar unsubscribe",
         );
@@ -2119,7 +2576,6 @@ impl DataClient for BinanceFuturesDataClient {
     fn unsubscribe_mark_prices(&mut self, cmd: &UnsubscribeMarkPrices) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
 
-        // Mark/index/funding share the same stream - use ref counting
         let should_unsubscribe = {
             let prev = self.mark_price_refs.load().get(&instrument_id).copied();
             match prev {
@@ -2153,6 +2609,7 @@ impl DataClient for BinanceFuturesDataClient {
                     ws.unsubscribe(streams)
                         .await
                         .context("mark prices unsubscribe")
+                        .map(|_| ())
                 },
                 "mark prices unsubscribe",
             );
@@ -2163,7 +2620,6 @@ impl DataClient for BinanceFuturesDataClient {
     fn unsubscribe_index_prices(&mut self, cmd: &UnsubscribeIndexPrices) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
 
-        // Mark/index/funding share the same stream - use ref counting
         let should_unsubscribe = {
             let prev = self.mark_price_refs.load().get(&instrument_id).copied();
             match prev {
@@ -2197,6 +2653,7 @@ impl DataClient for BinanceFuturesDataClient {
                     ws.unsubscribe(streams)
                         .await
                         .context("index prices unsubscribe")
+                        .map(|_| ())
                 },
                 "index prices unsubscribe",
             );
@@ -2240,6 +2697,7 @@ impl DataClient for BinanceFuturesDataClient {
                     ws.unsubscribe(streams)
                         .await
                         .context("funding rates unsubscribe")
+                        .map(|_| ())
                 },
                 "funding rates unsubscribe",
             );
@@ -2269,11 +2727,12 @@ impl DataClient for BinanceFuturesDataClient {
         let end = request.end;
         let params = request.params;
         let clock = self.clock;
+        let provider = self.config.instrument_provider.clone();
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
 
-        get_runtime().spawn(async move {
-            match http.request_instruments().await {
+        self.spawn_command(async move {
+            match http.request_instruments_with_config(&provider).await {
                 Ok(instruments) => {
                     for instrument in &instruments {
                         upsert_instrument(&instruments_cache, instrument.clone());
@@ -2312,11 +2771,12 @@ impl DataClient for BinanceFuturesDataClient {
         let end = request.end;
         let params = request.params;
         let clock = self.clock;
+        let provider = self.config.instrument_provider.clone();
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
 
-        get_runtime().spawn(async move {
-            match http.request_instruments().await {
+        self.spawn_command(async move {
+            match http.request_instruments_with_config(&provider).await {
                 Ok(all_instruments) => {
                     for instrument in &all_instruments {
                         upsert_instrument(&instruments, instrument.clone());
@@ -2360,6 +2820,57 @@ impl DataClient for BinanceFuturesDataClient {
         let data_type = request.data_type.clone();
         let data_type_name = data_type.type_name().to_string();
 
+        if data_type_name == "BinanceBar" {
+            let bar_type = parse_binance_bar_type(&data_type)?;
+            anyhow::ensure!(
+                bar_type.aggregation_source() == AggregationSource::External,
+                "historical BinanceBar requests require EXTERNAL aggregation"
+            );
+            anyhow::ensure!(
+                bar_type.spec().price_type == PriceType::Last,
+                "historical BinanceBar requests require LAST price type"
+            );
+            anyhow::ensure!(
+                bar_type.spec().is_time_aggregated(),
+                "historical BinanceBar requests require time aggregation"
+            );
+            let http = self.http_client.clone();
+            let sender = self.data_sender.clone();
+            let request_id = request.request_id;
+            let client_id = request.client_id;
+            let start = request.start;
+            let end = request.end;
+            let limit = request.limit.map(|value| value.get() as u32);
+            let params = request.params;
+            let clock = self.clock;
+            let venue = self.venue();
+            let start_nanos = datetime_to_unix_nanos(start);
+            let end_nanos = datetime_to_unix_nanos(end);
+            self.spawn_command(async move {
+                match http.request_binance_bars(bar_type, start, end, limit).await {
+                    Ok(bars) => {
+                        let response = DataResponse::Data(CustomDataResponse::new(
+                            request_id,
+                            client_id,
+                            Some(venue),
+                            data_type,
+                            bars,
+                            start_nanos,
+                            end_nanos,
+                            clock.get_time_ns(),
+                            params,
+                        ));
+
+                        if let Err(e) = sender.send(DataEvent::Response(response)) {
+                            log::error!("Failed to send BinanceBar response: {e}");
+                        }
+                    }
+                    Err(e) => log::error!("BinanceBar request failed for {bar_type}: {e:?}"),
+                }
+            });
+            return Ok(());
+        }
+
         if data_type_name != "BinanceFuturesOpenInterest"
             && data_type_name != "BinanceFuturesOpenInterestHist"
         {
@@ -2391,10 +2902,10 @@ impl DataClient for BinanceFuturesDataClient {
         let limit = request.limit.map(|n| n.get() as u32);
         let start_nanos = datetime_to_unix_nanos(request.start);
         let end_nanos = datetime_to_unix_nanos(request.end);
-        let start_ms = request.start.map(|dt| dt.timestamp_millis());
-        let end_ms = request.end.map(|dt| dt.timestamp_millis());
+        let start_ms = request.start.map(|dt| dt.as_millisecond());
+        let end_ms = request.end.map(|dt| dt.as_millisecond());
 
-        get_runtime().spawn(async move {
+        self.spawn_command(async move {
             let response = if data_type_name == "BinanceFuturesOpenInterest" {
                 let response_data_type = data_type.clone();
                 let query = BinanceOpenInterestParams {
@@ -2420,8 +2931,10 @@ impl DataClient for BinanceFuturesDataClient {
                                 return;
                             }
                         };
-                        let ts_event =
-                            match Self::unix_nanos_from_millis_i64("time", open_interest.time) {
+                        let ts_event = match parse_millis(
+                            open_interest.time,
+                            "Futures open interest time",
+                        ) {
                                 Ok(value) => value,
                                 Err(e) => {
                                     log::error!(
@@ -2470,7 +2983,7 @@ impl DataClient for BinanceFuturesDataClient {
                     },
                     BinanceProductType::CoinM => {
                         let (pair, contract_type) =
-                            match Self::coinm_open_interest_hist_params(&instrument_id) {
+                            match Self::coinm_open_interest_hist_params(&http, &instrument_id) {
                                 Ok(values) => values,
                                 Err(e) => {
                                     log::error!(
@@ -2516,9 +3029,9 @@ impl DataClient for BinanceFuturesDataClient {
                                         "sum_open_interest_value",
                                         &point.sum_open_interest_value,
                                     )?,
-                                    Self::unix_nanos_from_millis_i64(
-                                        "timestamp",
+                                    parse_millis(
                                         point.timestamp,
+                                        "Futures historical open interest timestamp",
                                     )?,
                                 ))
                             })
@@ -2584,13 +3097,22 @@ impl DataClient for BinanceFuturesDataClient {
         let clock = self.clock;
         let start_nanos = datetime_to_unix_nanos(request.start);
         let end_nanos = datetime_to_unix_nanos(request.end);
+        let start = request.start;
+        let end = request.end;
+        anyhow::ensure!(
+            limit.is_none_or(|value| value <= 1000),
+            "Binance Futures trade limit must not exceed 1000"
+        );
 
-        get_runtime().spawn(async move {
-            match http
-                .request_trades(instrument_id, limit)
-                .await
-                .context("failed to request trades from Binance Futures")
-            {
+        self.spawn_command(async move {
+            let result = if start.is_some() || end.is_some() {
+                http.request_agg_trades(instrument_id, start, end, limit)
+                    .await
+            } else {
+                http.request_trades(instrument_id, limit).await
+            };
+
+            match result.context("failed to request trades from Binance Futures") {
                 Ok(trades) => {
                     let response = DataResponse::Trades(TradesResponse::new(
                         request_id,
@@ -2628,7 +3150,7 @@ impl DataClient for BinanceFuturesDataClient {
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
 
-        get_runtime().spawn(async move {
+        self.spawn_command(async move {
             match http
                 .request_funding_rates(instrument_id, start, end, limit)
                 .await
@@ -2670,13 +3192,23 @@ impl DataClient for BinanceFuturesDataClient {
         let clock = self.clock;
         let start_nanos = datetime_to_unix_nanos(start);
         let end_nanos = datetime_to_unix_nanos(end);
+        anyhow::ensure!(
+            bar_type.aggregation_source() == AggregationSource::External,
+            "Binance historical bars require EXTERNAL aggregation"
+        );
+        anyhow::ensure!(
+            bar_type.spec().price_type == PriceType::Last,
+            "Binance historical bars require LAST price type"
+        );
+        anyhow::ensure!(
+            bar_type.spec().is_time_aggregated(),
+            "Binance historical bars require time aggregation"
+        );
 
-        get_runtime().spawn(async move {
-            match http
-                .request_bars(bar_type, start, end, limit)
-                .await
-                .context("failed to request bars from Binance Futures")
-            {
+        self.spawn_command(async move {
+            let result = http.request_bars(bar_type, start, end, limit).await;
+
+            match result.context("failed to request bars from Binance Futures") {
                 Ok(bars) => {
                     let response = DataResponse::Bars(BarsResponse::new(
                         request_id,
@@ -2699,6 +3231,222 @@ impl DataClient for BinanceFuturesDataClient {
 
         Ok(())
     }
+
+    fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
+        let depth = request.depth.map_or(1000, |value| value.get() as u32);
+        anyhow::ensure!(
+            BINANCE_BOOK_DEPTHS.contains(&depth),
+            "invalid Binance Futures order-book depth {depth}; valid values are {BINANCE_BOOK_DEPTHS:?}"
+        );
+        let http = self.http_client.clone();
+        let sender = self.data_sender.clone();
+        let instrument_id = request.instrument_id;
+        let request_id = request.request_id;
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        let params = request.params;
+        let clock = self.clock;
+
+        self.spawn_command(async move {
+            match http.request_book_snapshot(instrument_id, Some(depth)).await {
+                Ok(book) => {
+                    let response = DataResponse::Book(BookResponse::new(
+                        request_id,
+                        client_id,
+                        instrument_id,
+                        book,
+                        None,
+                        None,
+                        clock.get_time_ns(),
+                        params,
+                    ));
+
+                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Failed to send book snapshot response: {e}");
+                    }
+                }
+                Err(e) => log::error!("Book snapshot request failed for {instrument_id}: {e:?}"),
+            }
+        });
+        Ok(())
+    }
+}
+
+impl BinanceFuturesDataClient {
+    fn subscribe_top_of_book(&self, instrument_id: InstrumentId) {
+        let should_subscribe = {
+            let previous = self
+                .quote_refs
+                .load()
+                .get(&instrument_id)
+                .copied()
+                .unwrap_or(0);
+            self.quote_refs
+                .rcu(|refs| *refs.entry(instrument_id).or_insert(0) += 1);
+            previous == 0
+        };
+
+        if should_subscribe {
+            let ws = self.ws_public_client.clone();
+            let stream = format!(
+                "{}@bookTicker",
+                format_binance_stream_symbol(&instrument_id)
+            );
+            self.spawn_ws(
+                async move {
+                    ws.subscribe(vec![stream])
+                        .await
+                        .context("top-of-book subscription")
+                },
+                "top-of-book subscription",
+            );
+        }
+    }
+
+    fn unsubscribe_top_of_book(&self, instrument_id: InstrumentId) {
+        let should_unsubscribe = match self.quote_refs.load().get(&instrument_id).copied() {
+            Some(1) => {
+                self.quote_refs.remove(&instrument_id);
+                true
+            }
+            Some(count) if count > 1 => {
+                self.quote_refs.rcu(|refs| {
+                    if let Some(existing) = refs.get_mut(&instrument_id) {
+                        *existing -= 1;
+                    }
+                });
+                false
+            }
+            _ => false,
+        };
+
+        if should_unsubscribe {
+            let ws = self.ws_public_client.clone();
+            let stream = format!(
+                "{}@bookTicker",
+                format_binance_stream_symbol(&instrument_id)
+            );
+            self.spawn_ws(
+                async move {
+                    ws.unsubscribe(vec![stream])
+                        .await
+                        .context("top-of-book unsubscribe")
+                        .map(|_| ())
+                },
+                "top-of-book unsubscribe",
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BufferedDepthUpdate {
+    deltas: OrderBookDeltas,
+    first_update_id: u64,
+    final_update_id: u64,
+    prev_final_update_id: u64,
+}
+
+#[derive(Debug, Clone)]
+struct BookBuffer {
+    updates: Vec<BufferedDepthUpdate>,
+    epoch: u64,
+}
+
+impl BookBuffer {
+    fn new(epoch: u64) -> Self {
+        Self {
+            updates: Vec::new(),
+            epoch,
+        }
+    }
+}
+
+fn is_partial_book_depth(depth: u32) -> bool {
+    matches!(depth, 5 | 10 | 20)
+}
+
+fn book_stream(instrument_id: &InstrumentId, depth: u32) -> String {
+    let symbol = format_binance_stream_symbol(instrument_id);
+    if is_partial_book_depth(depth) {
+        format!("{symbol}@depth{depth}@100ms")
+    } else {
+        format!("{symbol}@depth@0ms")
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BookDrain {
+    generation: u64,
+    stream: String,
+    // A same-stream resubscribe satisfies the drain: its frames carry identical
+    // semantics, so the gate no longer needs to hold for it
+    satisfied: bool,
+}
+
+fn arm_book_drain(
+    map: &AtomicMap<InstrumentId, Vec<BookDrain>>,
+    instrument_id: InstrumentId,
+    generation: u64,
+    stream: &str,
+) {
+    map.rcu(|m| {
+        m.entry(instrument_id).or_default().push(BookDrain {
+            generation,
+            stream: stream.to_owned(),
+            satisfied: false,
+        });
+    });
+}
+
+fn satisfy_book_drain(
+    map: &AtomicMap<InstrumentId, Vec<BookDrain>>,
+    instrument_id: InstrumentId,
+    stream: &str,
+) {
+    map.rcu(|m| {
+        if let Some(drains) = m.get_mut(&instrument_id) {
+            for drain in drains.iter_mut().filter(|drain| drain.stream == stream) {
+                drain.satisfied = true;
+            }
+        }
+    });
+}
+
+// Drains are correlated by generation: a confirmation or reconnect abandonment only
+// resolves the exact unsubscribe lifecycle it belongs to
+fn remove_book_drain(map: &AtomicMap<InstrumentId, Vec<BookDrain>>, generation: u64) {
+    map.rcu(|m| {
+        for drains in m.values_mut() {
+            drains.retain(|drain| drain.generation != generation);
+        }
+        m.retain(|_, drains| !drains.is_empty());
+    });
+}
+
+fn book_drain_active(
+    map: &AtomicMap<InstrumentId, Vec<BookDrain>>,
+    instrument_id: InstrumentId,
+) -> bool {
+    map.load()
+        .get(&instrument_id)
+        .is_some_and(|drains| drains.iter().any(|drain| !drain.satisfied))
+}
+
+// A satisfied drain only releases frames whose semantics match; when the subscription
+// changes to a different stream, an unresolved old copy may still be live elsewhere,
+// so its protection must hold again
+fn revive_book_drains(
+    map: &AtomicMap<InstrumentId, Vec<BookDrain>>,
+    instrument_id: InstrumentId,
+    stream: &str,
+) {
+    map.rcu(|m| {
+        if let Some(drains) = m.get_mut(&instrument_id) {
+            for drain in drains.iter_mut().filter(|drain| drain.stream != stream) {
+                drain.satisfied = false;
+            }
+        }
+    });
 }
 
 fn subscribe_ticker(client: &BinanceFuturesDataClient, data_type: &DataType) -> anyhow::Result<()> {
@@ -2777,6 +3525,7 @@ fn unsubscribe_ticker(
                 ws.unsubscribe(vec![stream])
                     .await
                     .context("ticker unsubscribe")
+                    .map(|_| ())
             },
             "ticker unsubscribe",
         );
@@ -2793,6 +3542,19 @@ fn ticker_data_type(instrument_id: InstrumentId) -> DataType {
     );
     DataType::new(
         "BinanceFuturesTicker",
+        Some(metadata),
+        Some(instrument_id.to_string()),
+    )
+}
+
+fn mark_price_data_type(instrument_id: InstrumentId) -> DataType {
+    let mut metadata = Params::new();
+    metadata.insert(
+        "instrument_id".to_string(),
+        serde_json::Value::String(instrument_id.to_string()),
+    );
+    DataType::new(
+        "BinanceFuturesMarkPriceUpdate",
         Some(metadata),
         Some(instrument_id.to_string()),
     )
@@ -2847,13 +3609,42 @@ mod tests {
             parse_order_book_snapshot(&order_book, instrument_id, 2, 3, UnixNanos::from(1));
 
         assert_eq!(deltas.deltas.len(), 3);
-        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy);
+        assert_eq!(deltas.deltas[1].order.side, OrderSide::Buy.into());
         assert_eq!(deltas.deltas[1].order.price.as_decimal(), dec!(100.00));
         assert_eq!(deltas.deltas[1].order.size.as_decimal(), dec!(0.500));
-        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell);
+        assert_eq!(deltas.deltas[2].order.side, OrderSide::Sell.into());
         assert_eq!(deltas.deltas[2].order.price.as_decimal(), dec!(102.00));
         assert_eq!(deltas.deltas[2].order.size.as_decimal(), dec!(0.700));
         assert_eq!(deltas.deltas[2].flags, RecordFlag::F_LAST as u8);
+        assert_eq!(deltas.ts_event, UnixNanos::from(1));
+        assert_eq!(deltas.ts_init, UnixNanos::from(1));
+    }
+
+    #[rstest]
+    #[case::negative(-1)]
+    #[case::overflow(i64::MAX)]
+    fn test_parse_order_book_snapshot_falls_back_for_invalid_timestamp(
+        #[case] transaction_time: i64,
+    ) {
+        let order_book = BinanceOrderBook {
+            last_update_id: 10,
+            bids: vec![],
+            asks: vec![],
+            event_time: None,
+            transaction_time: Some(transaction_time),
+        };
+
+        let ts_init = UnixNanos::from(1);
+        let deltas = parse_order_book_snapshot(
+            &order_book,
+            InstrumentId::from("BTCUSDT-PERP.BINANCE"),
+            2,
+            3,
+            ts_init,
+        );
+
+        assert_eq!(deltas.ts_event, ts_init);
+        assert_eq!(deltas.ts_init, ts_init);
     }
 
     #[rstest]
@@ -2876,5 +3667,76 @@ mod tests {
             deltas.deltas[0].flags,
             RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8
         );
+    }
+
+    #[rstest]
+    fn test_book_drain_gate_follows_unsatisfied_entries() {
+        let map = AtomicMap::new();
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+
+        assert!(!book_drain_active(&map, instrument_id));
+        arm_book_drain(&map, instrument_id, 1, "btcusdt@depth20@100ms");
+        assert!(book_drain_active(&map, instrument_id));
+
+        satisfy_book_drain(&map, instrument_id, "btcusdt@depth20@100ms");
+        assert!(!book_drain_active(&map, instrument_id));
+
+        arm_book_drain(&map, instrument_id, 2, "btcusdt@depth10@100ms");
+        assert!(book_drain_active(&map, instrument_id));
+    }
+
+    #[rstest]
+    fn test_remove_book_drain_resolves_only_matching_generation() {
+        let map = AtomicMap::new();
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+
+        // A satisfied tombstone never produces a confirmation, so a late one for
+        // the older lifecycle must not strand the newer drain
+        arm_book_drain(&map, instrument_id, 1, "btcusdt@depth20@100ms");
+        satisfy_book_drain(&map, instrument_id, "btcusdt@depth20@100ms");
+        arm_book_drain(&map, instrument_id, 2, "btcusdt@depth20@100ms");
+
+        remove_book_drain(&map, 1);
+        assert!(book_drain_active(&map, instrument_id));
+
+        remove_book_drain(&map, 2);
+        assert!(!book_drain_active(&map, instrument_id));
+        assert!(!map.load().contains_key(&instrument_id));
+    }
+
+    #[rstest]
+    fn test_semantics_change_revives_satisfied_drains() {
+        let map = AtomicMap::new();
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+
+        arm_book_drain(&map, instrument_id, 1, "btcusdt@depth20@100ms");
+        satisfy_book_drain(&map, instrument_id, "btcusdt@depth20@100ms");
+        assert!(!book_drain_active(&map, instrument_id));
+
+        // A depth change revives the drain: its stream may still be live and its
+        // frames no longer match the subscription's semantics
+        revive_book_drains(&map, instrument_id, "btcusdt@depth5@100ms");
+        assert!(book_drain_active(&map, instrument_id));
+
+        // A same-stream resubscribe does not revive it
+        satisfy_book_drain(&map, instrument_id, "btcusdt@depth20@100ms");
+        revive_book_drains(&map, instrument_id, "btcusdt@depth20@100ms");
+        assert!(!book_drain_active(&map, instrument_id));
+    }
+
+    #[rstest]
+    fn test_remove_book_drain_leaves_other_generations_pending() {
+        let map = AtomicMap::new();
+        let instrument_id = InstrumentId::from("BTCUSDT-PERP.BINANCE");
+
+        arm_book_drain(&map, instrument_id, 1, "btcusdt@depth20@100ms");
+        arm_book_drain(&map, instrument_id, 2, "btcusdt@depth10@100ms");
+
+        // A confirmation for the second drain leaves the failed first one pending
+        remove_book_drain(&map, 2);
+        assert!(book_drain_active(&map, instrument_id));
+
+        remove_book_drain(&map, 1);
+        assert!(!book_drain_active(&map, instrument_id));
     }
 }

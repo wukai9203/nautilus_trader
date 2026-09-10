@@ -15,16 +15,16 @@
 
 //! Functions related to order book display.
 
+use indexmap::IndexMap;
 use rust_decimal::Decimal;
-use tabled::{Table, Tabled, settings::Style};
+use tabled::{builder::Builder, settings::Style};
 
 use super::{BookPrice, level::BookLevel, own::OwnBookLevel};
 use crate::{
-    enums::OrderSideSpecified,
+    enums::OrderSide,
     orderbook::{OrderBook, own::OwnOrderBook},
 };
 
-#[derive(Tabled)]
 struct BookLevelDisplay {
     bids: String,
     price: String,
@@ -43,30 +43,11 @@ pub(crate) fn pprint_book(
         let bid_quantities = order_book.group_bids(group_size, Some(num_levels));
         let ask_quantities = order_book.group_asks(group_size, Some(num_levels));
 
-        // Use the precision of the group_size for consistent formatting
-        let precision = group_size.scale();
-
-        let mut data = Vec::new();
-
-        // Add ask levels (highest to lowest)
-        for (price, qty) in ask_quantities.iter().rev() {
-            data.push(BookLevelDisplay {
-                bids: String::new(),
-                price: format!("{price:.precision$}", precision = precision as usize),
-                asks: qty.to_string(),
-            });
-        }
-
-        // Add bid levels (highest to lowest)
-        for (price, qty) in &bid_quantities {
-            data.push(BookLevelDisplay {
-                bids: qty.to_string(),
-                price: format!("{price:.precision$}", precision = precision as usize),
-                asks: String::new(),
-            });
-        }
-
-        data
+        grouped_levels(
+            &bid_quantities,
+            &ask_quantities,
+            group_size.scale() as usize,
+        )
     } else {
         let ask_levels: Vec<(&BookPrice, &BookLevel)> = order_book
             .asks
@@ -83,8 +64,8 @@ pub(crate) fn pprint_book(
         levels
             .iter()
             .map(|(book_price, level)| {
-                let is_bid_level = book_price.side == OrderSideSpecified::Buy;
-                let is_ask_level = book_price.side == OrderSideSpecified::Sell;
+                let is_bid_level = book_price.side == OrderSide::Buy;
+                let is_ask_level = book_price.side == OrderSide::Sell;
 
                 let bid_sizes: Vec<String> = level
                     .orders
@@ -117,7 +98,7 @@ pub(crate) fn pprint_book(
             .collect()
     };
 
-    let table = Table::new(data).with(Style::rounded()).to_string();
+    let table = render_book_levels(data);
 
     let header = format!(
         "bid_levels: {}\nask_levels: {}\nsequence: {}\nupdate_count: {}\nts_last: {}",
@@ -140,35 +121,17 @@ pub(crate) fn pprint_own_book(
     group_size: Option<Decimal>,
 ) -> String {
     let data: Vec<BookLevelDisplay> = if let Some(group_size) = group_size {
+        // Rendering is membership-neutral, so acceptance-time filtering stays disabled.
         let bid_quantities =
             own_order_book.bid_quantity(None, Some(num_levels), Some(group_size), None, None);
         let ask_quantities =
             own_order_book.ask_quantity(None, Some(num_levels), Some(group_size), None, None);
 
-        // Use the precision of the group_size for consistent formatting
-        let precision = group_size.scale();
-
-        let mut data = Vec::new();
-
-        // Add ask levels (highest to lowest)
-        for (price, qty) in ask_quantities.iter().rev() {
-            data.push(BookLevelDisplay {
-                bids: String::new(),
-                price: format!("{price:.precision$}", precision = precision as usize),
-                asks: qty.to_string(),
-            });
-        }
-
-        // Add bid levels (highest to lowest)
-        for (price, qty) in &bid_quantities {
-            data.push(BookLevelDisplay {
-                bids: qty.to_string(),
-                price: format!("{price:.precision$}", precision = precision as usize),
-                asks: String::new(),
-            });
-        }
-
-        data
+        grouped_levels(
+            &bid_quantities,
+            &ask_quantities,
+            group_size.scale() as usize,
+        )
     } else {
         let ask_levels: Vec<(&BookPrice, &OwnBookLevel)> = own_order_book
             .asks
@@ -185,8 +148,8 @@ pub(crate) fn pprint_own_book(
         levels
             .iter()
             .map(|(book_price, level)| {
-                let is_bid_level = book_price.side == OrderSideSpecified::Buy;
-                let is_ask_level = book_price.side == OrderSideSpecified::Sell;
+                let is_bid_level = book_price.side == OrderSide::Buy;
+                let is_ask_level = book_price.side == OrderSide::Sell;
 
                 let bid_sizes: Vec<String> = level
                     .orders
@@ -219,7 +182,7 @@ pub(crate) fn pprint_own_book(
             .collect()
     };
 
-    let table = Table::new(data).with(Style::rounded()).to_string();
+    let table = render_book_levels(data);
 
     let header = format!(
         "bid_levels: {}\nask_levels: {}\nupdate_count: {}\nts_last: {}",
@@ -230,4 +193,41 @@ pub(crate) fn pprint_own_book(
     );
 
     format!("{header}\n{table}")
+}
+
+fn grouped_levels(
+    bid_quantities: &IndexMap<Decimal, Decimal>,
+    ask_quantities: &IndexMap<Decimal, Decimal>,
+    precision: usize,
+) -> Vec<BookLevelDisplay> {
+    let mut data = Vec::with_capacity(bid_quantities.len() + ask_quantities.len());
+
+    for (price, quantity) in ask_quantities.iter().rev() {
+        data.push(BookLevelDisplay {
+            bids: String::new(),
+            price: format!("{price:.precision$}"),
+            asks: quantity.to_string(),
+        });
+    }
+
+    for (price, quantity) in bid_quantities {
+        data.push(BookLevelDisplay {
+            bids: quantity.to_string(),
+            price: format!("{price:.precision$}"),
+            asks: String::new(),
+        });
+    }
+
+    data
+}
+
+fn render_book_levels(data: Vec<BookLevelDisplay>) -> String {
+    let mut builder = Builder::with_capacity(data.len() + 1, 3);
+    builder.push_record(["bids", "price", "asks"]);
+
+    for level in data {
+        builder.push_record([level.bids, level.price, level.asks]);
+    }
+
+    builder.build().with(Style::rounded()).to_string()
 }

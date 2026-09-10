@@ -1,6 +1,5 @@
 [package]
 name = "nautilus-serialization"
-readme = "README.md"
 build = "build.rs"
 include = [
   "src/**/*",
@@ -58,12 +57,13 @@ ignored = [
 ]
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["arrow", "capnp", "display", "high-precision", "sbe"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 nautilus-core = { workspace = true }
-nautilus-model = { workspace = true, features = ["stubs"] }
+nautilus-model = { workspace = true }
 
 anyhow = { workspace = true }
 indexmap = { workspace = true }
@@ -81,6 +81,8 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-model = { workspace = true, features = ["test-support"] }
+
 criterion = { workspace = true }
 pretty_assertions = { workspace = true }
 rstest = { workspace = true }

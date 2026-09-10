@@ -13,8 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use futures_util::future::join_all;
+use http::Method;
 use nautilus_network::http::InnerHttpClient;
-use reqwest::Method;
 
 const CONCURRENCY: usize = 256;
 const TOTAL: usize = 1_000_000;
@@ -36,7 +37,7 @@ async fn main() {
             ));
         }
 
-        let resp = futures::future::join_all(reqs.drain(0..)).await;
+        let resp = join_all(reqs.drain(0..)).await;
         assert!(resp.iter().all(|res| if let Ok(resp) = res {
             resp.status.is_success()
         } else {

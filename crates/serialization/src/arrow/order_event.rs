@@ -13,20 +13,13 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::collections::HashMap;
-
-use arrow::{datatypes::Schema, error::ArrowError, record_batch::RecordBatch};
 use nautilus_model::events::{
     OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated, OrderExpired,
-    OrderFilled, OrderInitialized, OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate,
-    OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated,
+    OrderFillVoided, OrderFilled, OrderInitialized, OrderModifyRejected, OrderPendingCancel,
+    OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated,
 };
 
-use super::{
-    ArrowSchemaProvider, DecodeTypedFromRecordBatch, EncodeToRecordBatch, EncodingError,
-    KEY_INSTRUMENT_ID,
-    json::{JsonFieldSpec, decode_batch, encode_batch, metadata_for_type, schema_for_type},
-};
+use super::json::{JsonFieldSpec, impl_json_arrow};
 
 const ORDER_INITIALIZED_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("trader_id", false),
@@ -62,6 +55,9 @@ const ORDER_INITIALIZED_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8_json("exec_algorithm_params", true),
     JsonFieldSpec::utf8("exec_spawn_id", true),
     JsonFieldSpec::utf8_json("tags", true),
+    // Appended (not inserted) so older batches without this column fail with a clean
+    // `MissingColumn` error rather than silently reading a shifted column.
+    JsonFieldSpec::utf8("activation_price", true),
 ];
 
 const ORDER_DENIED_FIELDS: &[JsonFieldSpec] = &[
@@ -128,7 +124,7 @@ const ORDER_PENDING_CANCEL_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("strategy_id", false),
     JsonFieldSpec::utf8("instrument_id", false),
     JsonFieldSpec::utf8("client_order_id", false),
-    JsonFieldSpec::utf8("account_id", false),
+    JsonFieldSpec::utf8("account_id", true),
     JsonFieldSpec::utf8("event_id", false),
     JsonFieldSpec::u64("ts_event", false),
     JsonFieldSpec::u64("ts_init", false),
@@ -194,7 +190,7 @@ const ORDER_PENDING_UPDATE_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("strategy_id", false),
     JsonFieldSpec::utf8("instrument_id", false),
     JsonFieldSpec::utf8("client_order_id", false),
-    JsonFieldSpec::utf8("account_id", false),
+    JsonFieldSpec::utf8("account_id", true),
     JsonFieldSpec::utf8("event_id", false),
     JsonFieldSpec::u64("ts_event", false),
     JsonFieldSpec::u64("ts_init", false),
@@ -265,97 +261,95 @@ const ORDER_FILLED_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::boolean("reconciliation", false),
     JsonFieldSpec::utf8("position_id", true),
     JsonFieldSpec::utf8("commission", true),
+    JsonFieldSpec::utf8_json("info", true),
 ];
 
-fn instrument_metadata(type_name: &'static str, instrument_id: &str) -> HashMap<String, String> {
-    let mut metadata = metadata_for_type(type_name);
-    metadata.insert(KEY_INSTRUMENT_ID.to_string(), instrument_id.to_string());
-    metadata
-}
+const ORDER_FILL_VOIDED_FIELDS: &[JsonFieldSpec] = &[
+    JsonFieldSpec::utf8("trader_id", false),
+    JsonFieldSpec::utf8("strategy_id", false),
+    JsonFieldSpec::utf8("instrument_id", false),
+    JsonFieldSpec::utf8("client_order_id", false),
+    JsonFieldSpec::utf8("venue_order_id", false),
+    JsonFieldSpec::utf8("account_id", false),
+    JsonFieldSpec::utf8("correction_id", false),
+    JsonFieldSpec::utf8("trade_id", false),
+    JsonFieldSpec::utf8("voided_qty", false),
+    JsonFieldSpec::utf8("commission_voided", true),
+    JsonFieldSpec::utf8("order_side", false),
+    JsonFieldSpec::utf8("order_type", false),
+    JsonFieldSpec::utf8("last_px", false),
+    JsonFieldSpec::utf8("currency", false),
+    JsonFieldSpec::utf8("liquidity_side", false),
+    JsonFieldSpec::utf8("position_id", true),
+    JsonFieldSpec::utf8("reason", true),
+    JsonFieldSpec::utf8_json("info", true),
+    JsonFieldSpec::utf8("event_id", false),
+    JsonFieldSpec::u64("ts_event", false),
+    JsonFieldSpec::u64("ts_init", false),
+    JsonFieldSpec::boolean("reconciliation", false),
+    JsonFieldSpec::boolean("is_reopened", false),
+    JsonFieldSpec::utf8("causation_id", true),
+];
 
-macro_rules! impl_order_event_arrow {
-    ($type:ty, $type_name:expr, $fields:expr) => {
-        impl ArrowSchemaProvider for $type {
-            fn get_schema(metadata: Option<HashMap<String, String>>) -> Schema {
-                schema_for_type($type_name, metadata, $fields)
-            }
-        }
-
-        impl EncodeToRecordBatch for $type {
-            fn encode_batch(
-                metadata: &HashMap<String, String>,
-                data: &[Self],
-            ) -> Result<RecordBatch, ArrowError> {
-                encode_batch($type_name, metadata, data, $fields)
-            }
-
-            fn metadata(&self) -> HashMap<String, String> {
-                instrument_metadata($type_name, &self.instrument_id.to_string())
-            }
-        }
-
-        impl DecodeTypedFromRecordBatch for $type {
-            fn decode_typed_batch(
-                metadata: &HashMap<String, String>,
-                record_batch: RecordBatch,
-            ) -> Result<Vec<Self>, EncodingError> {
-                decode_batch(metadata, &record_batch, $fields, Some($type_name))
-            }
-        }
-    };
-}
-
-impl_order_event_arrow!(
-    OrderInitialized,
+impl_json_arrow!(instrument OrderInitialized,
     "OrderInitialized",
     ORDER_INITIALIZED_FIELDS
 );
-impl_order_event_arrow!(OrderDenied, "OrderDenied", ORDER_DENIED_FIELDS);
-impl_order_event_arrow!(OrderEmulated, "OrderEmulated", ORDER_EMULATED_FIELDS);
-impl_order_event_arrow!(OrderSubmitted, "OrderSubmitted", ORDER_SUBMITTED_FIELDS);
-impl_order_event_arrow!(OrderAccepted, "OrderAccepted", ORDER_ACCEPTED_FIELDS);
-impl_order_event_arrow!(OrderRejected, "OrderRejected", ORDER_REJECTED_FIELDS);
-impl_order_event_arrow!(
-    OrderPendingCancel,
+impl_json_arrow!(instrument OrderDenied, "OrderDenied", ORDER_DENIED_FIELDS);
+impl_json_arrow!(instrument OrderEmulated, "OrderEmulated", ORDER_EMULATED_FIELDS);
+impl_json_arrow!(instrument OrderSubmitted, "OrderSubmitted", ORDER_SUBMITTED_FIELDS);
+impl_json_arrow!(instrument OrderAccepted, "OrderAccepted", ORDER_ACCEPTED_FIELDS);
+impl_json_arrow!(instrument OrderRejected, "OrderRejected", ORDER_REJECTED_FIELDS);
+impl_json_arrow!(instrument OrderPendingCancel,
     "OrderPendingCancel",
     ORDER_PENDING_CANCEL_FIELDS
 );
-impl_order_event_arrow!(OrderCanceled, "OrderCanceled", ORDER_CANCELED_FIELDS);
-impl_order_event_arrow!(
-    OrderCancelRejected,
+impl_json_arrow!(instrument OrderCanceled, "OrderCanceled", ORDER_CANCELED_FIELDS);
+impl_json_arrow!(instrument OrderCancelRejected,
     "OrderCancelRejected",
     ORDER_CANCEL_REJECTED_FIELDS
 );
-impl_order_event_arrow!(OrderExpired, "OrderExpired", ORDER_EXPIRED_FIELDS);
-impl_order_event_arrow!(OrderTriggered, "OrderTriggered", ORDER_TRIGGERED_FIELDS);
-impl_order_event_arrow!(
-    OrderPendingUpdate,
+impl_json_arrow!(instrument OrderExpired, "OrderExpired", ORDER_EXPIRED_FIELDS);
+impl_json_arrow!(instrument OrderTriggered, "OrderTriggered", ORDER_TRIGGERED_FIELDS);
+impl_json_arrow!(instrument OrderPendingUpdate,
     "OrderPendingUpdate",
     ORDER_PENDING_UPDATE_FIELDS
 );
-impl_order_event_arrow!(OrderReleased, "OrderReleased", ORDER_RELEASED_FIELDS);
-impl_order_event_arrow!(
-    OrderModifyRejected,
+impl_json_arrow!(instrument OrderReleased, "OrderReleased", ORDER_RELEASED_FIELDS);
+impl_json_arrow!(instrument OrderModifyRejected,
     "OrderModifyRejected",
     ORDER_MODIFY_REJECTED_FIELDS
 );
-impl_order_event_arrow!(OrderUpdated, "OrderUpdated", ORDER_UPDATED_FIELDS);
-impl_order_event_arrow!(OrderFilled, "OrderFilled", ORDER_FILLED_FIELDS);
+impl_json_arrow!(instrument OrderUpdated, "OrderUpdated", ORDER_UPDATED_FIELDS);
+impl_json_arrow!(instrument OrderFilled, "OrderFilled", ORDER_FILLED_FIELDS);
+impl_json_arrow!(instrument OrderFillVoided, "OrderFillVoided", ORDER_FILL_VOIDED_FIELDS);
 
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
-    use nautilus_model::events::order::stubs::{
-        order_accepted, order_cancel_rejected, order_denied_max_submitted_rate, order_emulated,
-        order_expired, order_filled, order_initialized_buy_limit, order_modify_rejected,
-        order_pending_cancel, order_pending_update, order_rejected_insufficient_margin,
-        order_released, order_submitted, order_triggered, order_updated,
+    use indexmap::IndexMap;
+    use nautilus_core::UUID4;
+    use nautilus_model::{
+        events::order::{
+            spec::OrderFillVoidedSpec,
+            stubs::{
+                order_accepted, order_cancel_rejected, order_denied_max_submitted_rate,
+                order_emulated, order_expired, order_filled, order_initialized_buy_limit,
+                order_modify_rejected, order_pending_cancel, order_pending_update,
+                order_rejected_insufficient_margin, order_released, order_submitted,
+                order_triggered, order_updated,
+            },
+        },
+        identifiers::PositionId,
+        types::{Money, Quantity},
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
+    use ustr::Ustr;
 
     use super::*;
+    use crate::arrow::{ArrowSchemaProvider, DecodeTypedFromRecordBatch, EncodeToRecordBatch};
 
     #[rstest]
     fn test_order_initialized_round_trip(order_initialized_buy_limit: OrderInitialized) {
@@ -377,10 +371,30 @@ mod tests {
     fn test_order_filled_round_trip(order_filled: OrderFilled) {
         let event = order_filled;
         let metadata = event.metadata();
-        let batch = OrderFilled::encode_batch(&metadata, &[event]).unwrap();
+        let batch = OrderFilled::encode_batch(&metadata, std::slice::from_ref(&event)).unwrap();
         let decoded = OrderFilled::decode_typed_batch(batch.schema().metadata(), batch).unwrap();
 
         assert_eq!(decoded, vec![event]);
+    }
+
+    #[rstest]
+    fn test_order_fill_voided_round_trip() {
+        roundtrip(OrderFillVoidedSpec::builder().is_reopened(true).build());
+    }
+
+    #[rstest]
+    fn test_order_fill_voided_populated_optionals_round_trip() {
+        let mut event = OrderFillVoidedSpec::builder()
+            .voided_qty(Quantity::from("0.561000"))
+            .commission_voided(Money::from("12.20000000 USDT"))
+            .position_id(PositionId::from("P-001"))
+            .reason(Ustr::from("VENUE_VOID"))
+            .info(IndexMap::from([(Ustr::from("source"), Ustr::from("test"))]))
+            .is_reopened(true)
+            .build();
+        event.causation_id = Some(UUID4::new());
+
+        roundtrip(event);
     }
 
     fn roundtrip<T>(event: T)
@@ -445,8 +459,24 @@ mod tests {
     }
 
     #[rstest]
+    fn test_order_pending_update_none_account_round_trip(order_pending_update: OrderPendingUpdate) {
+        roundtrip(OrderPendingUpdate {
+            account_id: None,
+            ..order_pending_update
+        });
+    }
+
+    #[rstest]
     fn test_order_pending_cancel_round_trip(order_pending_cancel: OrderPendingCancel) {
         roundtrip(order_pending_cancel);
+    }
+
+    #[rstest]
+    fn test_order_pending_cancel_none_account_round_trip(order_pending_cancel: OrderPendingCancel) {
+        roundtrip(OrderPendingCancel {
+            account_id: None,
+            ..order_pending_cancel
+        });
     }
 
     #[rstest]

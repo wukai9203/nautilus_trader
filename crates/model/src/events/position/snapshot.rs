@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_core::UnixNanos;
+use nautilus_core::{DurationNanos, UnixNanos};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -27,7 +27,7 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -77,7 +77,7 @@ pub struct PositionSnapshot {
     /// The commissions for the position.
     pub commissions: Vec<Money>,
     /// The open duration for the position (nanoseconds).
-    pub duration_ns: Option<u64>,
+    pub duration_ns: Option<DurationNanos>,
     /// UNIX timestamp (nanoseconds) when the position opened.
     pub ts_opened: UnixNanos,
     /// UNIX timestamp (nanoseconds) when the position closed.
@@ -86,6 +86,9 @@ pub struct PositionSnapshot {
     pub ts_init: UnixNanos,
     /// UNIX timestamp (nanoseconds) when the last position event occurred.
     pub ts_last: UnixNanos,
+    /// Full replay state when the snapshot is used as a durable correction boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_state: Option<serde_json::Value>,
 }
 
 impl PositionSnapshot {
@@ -118,7 +121,16 @@ impl PositionSnapshot {
             ts_closed: position.ts_closed,
             ts_init: position.ts_init,
             ts_last: position.ts_last,
+            replay_state: None,
         }
+    }
+
+    /// Creates a snapshot containing the full state needed to replay a corrected position.
+    #[must_use]
+    pub fn from_replay_state(position: &Position, unrealized_pnl: Option<Money>) -> Self {
+        let mut snapshot = Self::from(position, unrealized_pnl);
+        snapshot.replay_state = serde_json::to_value(position).ok();
+        snapshot
     }
 }
 
@@ -163,11 +175,12 @@ mod tests {
             realized_pnl: Some(Money::new(100.0, Currency::USD())),
             unrealized_pnl: Some(Money::new(50.0, Currency::USD())),
             commissions: vec![Money::new(2.0, Currency::USD())],
-            duration_ns: Some(3_600_000_000_000), // 1 hour in nanoseconds
+            duration_ns: Some(DurationNanos::from_hours(1)),
             ts_opened: UnixNanos::from(1_000_000_000),
             ts_closed: Some(UnixNanos::from(4_600_000_000)),
             ts_init: UnixNanos::from(2_000_000_000),
             ts_last: UnixNanos::from(4_600_000_000),
+            replay_state: None,
         }
     }
 
@@ -221,6 +234,7 @@ mod tests {
         assert_eq!(snapshot.ts_closed, position.ts_closed);
         assert_eq!(snapshot.ts_init, position.ts_init);
         assert_eq!(snapshot.ts_last, position.ts_last);
+        assert_eq!(snapshot.replay_state, None);
     }
 
     #[rstest]
@@ -232,6 +246,18 @@ mod tests {
         let snapshot = PositionSnapshot::from(&position, None);
 
         assert_eq!(snapshot.unrealized_pnl, None);
+    }
+
+    #[rstest]
+    fn test_position_snapshot_from_replay_state() {
+        let instrument = audusd_sim();
+        let fill = create_test_order_filled();
+        let position = Position::new(&InstrumentAny::CurrencyPair(instrument), fill);
+
+        let snapshot = PositionSnapshot::from_replay_state(&position, None);
+        let restored: Position = serde_json::from_value(snapshot.replay_state.unwrap()).unwrap();
+
+        assert_eq!(restored, position);
     }
 
     #[rstest]

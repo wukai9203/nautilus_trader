@@ -8,11 +8,11 @@ Main features and intended use cases for the platform.
 
 ## Architecture
 
-The principles, structures, and designs that underpin the platform.
+[Architecture](architecture.md) describes the components, runtime boundaries, and data flows.
 
 ## Actors
 
-The `Actor` is the base component for interacting with the trading system.
+The `DataActor` is the base component for interacting with the trading system.
 Covers capabilities and implementation details.
 
 ## Strategies
@@ -75,8 +75,9 @@ The high-performance order book, own order tracking, filtered views for net liqu
 
 ## Execution
 
-Trade execution and order management across multiple strategies and venues simultaneously (per instance),
-including the components involved and the flow of execution messages (commands and events).
+Trade execution and order management across multiple strategies and venues simultaneously (per
+instance), including component and message flow, venue-boundary policies, execution algorithms,
+and reconciliation.
 
 ## Orders
 
@@ -118,7 +119,13 @@ High-performance logging for both backtesting and live trading, implemented in R
 
 ## Backtesting
 
-Running simulated trading on historical data using a specific system implementation.
+Backtest APIs, data and venue setup, execution sequencing, fill simulation,
+accounts, funding, and margin configuration.
+
+## Behavioral Models
+
+[Behavioral Models](behavioral_models.md) explains how Rust and Python model implementations enter
+the runtime.
 
 ## Visualization
 
@@ -132,28 +139,32 @@ convention, builder patterns, and common fields shared across adapters and engin
 
 ## Live Trading
 
-Deploying backtested strategies in real-time without code changes, and the key differences
-between backtesting and live trading.
-
-## Plugins
-
-The Rust plug-in system loaded by a live node, covering the C-ABI boundary, manifest validation,
-plug-point surfaces (custom data, actors, strategies), host callback routing, configuration, and
-the lifecycle from `dlopen` through adapter registration.
+Running the same strategy and execution-algorithm code in live markets while accounting for venue,
+transport, timing, persistence, external-activity, and reconciliation behavior.
 
 ## Adapters
 
 Requirements and best practices for developing integration adapters for data providers and trading venues.
+
+## Networking
+
+Architecture, reliability policy, and performance characteristics for the shared HTTP, WebSocket,
+and raw TCP socket clients.
 
 ## Rust
 
 Writing actors, strategies, and running backtests and live trading in pure Rust
 using the `crates/` implementation directly.
 
-## Deterministic Simulation Testing (DST)
+## Python
 
-The determinism contract for seed-replayable execution, the source-level seams that implement
-it, the pre-commit hook that enforces it, and the known scope boundaries.
+Python application composition and user components running on the Rust core through PyO3,
+including ownership, async execution, and public API boundaries.
+
+## DST
+
+Deterministic simulation testing (DST): the contract for seed-replayable execution, the source-level
+seams that implement it, the pre-commit hook that enforces it, and the known scope boundaries.
 
 :::note
 If there are discrepancies between these guides and the API reference, the API reference is correct.

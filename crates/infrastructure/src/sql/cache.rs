@@ -13,27 +13,30 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{collections::VecDeque, ops::ControlFlow, pin::Pin, time::Duration};
+use std::{collections::VecDeque, fmt::Debug, ops::ControlFlow, pin::Pin, time::Duration};
 
 use ahash::AHashMap;
 use bytes::Bytes;
 use nautilus_common::{
-    cache::database::{CacheDatabaseAdapter, CacheMap},
+    cache::{
+        CacheConfig,
+        database::{CacheDatabaseAdapter, CacheDatabaseFactory, CacheMap},
+    },
     live::get_runtime,
     logging::{log_task_awaiting, log_task_started, log_task_stopped},
     signal::Signal,
 };
-use nautilus_core::UnixNanos;
+use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     accounts::AccountAny,
-    data::{Bar, CustomData, DataType, FundingRateUpdate, QuoteTick, TradeTick},
+    data::{Bar, CustomData, DataType, FundingRateUpdate, InstrumentClose, QuoteTick, TradeTick},
     events::{
         AccountState, OrderEventAny, OrderFilled, OrderInitialized, OrderSnapshot,
         position::snapshot::PositionSnapshot,
     },
     identifiers::{
-        AccountId, ClientId, ClientOrderId, ComponentId, InstrumentId, PositionId, StrategyId,
-        VenueOrderId,
+        AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId,
+        TraderId, VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny, SyntheticInstrument},
     orderbook::OrderBook,
@@ -41,6 +44,7 @@ use nautilus_model::{
     position::Position,
     types::{Currency, Money},
 };
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgConnectOptions};
 use tokio::{time::Instant, try_join};
 use ustr::Ustr;
@@ -52,11 +56,127 @@ use crate::sql::{
 
 // Task and connection names
 const CACHE_PROCESS: &str = "cache-process";
+const SCHEMA_MIGRATION_COMMAND: &str = "run `nautilus database init` to migrate";
+
+/// Configuration for a Postgres-backed cache database.
+///
+/// Missing fields are resolved from Postgres environment variables and then built-in defaults.
+#[cfg_attr(
+    feature = "python",
+    expect(
+        clippy::unsafe_derive_deserialize,
+        reason = "config deserializes plain fields; unsafe methods come from generated PyO3 integration"
+    )
+)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.infrastructure", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.infrastructure")
+)]
+pub struct PostgresCacheConfig {
+    /// The Postgres host address.
+    pub host: Option<String>,
+    /// The Postgres port.
+    pub port: Option<u16>,
+    /// The Postgres account username.
+    pub username: Option<String>,
+    /// The Postgres account password.
+    pub password: Option<String>,
+    /// The Postgres database name.
+    pub database: Option<String>,
+}
+
+impl Debug for PostgresCacheConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = self.password.as_ref().map(|_| "***");
+        f.debug_struct(stringify!(PostgresCacheConfig))
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &redacted)
+            .field("database", &self.database)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use serde_json::json;
+
+    use super::*;
+
+    #[rstest]
+    fn test_default_postgres_cache_config() {
+        let config = PostgresCacheConfig::default();
+
+        assert_eq!(config.host, None);
+        assert_eq!(config.port, None);
+        assert_eq!(config.username, None);
+        assert_eq!(config.password, None);
+        assert_eq!(config.database, None);
+    }
+
+    #[rstest]
+    fn test_deserialize_postgres_cache_config() {
+        let config_json = json!({
+            "host": "localhost",
+            "port": 5432,
+            "username": "user",
+            "password": "pass",
+            "database": "nautilus"
+        });
+
+        let config: PostgresCacheConfig = serde_json::from_value(config_json).unwrap();
+
+        assert_eq!(config.host, Some("localhost".to_string()));
+        assert_eq!(config.port, Some(5432));
+        assert_eq!(config.username, Some("user".to_string()));
+        assert_eq!(config.password, Some("pass".to_string()));
+        assert_eq!(config.database, Some("nautilus".to_string()));
+    }
+
+    #[rstest]
+    fn test_deserialize_postgres_cache_config_rejects_type_selector() {
+        let config_json = json!({
+            "type": "postgres",
+        });
+
+        let error = serde_json::from_value::<PostgresCacheConfig>(config_json).unwrap_err();
+
+        assert!(error.to_string().contains("unknown field `type`"));
+    }
+}
+
+#[async_trait::async_trait]
+impl CacheDatabaseFactory for PostgresCacheConfig {
+    async fn create(
+        &self,
+        _trader_id: TraderId,
+        _instance_id: UUID4,
+        _config: CacheConfig,
+    ) -> anyhow::Result<Box<dyn CacheDatabaseAdapter>> {
+        let database = PostgresCacheDatabase::connect(
+            self.host.clone(),
+            self.port,
+            self.username.clone(),
+            self.password.clone(),
+            self.database.clone(),
+        )
+        .await?;
+        Ok(Box::new(database))
+    }
+}
 
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.infrastructure")
+    pyo3::pyclass(module = "nautilus_trader.infrastructure")
 )]
 pub struct PostgresCacheDatabase {
     pub pool: PgPool,
@@ -74,6 +194,7 @@ pub enum DatabaseQuery {
     Add(String, Vec<u8>),
     AddCurrency(Currency),
     AddInstrument(InstrumentAny),
+    AddInstrumentClose(InstrumentClose),
     AddOrder(OrderInitialized, Option<ClientId>),
     AddOrderSnapshot(OrderSnapshot),
     AddPosition(PositionId, OrderFilled),
@@ -87,6 +208,7 @@ pub enum DatabaseQuery {
     UpdateOrder(OrderEventAny),
     UpdatePosition(OrderFilled),
     IndexOrderPosition(ClientOrderId, PositionId),
+    IndexOrderClients(Vec<(ClientOrderId, ClientId)>),
 }
 
 impl PostgresCacheDatabase {
@@ -109,6 +231,7 @@ impl PostgresCacheDatabase {
         let pg_connect_options =
             get_postgres_connect_options(host, port, username, password, database);
         let pool = connect_pg(pg_connect_options.clone().into()).await.unwrap();
+        check_schema_migrated(&pool).await?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DatabaseQuery>();
 
         let handle = get_runtime().spawn(async move {
@@ -171,6 +294,96 @@ impl PostgresCacheDatabase {
     }
 }
 
+// Fails fast when the connected database predates required cache schema.
+//
+// An absent instrument-close table otherwise fails only when first queried. Both directions of the
+// exact-average type mismatch are silent: `numeric -> double precision` is an implicit cast so
+// writes truncate, and the row readers use `.ok().flatten()` so reads degrade to `None`. Absent
+// order event columns are silent in both directions too: every insert names them so writes fail
+// and drop the event, while every decoder reads them so `load_orders` yields an empty cache.
+// Missing instrument metadata also breaks inserts and panics in the existing row dispatch on load.
+async fn check_schema_migrated(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let has_instrument_close: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = current_schema()
+              AND table_name = 'instrument_close'
+        )",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    if !has_instrument_close {
+        return Err(sqlx::Error::Configuration(
+            format!(
+                "Postgres schema is out of date, missing `instrument_close` table: {SCHEMA_MIGRATION_COMMAND}"
+            )
+            .into(),
+        ));
+    }
+
+    let stale: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name || '.' || column_name || ' (' || data_type || ')'
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND (table_name, column_name) IN (('order', 'avg_px'), ('order', 'slippage'))
+          AND data_type <> 'numeric'
+        ORDER BY table_name, column_name",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if !stale.is_empty() {
+        return Err(sqlx::Error::Configuration(
+            format!(
+                "Postgres schema is out of date, {} should be `numeric`: {SCHEMA_MIGRATION_COMMAND}",
+                stale.join(", "),
+            )
+            .into(),
+        ));
+    }
+
+    let missing: Vec<String> = sqlx::query_scalar(
+        "SELECT required.table_name || '.' || required.column_name
+        FROM (VALUES
+            ('instrument', 'info'),
+            ('order_event', 'released_price'),
+            ('order_event', 'protection_price'),
+            ('order_event', 'due_post_only'),
+            ('order_event', 'correction_id'),
+            ('order_event', 'is_reopened'),
+            ('order_event', 'info'),
+            ('order_event', 'causation_id'),
+            ('position_event', 'reconciliation'),
+            ('position_event', 'info'),
+            ('position_event', 'causation_id')
+        ) AS required(table_name, column_name)
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = required.table_name
+              AND column_name = required.column_name
+        )
+        ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    Err(sqlx::Error::Configuration(
+        format!(
+            "Postgres schema is out of date, missing cache columns {}: {SCHEMA_MIGRATION_COMMAND}",
+            missing.join(", "),
+        )
+        .into(),
+    ))
+}
+
 async fn handle_query(
     maybe_msg: Option<DatabaseQuery>,
     buffer: &mut VecDeque<DatabaseQuery>,
@@ -227,13 +440,24 @@ pub async fn get_pg_cache_database() -> anyhow::Result<PostgresCacheDatabase> {
     .await?)
 }
 
-#[allow(dead_code)]
-#[allow(unused)]
 #[async_trait::async_trait]
 impl CacheDatabaseAdapter for PostgresCacheDatabase {
     fn close(&mut self) -> anyhow::Result<()> {
         let pool = self.pool.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+
+        // The close command follows all pending writes on the FIFO channel and drains the buffer
+        if let Err(e) = self.tx.send(DatabaseQuery::Close) {
+            log::warn!("Error sending close: {e:?}");
+        }
+
+        log_task_awaiting("cache-write");
+
+        tokio::task::block_in_place(|| {
+            if let Err(e) = get_runtime().block_on(&mut self.handle) {
+                log::error!("Error awaiting task 'cache-write': {e:?}");
+            }
+        });
 
         log::debug!("Closing connection pool");
 
@@ -245,19 +469,6 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
                     log::error!("Error closing pool: {e:?}");
                 }
             });
-        });
-
-        // Cancel message handling task
-        if let Err(e) = self.tx.send(DatabaseQuery::Close) {
-            log::warn!("Error sending close: {e:?}");
-        }
-
-        log_task_awaiting("cache-write");
-
-        tokio::task::block_in_place(|| {
-            if let Err(e) = get_runtime().block_on(&mut self.handle) {
-                log::error!("Error awaiting task 'cache-write': {e:?}");
-            }
         });
 
         log::debug!("Closed");
@@ -285,9 +496,14 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     async fn load_all(&self) -> anyhow::Result<CacheMap> {
-        let (currencies, instruments, synthetics, accounts, orders, positions) = try_join!(
-            self.load_currencies(),
+        let currencies = self.load_currencies().await?;
+        for currency in currencies.values() {
+            Currency::register(*currency, false)?;
+        }
+
+        let (instruments, instrument_closes, synthetics, accounts, orders, positions) = try_join!(
             self.load_instruments(),
+            self.load_instrument_closes(),
             self.load_synthetics(),
             self.load_accounts(),
             self.load_orders(),
@@ -303,6 +519,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         Ok(CacheMap {
             currencies,
             instruments,
+            instrument_closes,
             synthetics,
             accounts,
             orders,
@@ -396,8 +613,18 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         Ok(rx.recv()?)
     }
 
+    async fn load_instrument_closes(
+        &self,
+    ) -> anyhow::Result<AHashMap<InstrumentId, InstrumentClose>> {
+        Ok(DatabaseQueries::load_instrument_closes(&self.pool)
+            .await?
+            .into_iter()
+            .map(|close| (close.instrument_id, close))
+            .collect())
+    }
+
     async fn load_synthetics(&self) -> anyhow::Result<AHashMap<InstrumentId, SyntheticInstrument>> {
-        todo!()
+        Ok(AHashMap::new())
     }
 
     async fn load_accounts(&self) -> anyhow::Result<AHashMap<AccountId, AccountAny>> {
@@ -578,7 +805,9 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         &self,
         instrument_id: &InstrumentId,
     ) -> anyhow::Result<Option<SyntheticInstrument>> {
-        todo!()
+        anyhow::bail!(
+            "load_synthetic not implemented for PostgreSQL cache adapter: {instrument_id}"
+        )
     }
 
     async fn load_account(&self, account_id: &AccountId) -> anyhow::Result<Option<AccountAny>> {
@@ -644,19 +873,19 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         rx.recv()?
     }
 
-    fn load_actor(&self, component_id: &ComponentId) -> anyhow::Result<AHashMap<String, Bytes>> {
-        todo!()
+    fn load_actor(&self, actor_id: &ActorId) -> anyhow::Result<AHashMap<String, Bytes>> {
+        anyhow::bail!("load_actor not implemented for PostgreSQL cache adapter: {actor_id}")
     }
 
-    fn delete_actor(&self, component_id: &ComponentId) -> anyhow::Result<()> {
+    fn delete_actor(&self, _actor_id: &ActorId) -> anyhow::Result<()> {
         todo!()
     }
 
     fn load_strategy(&self, strategy_id: &StrategyId) -> anyhow::Result<AHashMap<String, Bytes>> {
-        todo!()
+        anyhow::bail!("load_strategy not implemented for PostgreSQL cache adapter: {strategy_id}")
     }
 
-    fn delete_strategy(&self, component_id: &StrategyId) -> anyhow::Result<()> {
+    fn delete_strategy(&self, _strategy_id: &StrategyId) -> anyhow::Result<()> {
         todo!()
     }
 
@@ -697,7 +926,17 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         })
     }
 
-    fn add_synthetic(&self, synthetic: &SyntheticInstrument) -> anyhow::Result<()> {
+    fn add_instrument_close(&self, close: &InstrumentClose) -> anyhow::Result<()> {
+        self.tx
+            .send(DatabaseQuery::AddInstrumentClose(*close))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to send query add_instrument_close to database message handler: {e}"
+                )
+            })
+    }
+
+    fn add_synthetic(&self, _synthetic: &SyntheticInstrument) -> anyhow::Result<()> {
         todo!()
     }
 
@@ -741,7 +980,7 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         })
     }
 
-    fn add_order_book(&self, order_book: &OrderBook) -> anyhow::Result<()> {
+    fn add_order_book(&self, _order_book: &OrderBook) -> anyhow::Result<()> {
         todo!()
     }
 
@@ -977,8 +1216,8 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
 
     fn index_venue_order_id(
         &self,
-        client_order_id: ClientOrderId,
-        venue_order_id: VenueOrderId,
+        _client_order_id: ClientOrderId,
+        _venue_order_id: VenueOrderId,
     ) -> anyhow::Result<()> {
         todo!()
     }
@@ -996,20 +1235,33 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         })
     }
 
+    fn index_order_clients(&self, claims: &[(ClientOrderId, ClientId)]) -> anyhow::Result<()> {
+        if claims.is_empty() {
+            return Ok(());
+        }
+
+        let query = DatabaseQuery::IndexOrderClients(claims.to_vec());
+        self.tx.send(query).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to send query index_order_clients to database message handler: {e}"
+            )
+        })
+    }
+
     fn update_actor(
         &self,
-        _component_id: &ComponentId,
+        actor_id: &ActorId,
         _state: &AHashMap<String, Bytes>,
     ) -> anyhow::Result<()> {
-        todo!()
+        anyhow::bail!("update_actor not implemented for PostgreSQL cache adapter: {actor_id}")
     }
 
     fn update_strategy(
         &self,
-        _strategy_id: &StrategyId,
+        strategy_id: &StrategyId,
         _state: &AHashMap<String, Bytes>,
     ) -> anyhow::Result<()> {
-        todo!()
+        anyhow::bail!("update_strategy not implemented for PostgreSQL cache adapter: {strategy_id}")
     }
 
     fn update_account(&self, account: &AccountAny) -> anyhow::Result<()> {
@@ -1027,14 +1279,19 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
     }
 
     fn update_position(&self, position: &Position) -> anyhow::Result<()> {
-        let query = DatabaseQuery::UpdatePosition(position_last_event(position)?);
+        let query = if position.fill_voids.is_empty() {
+            DatabaseQuery::UpdatePosition(position_last_event(position)?)
+        } else {
+            DatabaseQuery::AddPositionSnapshot(PositionSnapshot::from_replay_state(position, None))
+        };
         self.tx.send(query).map_err(|e| {
             anyhow::anyhow!("Failed to send query update_position to database message handler: {e}")
         })
     }
 
     fn snapshot_order_state(&self, order: &OrderAny) -> anyhow::Result<()> {
-        todo!()
+        let snapshot = OrderSnapshot::from(order.clone());
+        self.add_order_snapshot(&snapshot)
     }
 
     fn snapshot_position_state(
@@ -1043,10 +1300,16 @@ impl CacheDatabaseAdapter for PostgresCacheDatabase {
         ts_snapshot: UnixNanos,
         unrealized_pnl: Option<Money>,
     ) -> anyhow::Result<()> {
-        todo!()
+        let mut snapshot = if position.fill_voids.is_empty() {
+            PositionSnapshot::from(position, unrealized_pnl)
+        } else {
+            PositionSnapshot::from_replay_state(position, unrealized_pnl)
+        };
+        snapshot.ts_init = ts_snapshot;
+        self.add_position_snapshot(&snapshot)
     }
 
-    fn heartbeat(&self, timestamp: UnixNanos) -> anyhow::Result<()> {
+    fn heartbeat(&self, _timestamp: UnixNanos) -> anyhow::Result<()> {
         todo!()
     }
 }
@@ -1161,6 +1424,9 @@ async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) {
                         .await
                 }
             },
+            DatabaseQuery::AddInstrumentClose(close) => {
+                DatabaseQueries::add_instrument_close(pool, &close).await
+            }
             DatabaseQuery::AddOrder(event, client_id) => {
                 DatabaseQueries::add_order(pool, event, client_id).await
             }
@@ -1189,6 +1455,9 @@ async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) {
             }
             DatabaseQuery::IndexOrderPosition(client_order_id, position_id) => {
                 DatabaseQueries::index_order_position(pool, client_order_id, position_id).await
+            }
+            DatabaseQuery::IndexOrderClients(claims) => {
+                DatabaseQueries::index_order_clients(pool, &claims).await
             }
         };
 

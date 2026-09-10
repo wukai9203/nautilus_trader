@@ -33,11 +33,11 @@ use nautilus_common::{
     msgbus::{self, MStr, Topic, TypedHandler, switchboard},
     timer::{TimeEvent, TimeEventCallback},
 };
-use nautilus_core::{UUID4, correctness::FAILED, datetime::millis_to_nanos_unchecked};
+use nautilus_core::{DurationNanos, UUID4, correctness::FAILED};
 use nautilus_model::{
     data::{QuoteTick, option_chain::OptionGreeks},
     enums::OptionKind,
-    identifiers::{InstrumentId, OptionSeriesId, Venue},
+    identifiers::{ClientId, InstrumentId, OptionSeriesId, Venue},
     instruments::Instrument,
     types::Price,
 };
@@ -67,10 +67,11 @@ pub struct OptionChainManager {
     msgbus_priority: u32,
     /// Whether the first ATM price has been received and the active set bootstrapped.
     bootstrapped: bool,
-    /// Shared deferred command queue — the `DataEngine` drains this on each data tick.
+    /// Shared deferred command queue - the `DataEngine` drains this on each data tick.
     deferred_cmd_queue: DeferredCommandQueue,
     /// Clock reference for constructing command timestamps.
     clock: Rc<RefCell<dyn Clock>>,
+    client_id: Option<ClientId>,
     /// When `true`, every quote/greeks update for an active instrument immediately publishes a snapshot.
     raw_mode: bool,
 }
@@ -95,6 +96,7 @@ impl OptionChainManager {
     ) -> Rc<RefCell<Self>> {
         let topic = switchboard::get_option_chain_topic(series_id);
         let instruments = Self::resolve_instruments(cache, &series_id);
+        let client_id = client.as_ref().map(|client| client.client_id);
 
         let mut tracker = AtmTracker::new();
 
@@ -111,7 +113,7 @@ impl OptionChainManager {
             OptionChainAggregator::new(series_id, cmd.strike_range.clone(), tracker, instruments);
 
         // Initial active set for msgbus handlers (subset of all instruments).
-        // When ATM is unknown (ATM-based ranges), this is empty — deferred until bootstrap.
+        // When ATM is unknown (ATM-based ranges), this is empty - deferred until bootstrap.
         let active_instrument_ids = aggregator.instrument_ids();
         let all_instrument_ids = aggregator.all_instrument_ids();
         // If active set is already populated (Fixed range or ATM provided), we're bootstrapped
@@ -129,6 +131,7 @@ impl OptionChainManager {
             bootstrapped,
             deferred_cmd_queue,
             clock: clock.clone(),
+            client_id,
             raw_mode,
         };
         let manager_rc = Rc::new(RefCell::new(manager));
@@ -148,7 +151,7 @@ impl OptionChainManager {
         );
 
         // Forward wire-level subscriptions for the active set.
-        // When ATM is unknown, active set is empty — deferred until bootstrap.
+        // When ATM is unknown, active set is empty - deferred until bootstrap.
         Self::forward_client_subscriptions(
             client,
             &active_instrument_ids,
@@ -246,7 +249,7 @@ impl OptionChainManager {
         };
 
         for instrument_id in instrument_ids {
-            client.execute_subscribe(SubscribeCommand::Quotes(SubscribeQuotes {
+            client.execute_subscribe_intent(SubscribeCommand::Quotes(SubscribeQuotes {
                 instrument_id: *instrument_id,
                 client_id: cmd.client_id,
                 venue: Some(venue),
@@ -255,16 +258,18 @@ impl OptionChainManager {
                 correlation_id: None,
                 params: None,
             }));
-            client.execute_subscribe(SubscribeCommand::OptionGreeks(SubscribeOptionGreeks {
-                instrument_id: *instrument_id,
-                client_id: cmd.client_id,
-                venue: Some(venue),
-                command_id: UUID4::new(),
-                ts_init,
-                correlation_id: None,
-                params: None,
-            }));
-            client.execute_subscribe(SubscribeCommand::InstrumentStatus(
+            client.execute_subscribe_intent(SubscribeCommand::OptionGreeks(
+                SubscribeOptionGreeks {
+                    instrument_id: *instrument_id,
+                    client_id: cmd.client_id,
+                    venue: Some(venue),
+                    command_id: UUID4::new(),
+                    ts_init,
+                    correlation_id: None,
+                    params: None,
+                },
+            ));
+            client.execute_subscribe_intent(SubscribeCommand::InstrumentStatus(
                 SubscribeInstrumentStatus {
                     instrument_id: *instrument_id,
                     client_id: cmd.client_id,
@@ -290,12 +295,15 @@ impl OptionChainManager {
         interval_ms: u64,
         clock: &Rc<RefCell<dyn Clock>>,
     ) -> Ustr {
-        let interval_ns = millis_to_nanos_unchecked(interval_ms as f64);
+        let interval_ns = DurationNanos::from_millis(interval_ms);
         let publisher = OptionChainSlicePublisher::new(manager_rc);
         let timer_name = Ustr::from(&format!("OptionChain|{series_id}|{interval_ms}"));
 
-        let now_ns = clock.borrow().timestamp_ns().as_u64();
-        let start_time_ns = now_ns - (now_ns % interval_ns) + interval_ns;
+        let now_ns = clock.borrow().timestamp_ns();
+        let start_time_ns = now_ns
+            .floor(interval_ns)
+            .checked_add(interval_ns)
+            .expect("Option chain timer start exceeds UnixNanos range");
 
         let callback_fn: Rc<dyn Fn(TimeEvent)> = Rc::new(move |event| publisher.publish(&event));
         let callback = TimeEventCallback::from(callback_fn);
@@ -305,7 +313,7 @@ impl OptionChainManager {
             .set_timer_ns(
                 &timer_name,
                 interval_ns,
-                Some(start_time_ns.into()),
+                Some(start_time_ns),
                 None,
                 Some(callback),
                 None,
@@ -326,6 +334,22 @@ impl OptionChainManager {
     #[must_use]
     pub fn venue(&self) -> Venue {
         self.aggregator.series_id().venue
+    }
+
+    /// Returns whether the active instrument set has been bootstrapped.
+    #[must_use]
+    pub const fn is_bootstrapped(&self) -> bool {
+        self.bootstrapped
+    }
+
+    #[must_use]
+    pub(crate) fn is_instrument_active(&self, instrument_id: &InstrumentId) -> bool {
+        self.aggregator.active_ids().contains(instrument_id)
+    }
+
+    #[must_use]
+    pub(crate) const fn client_id(&self) -> Option<ClientId> {
+        self.client_id
     }
 
     /// Tears down this manager: unregisters all msgbus handlers and cancels the timer.
@@ -363,7 +387,7 @@ impl OptionChainManager {
 
     /// Routes incoming greeks to the aggregator.
     ///
-    /// Also updates the ATM tracker from the forward price if `ForwardPrice` source is active,
+    /// Also updates the ATM tracker from the reference price when one is available,
     /// and triggers deferred bootstrap on the first arrival.
     pub fn handle_greeks(&mut self, greeks: &OptionGreeks) {
         if self.aggregator.is_expired(greeks.ts_event) {
@@ -378,13 +402,19 @@ impl OptionChainManager {
             return;
         }
 
-        // Update ATM tracker from forward price (ForwardPrice source only)
-        self.aggregator
+        if let Err(e) = self
+            .aggregator
             .atm_tracker_mut()
-            .update_from_option_greeks(greeks);
-        // Route greeks to aggregator for storage
+            .try_update_from_option_greeks(greeks)
+        {
+            log::warn!(
+                "Dropping greeks for {}: invalid forward price: {e}",
+                greeks.instrument_id,
+            );
+            return;
+        }
+
         self.aggregator.update_greeks(greeks);
-        // Check if first ATM arrival triggers deferred bootstrap
         self.maybe_bootstrap();
 
         if self.raw_mode
@@ -473,7 +503,7 @@ impl OptionChainManager {
             return;
         }
 
-        // First ATM received — compute active set and register handlers
+        // First ATM received - compute active set and register handlers
         let active_ids = self.aggregator.recompute_active_set();
         self.register_handlers_for_instruments_bulk(&active_ids);
 
@@ -550,7 +580,7 @@ impl OptionChainManager {
         queue.push_back(DeferredCommand::Subscribe(SubscribeCommand::Quotes(
             SubscribeQuotes {
                 instrument_id,
-                client_id: None,
+                client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
                 ts_init,
@@ -561,7 +591,7 @@ impl OptionChainManager {
         queue.push_back(DeferredCommand::Subscribe(SubscribeCommand::OptionGreeks(
             SubscribeOptionGreeks {
                 instrument_id,
-                client_id: None,
+                client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
                 ts_init,
@@ -572,7 +602,7 @@ impl OptionChainManager {
         queue.push_back(DeferredCommand::Subscribe(
             SubscribeCommand::InstrumentStatus(SubscribeInstrumentStatus {
                 instrument_id,
-                client_id: None,
+                client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
                 ts_init,
@@ -590,7 +620,7 @@ impl OptionChainManager {
         queue.push_back(DeferredCommand::Unsubscribe(UnsubscribeCommand::Quotes(
             UnsubscribeQuotes {
                 instrument_id,
-                client_id: None,
+                client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
                 ts_init,
@@ -601,7 +631,7 @@ impl OptionChainManager {
         queue.push_back(DeferredCommand::Unsubscribe(
             UnsubscribeCommand::OptionGreeks(UnsubscribeOptionGreeks {
                 instrument_id,
-                client_id: None,
+                client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
                 ts_init,
@@ -612,7 +642,7 @@ impl OptionChainManager {
         queue.push_back(DeferredCommand::Unsubscribe(
             UnsubscribeCommand::InstrumentStatus(UnsubscribeInstrumentStatus {
                 instrument_id,
-                client_id: None,
+                client_id: self.client_id,
                 venue: Some(venue),
                 command_id: UUID4::new(),
                 ts_init,
@@ -638,7 +668,7 @@ impl OptionChainManager {
 
         let ts_init = clock.borrow().timestamp_ns();
 
-        client.execute_subscribe(SubscribeCommand::Quotes(SubscribeQuotes {
+        client.execute_subscribe_intent(SubscribeCommand::Quotes(SubscribeQuotes {
             instrument_id,
             client_id: None,
             venue: Some(venue),
@@ -647,7 +677,7 @@ impl OptionChainManager {
             correlation_id: None,
             params: None,
         }));
-        client.execute_subscribe(SubscribeCommand::OptionGreeks(SubscribeOptionGreeks {
+        client.execute_subscribe_intent(SubscribeCommand::OptionGreeks(SubscribeOptionGreeks {
             instrument_id,
             client_id: None,
             venue: Some(venue),
@@ -656,7 +686,7 @@ impl OptionChainManager {
             correlation_id: None,
             params: None,
         }));
-        client.execute_subscribe(SubscribeCommand::InstrumentStatus(
+        client.execute_subscribe_intent(SubscribeCommand::InstrumentStatus(
             SubscribeInstrumentStatus {
                 instrument_id,
                 client_id: None,
@@ -846,6 +876,7 @@ mod tests {
             bootstrapped: true,
             deferred_cmd_queue: queue.clone(),
             clock,
+            client_id: None,
             raw_mode: false,
         };
         (manager, queue)
@@ -855,7 +886,7 @@ mod tests {
     fn test_manager_handle_quote_no_instrument() {
         let (mut manager, _queue) = make_manager();
 
-        // Should not panic — quote for unknown instrument
+        // Should not panic - quote for unknown instrument
         let quote = QuoteTick::new(
             InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
             Price::from("100.00"),
@@ -871,7 +902,7 @@ mod tests {
     #[rstest]
     fn test_manager_publish_slice_empty() {
         let (mut manager, _queue) = make_manager();
-        // Should not panic — empty slice skips publish
+        // Should not panic - empty slice skips publish
         manager.publish_slice(UnixNanos::from(100u64));
     }
 
@@ -879,7 +910,7 @@ mod tests {
     fn test_manager_teardown_no_handlers() {
         let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
         let (mut manager, _queue) = make_manager();
-        // Should not panic — no handlers to unregister
+        // Should not panic - no handlers to unregister
         manager.teardown(&clock);
         assert!(manager.quote_handlers.is_empty());
     }
@@ -922,6 +953,7 @@ mod tests {
             bootstrapped: false,
             deferred_cmd_queue: queue.clone(),
             clock,
+            client_id: None,
             raw_mode: false,
         };
         (manager, queue)
@@ -943,7 +975,7 @@ mod tests {
         // Initially no instruments active (ATM unknown, deferred)
         assert_eq!(manager.aggregator.instrument_ids().len(), 0);
 
-        // Feed ATM near 50000 via greeks — bootstrap computes active set (3 strikes × 2 = 6)
+        // Feed ATM near 50000 via greeks - bootstrap computes active set (3 strikes × 2 = 6)
         bootstrap_via_greeks(&mut manager);
         assert!(manager.bootstrapped);
         assert_eq!(manager.aggregator.instrument_ids().len(), 6); // 3 strikes × 2
@@ -1018,7 +1050,7 @@ mod tests {
         assert!(manager.bootstrapped);
         let count = manager.aggregator.instrument_ids().len();
 
-        // Feed another ATM update — bootstrap should not fire again
+        // Feed another ATM update - bootstrap should not fire again
         let greeks2 = OptionGreeks {
             instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
             underlying_price: Some(50200.0),
@@ -1070,6 +1102,64 @@ mod tests {
         };
         manager.handle_greeks(&greeks);
         assert!(!manager.bootstrapped);
+    }
+
+    #[rstest]
+    fn test_manager_forward_price_rejects_invalid_underlying() {
+        use nautilus_model::data::option_chain::OptionGreeks;
+
+        let (mut manager, queue) = make_option_chain_manager();
+        let greeks = OptionGreeks {
+            instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
+            underlying_price: Some(f64::NAN),
+            ..Default::default()
+        };
+
+        manager.handle_greeks(&greeks);
+
+        assert!(!manager.bootstrapped);
+        assert!(manager.aggregator.atm_tracker().atm_price().is_none());
+        assert!(queue.borrow().is_empty());
+    }
+
+    #[rstest]
+    fn test_manager_forward_price_rejects_invalid_underlying_without_buffering_greeks() {
+        use nautilus_model::data::{greeks::OptionGreekValues, option_chain::OptionGreeks};
+
+        let (mut manager, queue) = make_option_chain_manager();
+        bootstrap_via_greeks(&mut manager);
+        queue.borrow_mut().clear();
+
+        let instrument_id = InstrumentId::from("BTC-20240101-50000-C.DERIBIT");
+        let quote = QuoteTick::new(
+            instrument_id,
+            Price::from("100.00"),
+            Price::from("101.00"),
+            Quantity::from("1.0"),
+            Quantity::from("1.0"),
+            UnixNanos::from(1u64),
+            UnixNanos::from(1u64),
+        );
+        manager.handle_quote(&quote);
+
+        let greeks = OptionGreeks {
+            instrument_id,
+            underlying_price: Some(f64::NAN),
+            greeks: OptionGreekValues {
+                delta: 0.55,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        manager.handle_greeks(&greeks);
+
+        let slice = manager.aggregator.snapshot(UnixNanos::from(2u64));
+        assert_eq!(
+            manager.aggregator.atm_tracker().atm_price().unwrap(),
+            Price::from("50000.00")
+        );
+        assert!(slice.get_call_greeks(&Price::from("50000")).is_none());
+        assert!(queue.borrow().is_empty());
     }
 
     #[rstest]
@@ -1135,6 +1225,7 @@ mod tests {
             bootstrapped: true,
             deferred_cmd_queue: queue,
             clock,
+            client_id: None,
             raw_mode: false,
         };
 
@@ -1162,7 +1253,7 @@ mod tests {
         bootstrap_via_greeks(&mut manager);
         queue.borrow_mut().clear();
 
-        // Publish at the expiration timestamp — should push ExpireSeries, not publish
+        // Publish at the expiration timestamp - should push ExpireSeries, not publish
         let expiry_ns = manager.aggregator.series_id().expiration_ns;
         manager.publish_slice(expiry_ns);
 

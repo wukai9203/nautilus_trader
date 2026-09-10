@@ -13,10 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, HashMap};
 
 use nautilus_core::{UnixNanos, python::to_pyvalue_err};
 use nautilus_model::{
@@ -26,20 +23,7 @@ use nautilus_model::{
 };
 use pyo3::prelude::*;
 
-use crate::{
-    Returns,
-    analyzer::{PortfolioAnalyzer, Statistic},
-    statistics::{
-        alpha::Alpha, beta_ratio::BetaRatio, expectancy::Expectancy,
-        information_ratio::InformationRatio, long_ratio::LongRatio, loser_avg::AvgLoser,
-        loser_max::MaxLoser, loser_min::MinLoser, profit_factor::ProfitFactor,
-        returns_avg::ReturnsAverage, returns_avg_loss::ReturnsAverageLoss,
-        returns_avg_win::ReturnsAverageWin, returns_volatility::ReturnsVolatility,
-        risk_return_ratio::RiskReturnRatio, sharpe_ratio::SharpeRatio, sortino_ratio::SortinoRatio,
-        tracking_error::TrackingError, treynor_ratio::TreynorRatio, win_rate::WinRate,
-        winner_avg::AvgWinner, winner_max::MaxWinner, winner_min::MinWinner,
-    },
-};
+use crate::{Returns, analyzer::PortfolioAnalyzer, python::statistic::statistic_from_pyobject};
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -65,7 +49,7 @@ impl PortfolioAnalyzer {
         self.currencies().into_iter().copied().collect()
     }
 
-    /// Calculates total PnL including unrealized PnL if provided.
+    /// Gets all return-based performance statistics.
     #[pyo3(name = "get_performance_stats_returns")]
     fn py_get_performance_stats_returns(&self) -> HashMap<String, f64> {
         self.get_performance_stats_returns().into_iter().collect()
@@ -107,6 +91,15 @@ impl PortfolioAnalyzer {
             .collect()
     }
 
+    /// Gets all PnL-related performance statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if PnL calculations fail, for example due to:
+    ///
+    /// - No currency specified for a multi-currency portfolio.
+    /// - Unrealized PnL currency not matching the specified currency.
+    /// - Specified currency not found in account balances.
     #[pyo3(name = "get_performance_stats_pnls")]
     fn py_get_performance_stats_pnls(
         &self,
@@ -139,6 +132,8 @@ impl PortfolioAnalyzer {
     }
 
     /// Resets all analysis data to initial state.
+    ///
+    /// Registered statistics are retained; use `Self.deregister_statistics` to clear them.
     #[pyo3(name = "reset")]
     fn py_reset(&mut self) {
         self.reset();
@@ -146,217 +141,15 @@ impl PortfolioAnalyzer {
 
     /// Registers a new portfolio statistic for calculation.
     #[pyo3(name = "register_statistic")]
-    #[expect(clippy::needless_pass_by_value)]
     fn py_register_statistic(&mut self, py: Python, statistic: Py<PyAny>) -> PyResult<()> {
-        let type_name = statistic
-            .getattr(py, "__class__")?
-            .getattr(py, "__name__")?
-            .extract::<String>(py)?;
-
-        match type_name.as_str() {
-            "MaxWinner" => {
-                let stat = statistic.extract::<MaxWinner>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "MinWinner" => {
-                let stat = statistic.extract::<MinWinner>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "AvgWinner" => {
-                let stat = statistic.extract::<AvgWinner>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "MaxLoser" => {
-                let stat = statistic.extract::<MaxLoser>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "MinLoser" => {
-                let stat = statistic.extract::<MinLoser>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "AvgLoser" => {
-                let stat = statistic.extract::<AvgLoser>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "Expectancy" => {
-                let stat = statistic.extract::<Expectancy>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "WinRate" => {
-                let stat = statistic.extract::<WinRate>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "ReturnsVolatility" => {
-                let stat = statistic.extract::<ReturnsVolatility>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "ReturnsAverage" => {
-                let stat = statistic.extract::<ReturnsAverage>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "ReturnsAverageLoss" => {
-                let stat = statistic.extract::<ReturnsAverageLoss>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "ReturnsAverageWin" => {
-                let stat = statistic.extract::<ReturnsAverageWin>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "SharpeRatio" => {
-                let stat = statistic.extract::<SharpeRatio>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "SortinoRatio" => {
-                let stat = statistic.extract::<SortinoRatio>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "ProfitFactor" => {
-                let stat = statistic.extract::<ProfitFactor>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "RiskReturnRatio" => {
-                let stat = statistic.extract::<RiskReturnRatio>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "LongRatio" => {
-                let stat = statistic.extract::<LongRatio>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "Alpha" => {
-                let stat = statistic.extract::<Alpha>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "BetaRatio" => {
-                let stat = statistic.extract::<BetaRatio>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "InformationRatio" => {
-                let stat = statistic.extract::<InformationRatio>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "TrackingError" => {
-                let stat = statistic.extract::<TrackingError>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            "TreynorRatio" => {
-                let stat = statistic.extract::<TreynorRatio>(py)?;
-                self.register_statistic(Arc::new(stat));
-            }
-            _ => {
-                return Err(to_pyvalue_err(format!(
-                    "Unknown statistic type: {type_name}"
-                )));
-            }
-        }
-
+        self.register_statistic(statistic_from_pyobject(py, statistic)?);
         Ok(())
     }
 
     /// Removes a specific statistic from calculation.
     #[pyo3(name = "deregister_statistic")]
-    #[expect(clippy::needless_pass_by_value)]
     fn py_deregister_statistic(&mut self, py: Python, statistic: Py<PyAny>) -> PyResult<()> {
-        let type_name = statistic
-            .getattr(py, "__class__")?
-            .getattr(py, "__name__")?
-            .extract::<String>(py)?;
-
-        match type_name.as_str() {
-            "MaxWinner" => {
-                let stat = statistic.extract::<MaxWinner>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "MinWinner" => {
-                let stat = statistic.extract::<MinWinner>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "AvgWinner" => {
-                let stat = statistic.extract::<AvgWinner>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "MaxLoser" => {
-                let stat = statistic.extract::<MaxLoser>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "MinLoser" => {
-                let stat = statistic.extract::<MinLoser>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "AvgLoser" => {
-                let stat = statistic.extract::<AvgLoser>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "Expectancy" => {
-                let stat = statistic.extract::<Expectancy>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "WinRate" => {
-                let stat = statistic.extract::<WinRate>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "ReturnsVolatility" => {
-                let stat = statistic.extract::<ReturnsVolatility>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "ReturnsAverage" => {
-                let stat = statistic.extract::<ReturnsAverage>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "ReturnsAverageLoss" => {
-                let stat = statistic.extract::<ReturnsAverageLoss>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "ReturnsAverageWin" => {
-                let stat = statistic.extract::<ReturnsAverageWin>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "SharpeRatio" => {
-                let stat = statistic.extract::<SharpeRatio>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "SortinoRatio" => {
-                let stat = statistic.extract::<SortinoRatio>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "ProfitFactor" => {
-                let stat = statistic.extract::<ProfitFactor>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "RiskReturnRatio" => {
-                let stat = statistic.extract::<RiskReturnRatio>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "LongRatio" => {
-                let stat = statistic.extract::<LongRatio>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "Alpha" => {
-                let stat = statistic.extract::<Alpha>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "BetaRatio" => {
-                let stat = statistic.extract::<BetaRatio>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "InformationRatio" => {
-                let stat = statistic.extract::<InformationRatio>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "TrackingError" => {
-                let stat = statistic.extract::<TrackingError>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            "TreynorRatio" => {
-                let stat = statistic.extract::<TreynorRatio>(py)?;
-                self.deregister_statistic(&(Arc::new(stat) as Statistic));
-            }
-            _ => {
-                return Err(to_pyvalue_err(format!(
-                    "Unknown statistic type: {type_name}"
-                )));
-            }
-        }
-
+        self.deregister_statistic(&statistic_from_pyobject(py, statistic)?);
         Ok(())
     }
 
@@ -370,40 +163,33 @@ impl PortfolioAnalyzer {
     #[pyo3(name = "add_positions")]
     #[expect(clippy::needless_pass_by_value)]
     fn py_add_positions(&mut self, py: Python, positions: Vec<Py<PyAny>>) -> PyResult<()> {
-        // Extract Position objects from Cython wrappers
         let positions: Vec<Position> = positions
             .iter()
-            .map(|p| {
-                // Try to get the underlying Rust Position
-                // For now, we'll need to handle Cython Position by accessing its _mem field
-                p.getattr(py, "_mem")?
-                    .extract::<Position>(py)
-                    .map_err(Into::into)
-            })
+            .map(|position| position.extract::<Position>(py).map_err(Into::into))
             .collect::<PyResult<Vec<Position>>>()?;
 
         self.add_positions(&positions);
         Ok(())
     }
 
-    /// Records a trade's PnL.
+    /// Records a trade's PnL realized at `ts_event`.
     #[pyo3(name = "add_trade")]
     #[allow(
         clippy::trivially_copy_pass_by_ref,
         reason = "matches underlying add_trade signature"
     )]
-    fn py_add_trade(&mut self, position_id: &PositionId, realized_pnl: &Money) {
-        self.add_trade(position_id, realized_pnl);
+    fn py_add_trade(&mut self, position_id: &PositionId, ts_event: u64, realized_pnl: &Money) {
+        self.add_trade(position_id, UnixNanos::from(ts_event), realized_pnl);
     }
 
-    /// Records a trade's PnL observed during portfolio processing.
+    /// Records a trade's PnL realized at `ts_event`, observed during portfolio processing.
     #[pyo3(name = "record_trade")]
     #[allow(
         clippy::trivially_copy_pass_by_ref,
         reason = "matches underlying record_trade signature"
     )]
-    fn py_record_trade(&mut self, position_id: &PositionId, realized_pnl: &Money) {
-        self.record_trade(position_id, realized_pnl);
+    fn py_record_trade(&mut self, position_id: &PositionId, ts_event: u64, realized_pnl: &Money) {
+        self.record_trade(position_id, UnixNanos::from(ts_event), realized_pnl);
     }
 
     // Note: calculate_statistics is not exposed to Python because it requires
@@ -451,23 +237,31 @@ impl PortfolioAnalyzer {
 
     /// Retrieves realized PnLs for a specific currency.
     ///
-    /// Returns `None` if no PnLs exist, or if multiple currencies exist
-    /// without an explicit currency specified.
+    /// Each record is `(position_id, ts_event, realized_pnl)`, in ascending `ts_event` order.
+    /// Returns `None` if no PnLs exist, or if multiple currencies exist without an explicit
+    /// currency specified.
     #[pyo3(name = "realized_pnls")]
     fn py_realized_pnls(&self, py: Python, currency: Option<&Currency>) -> PyResult<Py<PyAny>> {
         match self.realized_pnls(currency) {
             Some(pnls) => {
-                // Convert Vec<(PositionId, f64)> to Python list of tuples or dict
-                let dict = pyo3::types::PyDict::new(py);
-                for (position_id, pnl) in pnls {
-                    dict.set_item(position_id.to_string(), pnl)?;
+                let list = pyo3::types::PyList::empty(py);
+                for (position_id, ts_event, pnl) in pnls {
+                    list.append((position_id.to_string(), ts_event.as_u64(), pnl))?;
                 }
-                Ok(dict.into())
+                Ok(list.into())
             }
             None => Ok(py.None()),
         }
     }
 
+    /// Calculates total PnL including unrealized PnL if provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No currency is specified in a multi-currency portfolio.
+    /// - The specified currency is not found in account balances.
+    /// - The unrealized PnL currency does not match the specified currency.
     #[pyo3(name = "total_pnl")]
     fn py_total_pnl(
         &self,
@@ -478,6 +272,14 @@ impl PortfolioAnalyzer {
             .map_err(to_pyvalue_err)
     }
 
+    /// Calculates total PnL as a percentage of starting balance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No currency is specified in a multi-currency portfolio.
+    /// - The specified currency is not found in account balances.
+    /// - The unrealized PnL currency does not match the specified currency.
     #[pyo3(name = "total_pnl_percentage")]
     fn py_total_pnl_percentage(
         &self,
@@ -489,6 +291,10 @@ impl PortfolioAnalyzer {
     }
 
     /// Gets formatted PnL statistics as strings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if PnL statistics calculation fails.
     #[pyo3(name = "get_stats_pnls_formatted")]
     fn py_get_stats_pnls_formatted(
         &self,

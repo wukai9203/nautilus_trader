@@ -15,6 +15,7 @@
 
 //! Configuration types for the BitMEX adapter clients.
 
+use nautilus_core::{correctness::check_in_range_inclusive_usize, string::secret::SecretString};
 use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
@@ -25,12 +26,27 @@ use crate::common::{
     enums::BitmexEnvironment,
 };
 
+pub(crate) const MAX_BROADCASTER_POOL_SIZE: usize = 16;
+
+/// Validates a BitMEX broadcaster pool size.
+///
+/// # Errors
+///
+/// Returns an error if `pool_size` is outside `[1, 16]`.
+pub(crate) fn validate_broadcaster_pool_size(
+    pool_size: usize,
+    parameter: &str,
+) -> anyhow::Result<()> {
+    check_in_range_inclusive_usize(pool_size, 1, MAX_BROADCASTER_POOL_SIZE, parameter)?;
+    Ok(())
+}
+
 /// Configuration for the BitMEX live data client.
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bitmex", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bitmex", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -38,15 +54,15 @@ use crate::common::{
 )]
 pub struct BitmexDataClientConfig {
     /// Optional API key used for authenticated REST/WebSocket requests.
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     /// Optional API secret used for authenticated REST/WebSocket requests.
-    pub api_secret: Option<String>,
+    pub api_secret: Option<SecretString>,
     /// Optional override for the REST base URL.
     pub base_url_http: Option<String>,
     /// Optional override for the WebSocket URL.
     pub base_url_ws: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// REST timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -61,6 +77,9 @@ pub struct BitmexDataClientConfig {
     pub retry_delay_max_ms: u64,
     /// Optional heartbeat interval (seconds) for the WebSocket client.
     pub heartbeat_interval_secs: Option<u64>,
+    /// Optional WebSocket authentication timeout (seconds), defaulting to
+    /// `AUTHENTICATION_TIMEOUT_SECS` when unset.
+    pub auth_timeout_secs: Option<u64>,
     /// Receive window in milliseconds for signed requests.
     ///
     /// This value determines how far in the future the `api-expires` timestamp will be set
@@ -96,6 +115,25 @@ pub struct BitmexDataClientConfig {
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
+
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(BitmexDataClientConfig {
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: Option<u64>,
+    auth_timeout_secs: Option<u64>,
+    recv_window_ms: u64,
+    active_only: bool,
+    update_instruments_interval_mins: Option<u64>,
+    environment: BitmexEnvironment,
+    max_requests_per_second: u32,
+    max_requests_per_minute: u32,
+    transport_backend: TransportBackend,
+});
 
 impl Default for BitmexDataClientConfig {
     fn default() -> Self {
@@ -144,27 +182,30 @@ impl BitmexDataClientConfig {
 }
 
 /// Configuration for the BitMEX live execution client.
+///
+/// The submit and cancel broadcaster pools must each contain `[1, 15]` clients, with a combined
+/// size in `[2, 16]`.
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bitmex", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bitmex", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitmex")
 )]
-pub struct BitmexExecClientConfig {
+pub struct BitmexExecutionClientConfig {
     /// API key used for authenticated requests.
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     /// API secret used for authenticated requests.
-    pub api_secret: Option<String>,
+    pub api_secret: Option<SecretString>,
     /// Optional override for the REST base URL.
     pub base_url_http: Option<String>,
     /// Optional override for the WebSocket URL.
     pub base_url_ws: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// REST timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -180,6 +221,9 @@ pub struct BitmexExecClientConfig {
     /// Heartbeat interval (seconds) for the WebSocket client.
     #[builder(default = 5)]
     pub heartbeat_interval_secs: u64,
+    /// Optional WebSocket authentication timeout (seconds), defaulting to
+    /// `AUTHENTICATION_TIMEOUT_SECS` when unset.
+    pub auth_timeout_secs: Option<u64>,
     /// Receive window in milliseconds for signed requests.
     ///
     /// This value determines how far in the future the `api-expires` timestamp will be set
@@ -211,14 +255,16 @@ pub struct BitmexExecClientConfig {
     /// Maximum number of requests per minute (rolling window).
     #[builder(default = 120)]
     pub max_requests_per_minute: u32,
-    /// Number of HTTP clients in the submit broadcaster pool (defaults to 1).
+    /// Number of HTTP clients in the submit broadcaster pool
+    /// (effective range `[1, 15]`, defaults to 1).
     pub submitter_pool_size: Option<usize>,
-    /// Number of HTTP clients in the cancel broadcaster pool (defaults to 1).
+    /// Number of HTTP clients in the cancel broadcaster pool
+    /// (effective range `[1, 15]`, defaults to 1).
     pub canceller_pool_size: Option<usize>,
     /// Optional list of proxy URLs for submit broadcaster pool (path diversity).
-    pub submitter_proxy_urls: Option<Vec<String>>,
+    pub submitter_proxy_urls: Option<Vec<SecretString>>,
     /// Optional list of proxy URLs for cancel broadcaster pool (path diversity).
-    pub canceller_proxy_urls: Option<Vec<String>>,
+    pub canceller_proxy_urls: Option<Vec<SecretString>>,
     /// Optional dead man's switch timeout in seconds.
     ///
     /// When set, a background task periodically calls the BitMEX `cancelAllAfter` endpoint
@@ -231,17 +277,62 @@ pub struct BitmexExecClientConfig {
     pub transport_backend: TransportBackend,
 }
 
-impl Default for BitmexExecClientConfig {
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(BitmexExecutionClientConfig {
+    base_url_http: Option<String>,
+    base_url_ws: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    auth_timeout_secs: Option<u64>,
+    recv_window_ms: u64,
+    active_only: bool,
+    environment: BitmexEnvironment,
+    account_id: Option<AccountId>,
+    max_requests_per_second: u32,
+    max_requests_per_minute: u32,
+    submitter_pool_size: Option<usize>,
+    canceller_pool_size: Option<usize>,
+    deadmans_switch_timeout_secs: Option<u64>,
+    transport_backend: TransportBackend,
+});
+
+impl Default for BitmexExecutionClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl BitmexExecClientConfig {
+impl BitmexExecutionClientConfig {
     /// Creates a configuration with default values.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Validates the individual and combined broadcaster pool sizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either pool is outside `[1, 15]` or their combined size is outside
+    /// `[2, 16]`.
+    pub(crate) fn validate_broadcaster_pool_sizes(&self) -> anyhow::Result<()> {
+        let submitter_pool_size = self.submitter_pool_size.unwrap_or(1);
+        let canceller_pool_size = self.canceller_pool_size.unwrap_or(1);
+        validate_broadcaster_pool_size(submitter_pool_size, "submitter_pool_size")?;
+        validate_broadcaster_pool_size(canceller_pool_size, "canceller_pool_size")?;
+        let combined_pool_size = submitter_pool_size
+            .checked_add(canceller_pool_size)
+            .ok_or_else(|| anyhow::anyhow!("combined BitMEX broadcaster pool size overflow"))?;
+        check_in_range_inclusive_usize(
+            combined_pool_size,
+            2,
+            MAX_BROADCASTER_POOL_SIZE,
+            "combined_pool_size",
+        )?;
+        Ok(())
     }
 
     /// Returns `true` if both API key and secret are available
@@ -284,6 +375,57 @@ mod tests {
     use super::*;
 
     #[rstest]
+    #[case(1)]
+    #[case(3)]
+    #[case(MAX_BROADCASTER_POOL_SIZE)]
+    fn test_validate_broadcaster_pool_size_accepts_supported_values(#[case] pool_size: usize) {
+        assert!(validate_broadcaster_pool_size(pool_size, "pool_size").is_ok());
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(MAX_BROADCASTER_POOL_SIZE + 1)]
+    #[case(usize::MAX)]
+    fn test_validate_broadcaster_pool_size_rejects_invalid_values(#[case] pool_size: usize) {
+        assert!(validate_broadcaster_pool_size(pool_size, "pool_size").is_err());
+    }
+
+    #[rstest]
+    #[case(Some(1), Some(1))]
+    #[case(Some(MAX_BROADCASTER_POOL_SIZE - 1), Some(1))]
+    #[case(Some(1), Some(MAX_BROADCASTER_POOL_SIZE - 1))]
+    fn test_execution_config_accepts_supported_combined_pool_size(
+        #[case] submitter_pool_size: Option<usize>,
+        #[case] canceller_pool_size: Option<usize>,
+    ) {
+        let config = BitmexExecutionClientConfig {
+            submitter_pool_size,
+            canceller_pool_size,
+            ..Default::default()
+        };
+
+        assert!(config.validate_broadcaster_pool_sizes().is_ok());
+    }
+
+    #[rstest]
+    #[case(Some(0), Some(1))]
+    #[case(Some(1), Some(0))]
+    #[case(Some(MAX_BROADCASTER_POOL_SIZE), Some(1))]
+    #[case(Some(usize::MAX), Some(1))]
+    fn test_execution_config_rejects_invalid_pool_sizes(
+        #[case] submitter_pool_size: Option<usize>,
+        #[case] canceller_pool_size: Option<usize>,
+    ) {
+        let config = BitmexExecutionClientConfig {
+            submitter_pool_size,
+            canceller_pool_size,
+            ..Default::default()
+        };
+
+        assert!(config.validate_broadcaster_pool_sizes().is_err());
+    }
+
+    #[rstest]
     fn test_data_config_toml_minimal() {
         let config: BitmexDataClientConfig = toml::from_str(
             r#"
@@ -303,8 +445,8 @@ max_requests_per_second = 5
 
     #[rstest]
     fn test_exec_config_toml_empty_uses_defaults() {
-        let config: BitmexExecClientConfig = toml::from_str("").unwrap();
-        let expected = BitmexExecClientConfig::default();
+        let config: BitmexExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = BitmexExecutionClientConfig::default();
 
         assert_eq!(config.environment, expected.environment);
         assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
@@ -319,5 +461,59 @@ max_requests_per_second = 5
             expected.max_requests_per_second,
         );
         assert_eq!(config.transport_backend, expected.transport_backend);
+    }
+
+    #[rstest]
+    fn test_config_auth_timeout_secs() {
+        assert_eq!(BitmexDataClientConfig::default().auth_timeout_secs, None);
+        assert_eq!(
+            BitmexExecutionClientConfig::default().auth_timeout_secs,
+            None
+        );
+
+        let data = BitmexDataClientConfig::builder()
+            .auth_timeout_secs(3)
+            .build();
+        assert_eq!(data.auth_timeout_secs, Some(3));
+
+        let exec = BitmexExecutionClientConfig::builder()
+            .auth_timeout_secs(4)
+            .build();
+        assert_eq!(exec.auth_timeout_secs, Some(4));
+
+        let data: BitmexDataClientConfig = toml::from_str("auth_timeout_secs = 7\n").unwrap();
+        assert_eq!(data.auth_timeout_secs, Some(7));
+
+        let exec: BitmexExecutionClientConfig = toml::from_str("auth_timeout_secs = 8\n").unwrap();
+        assert_eq!(exec.auth_timeout_secs, Some(8));
+    }
+
+    #[rstest]
+    fn test_config_debug_redacts_credentials() {
+        let data = BitmexDataClientConfig {
+            api_key: Some("data-api-key".into()),
+            api_secret: Some("data-api-secret".into()),
+            proxy_url: Some("http://data-user:data-password@localhost".into()),
+            ..Default::default()
+        };
+        let execution = BitmexExecutionClientConfig {
+            api_key: Some("execution-api-key".into()),
+            api_secret: Some("execution-api-secret".into()),
+            proxy_url: Some("http://execution-user:execution-password@localhost".into()),
+            submitter_proxy_urls: Some(vec!["http://submit-user:submit-password@localhost".into()]),
+            canceller_proxy_urls: Some(vec!["http://cancel-user:cancel-password@localhost".into()]),
+            ..Default::default()
+        };
+
+        let debug = format!("{data:?} {execution:?}");
+
+        assert!(!debug.contains("data-api-key"));
+        assert!(!debug.contains("data-api-secret"));
+        assert!(!debug.contains("data-password"));
+        assert!(!debug.contains("execution-api-key"));
+        assert!(!debug.contains("execution-api-secret"));
+        assert!(!debug.contains("execution-password"));
+        assert!(!debug.contains("submit-password"));
+        assert!(!debug.contains("cancel-password"));
     }
 }

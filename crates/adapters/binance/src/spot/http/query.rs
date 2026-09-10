@@ -15,7 +15,11 @@
 
 //! Query parameter builders for Binance Spot HTTP requests.
 
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::string::secret::SecretString;
 use serde::Serialize;
+use zeroize::Zeroize;
 
 use crate::{
     common::enums::{BinanceSelfTradePreventionMode, BinanceSide, BinanceTimeInForce},
@@ -75,6 +79,50 @@ impl TradesParams {
     pub fn with_limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
         self
+    }
+}
+
+/// Query parameters for the aggregate trades endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct AggTradesParams {
+    /// Trading pair symbol.
+    pub symbol: String,
+    /// Aggregate trade ID to begin from, inclusive.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "fromId")]
+    pub from_id: Option<i64>,
+    /// Start time in milliseconds, inclusive.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "startTime")]
+    pub start_time: Option<i64>,
+    /// End time in milliseconds, inclusive.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "endTime")]
+    pub end_time: Option<i64>,
+    /// Number of aggregate trades to return (default 500, max 1000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[cfg(test)]
+mod market_data_tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_agg_trades_params_serialization() {
+        let params = AggTradesParams {
+            symbol: "ETHUSDT".to_string(),
+            from_id: Some(123),
+            start_time: Some(1_700_000_000_001),
+            end_time: Some(1_700_000_000_999),
+            limit: Some(456),
+        };
+
+        let serialized = serde_urlencoded::to_string(&params).unwrap();
+
+        assert_eq!(
+            serialized,
+            "symbol=ETHUSDT&fromId=123&startTime=1700000000001&endTime=1700000000999&limit=456"
+        );
     }
 }
 
@@ -306,6 +354,12 @@ pub struct CancelReplaceOrderParams {
         rename = "cancelOrigClientOrderId"
     )]
     pub cancel_orig_client_order_id: Option<String>,
+    /// Client order ID for the cancel half of the request.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "cancelNewClientOrderId"
+    )]
+    pub cancel_new_client_order_id: Option<String>,
     /// New client order ID.
     #[serde(skip_serializing_if = "Option::is_none", rename = "newClientOrderId")]
     pub new_client_order_id: Option<String>,
@@ -680,6 +734,23 @@ pub struct AccountInfoParams {
     pub omit_zero_balances: Option<bool>,
 }
 
+/// Query parameters for account-specific symbol commission rates.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountCommissionParams {
+    /// Venue symbol.
+    pub symbol: String,
+}
+
+impl AccountCommissionParams {
+    /// Creates commission query parameters for `symbol`.
+    #[must_use]
+    pub fn new(symbol: impl Into<String>) -> Self {
+        Self {
+            symbol: symbol.into(),
+        }
+    }
+}
+
 impl AccountInfoParams {
     /// Create new account info params.
     #[must_use]
@@ -776,17 +847,17 @@ pub struct KlinesParams {
 }
 
 /// Query parameters for listen key operations (extend/close).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Zeroize)]
 pub struct ListenKeyParams {
     /// The listen key to extend or close.
     #[serde(rename = "listenKey")]
-    pub listen_key: String,
+    pub listen_key: SecretString,
 }
 
 impl ListenKeyParams {
     /// Creates new listen key params.
     #[must_use]
-    pub fn new(listen_key: impl Into<String>) -> Self {
+    pub fn new(listen_key: impl Into<SecretString>) -> Self {
         Self {
             listen_key: listen_key.into(),
         }
@@ -941,5 +1012,28 @@ impl BatchCancelItem {
             order_id: None,
             orig_client_order_id: Some(client_order_id.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use zeroize::Zeroize;
+
+    use super::*;
+
+    #[rstest]
+    fn test_listen_key_params_preserve_wire_value_and_redact_debug() {
+        let mut params = ListenKeyParams::new("listen-key-secret");
+
+        let serialized = serde_urlencoded::to_string(&params).unwrap();
+        let debug = format!("{params:?}");
+
+        assert_eq!(serialized, "listenKey=listen-key-secret");
+        assert!(debug.contains(REDACTED));
+        assert!(!debug.contains(params.listen_key.expose_secret()));
+
+        params.zeroize();
+        assert!(params.listen_key.expose_secret().is_empty());
     }
 }

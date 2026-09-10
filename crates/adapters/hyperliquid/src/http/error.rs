@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_network::http::{HttpClientError, ReqwestError, StatusCode};
+use nautilus_network::http::{HttpClientError, StatusCode};
 use thiserror::Error;
 
 /// Error type for Hyperliquid operations
@@ -136,27 +136,6 @@ impl Error {
         }
     }
 
-    /// Map reqwest errors to appropriate error types
-    #[expect(clippy::needless_pass_by_value)]
-    pub fn from_reqwest(error: ReqwestError) -> Self {
-        if error.is_timeout() {
-            Self::Timeout
-        } else if let Some(status) = error.status() {
-            let status_code = status.as_u16();
-            match status_code {
-                401 | 403 => Self::auth(format!("HTTP {status_code}: authentication failed")),
-                400 => Self::bad_request(format!("HTTP {status_code}: bad request")),
-                429 => Self::rate_limit("unknown", 0, None),
-                500..=599 => Self::exchange(format!("HTTP {status_code}: server error")),
-                _ => Self::http(status_code, format!("HTTP error: {error}")),
-            }
-        } else if error.is_connect() || error.is_request() {
-            Self::transport(format!("Request error: {error}"))
-        } else {
-            Self::transport(format!("Unknown reqwest error: {error}"))
-        }
-    }
-
     /// Map HTTP client errors to appropriate error types
     #[expect(clippy::needless_pass_by_value)]
     pub fn from_http_client(error: HttpClientError) -> Self {
@@ -185,6 +164,14 @@ impl Error {
     /// Check if the error is a transport-layer failure with undefined venue outcome.
     pub fn is_transport_error(&self) -> bool {
         matches!(self, Self::Transport(_) | Self::Timeout | Self::Io(_))
+    }
+
+    /// Check if the error is an HTTP 422 Unprocessable Entity response.
+    ///
+    /// Hyperliquid returns 422 from info endpoints that depend on the indexer
+    /// (such as `recentTrades`) when served by a node without it.
+    pub fn is_unprocessable_entity(&self) -> bool {
+        matches!(self, Self::Http { status: 422, .. })
     }
 }
 
@@ -252,6 +239,15 @@ mod tests {
         assert!(!Error::exchange("HTTP 500").is_transport_error());
         assert!(!Error::decode("bad json").is_transport_error());
         assert!(!Error::nonce_window("stale").is_transport_error());
+    }
+
+    #[rstest]
+    fn test_is_unprocessable_entity() {
+        assert!(Error::http(422, "indexer unavailable").is_unprocessable_entity());
+
+        assert!(!Error::http(404, "not found").is_unprocessable_entity());
+        assert!(!Error::http(500, "server error").is_unprocessable_entity());
+        assert!(!Error::bad_request("malformed payload").is_unprocessable_entity());
     }
 
     #[rstest]

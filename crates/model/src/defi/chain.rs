@@ -473,7 +473,7 @@ pub mod chains {
         LazyLock::new(|| Chain::new(Blockchain::Hyperliquid, 7979));
     pub static HYPERLIQUID_TEMP: LazyLock<Chain> =
         LazyLock::new(|| Chain::new(Blockchain::HyperliquidTemp, 7978));
-    // Align with mapping – 222 is the well–known chain-ID for the `Ink` network.
+    // Align with mapping - 222 is the well-known chain-ID for the `Ink` network.
     pub static INK: LazyLock<Chain> = LazyLock::new(|| Chain::new(Blockchain::Ink, 222));
     // Use the `foundry`-style development chain-ID 13337 to match the lookup table above.
     pub static INTERNAL_TEST_CHAIN: LazyLock<Chain> =
@@ -556,9 +556,9 @@ mod tests {
 
         // Test native currency
         let currency = eth_chain.native_currency();
-        assert_eq!(currency.code.as_str(), "ETH");
+        assert_eq!(currency.code, "ETH");
         assert_eq!(currency.precision, 18);
-        assert_eq!(currency.name.as_str(), "Ethereum");
+        assert_eq!(currency.name, "Ethereum");
     }
 
     #[rstest]
@@ -574,9 +574,9 @@ mod tests {
 
         // Test native currency (Arbitrum uses ETH)
         let currency = arbitrum_chain.native_currency();
-        assert_eq!(currency.code.as_str(), "ETH");
+        assert_eq!(currency.code, "ETH");
         assert_eq!(currency.precision, 18);
-        assert_eq!(currency.name.as_str(), "Ethereum");
+        assert_eq!(currency.name, "Ethereum");
     }
 
     #[rstest]

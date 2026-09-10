@@ -292,7 +292,7 @@ impl Drop for OwnedBytes {
 }
 
 /// Default `drop_fn` used by [`OwnedBytes::from_vec`]. Plug-ins that build
-/// `OwnedBytes` via `from_vec` get matching free behaviour automatically.
+/// `OwnedBytes` via `from_vec` get matching free behavior automatically.
 ///
 /// # Safety
 ///
@@ -411,6 +411,32 @@ mod tests {
         // SAFETY: storage lives for the duration of this test.
         let back = unsafe { b.as_str() };
         assert_eq!(back, s);
+    }
+
+    #[rstest]
+    fn borrowed_str_try_as_str_rejects_invalid_utf8() {
+        static INVALID_UTF8: [u8; 1] = [0xFF];
+        let mut b = BorrowedStr::empty();
+        b.ptr = INVALID_UTF8.as_ptr();
+        b.len = INVALID_UTF8.len();
+
+        // SAFETY: storage lives for the duration of this test.
+        let result = unsafe { b.try_as_str() };
+
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn borrowed_str_to_string_lossy_replaces_invalid_utf8() {
+        static INVALID_UTF8: [u8; 1] = [0xFF];
+        let mut b = BorrowedStr::empty();
+        b.ptr = INVALID_UTF8.as_ptr();
+        b.len = INVALID_UTF8.len();
+
+        // SAFETY: storage lives for the duration of this test.
+        let rendered = unsafe { b.to_string_lossy() };
+
+        assert_eq!(rendered, "\u{FFFD}");
     }
 
     #[rstest]

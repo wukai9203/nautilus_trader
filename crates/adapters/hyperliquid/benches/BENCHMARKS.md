@@ -30,7 +30,7 @@ through derived streams (mark/index/funding/bars), then the private user
 streams (fills, order updates) at the end.
 
 | Bench                           | Median  | Throughput |
-|---------------------------------|---------|------------|
+| ------------------------------- | ------- | ---------- |
 | `inbound_pipeline/book_deltas`  | 3.95 µs | 253 k/s    |
 | `inbound_pipeline/book_depth10` | 3.98 µs | 251 k/s    |
 | `inbound_pipeline/quotes`       | 557 ns  | 1.79 M/s   |
@@ -48,7 +48,7 @@ Strategy command (`OrderAny` / cancel / modify) -> fully signed wire bytes
 ready to POST. Covers normalize + serialize (msgpack) + EIP-712 sign.
 
 | Bench                              | Median  | Throughput |
-|------------------------------------|---------|------------|
+| ---------------------------------- | ------- | ---------- |
 | `exec_pipeline/submit_market`      | 42.2 µs | 23.7 k/s   |
 | `exec_pipeline/submit_limit`       | 42.1 µs | 23.7 k/s   |
 | `exec_pipeline/submit_stop_market` | 42.5 µs | 23.5 k/s   |
@@ -62,7 +62,7 @@ serialization benches isolate L1 signing from order normalization and POST body
 construction.
 
 | Bench                       | Median  |
-|-----------------------------|---------|
+| --------------------------- | ------- |
 | `sign_l1_action`            | 41.8 µs |
 | `sign_l1_action_with_vault` | 42.2 µs |
 | `signer_construction`       | 31.3 µs |
@@ -72,7 +72,7 @@ construction.
 ## Dispatch (`exec.rs`)
 
 Venue report (`FillReport`, `OrderStatusReport`) -> events emitted via
-`ExecutionEventEmitter`. Covers dedup + identity lookup + event construction.
+`ExecutionEventEmitter`. Covers dedup + context lookup + event construction.
 
 Note: these numbers include per-iteration `WsDispatchState` construction +
 drop, which is a bench-only artifact. In production, state lives forever and
@@ -80,7 +80,7 @@ the dispatch-only cost is much smaller (see `atom/dispatch_fill_reused` in
 the component breakdown below).
 
 | Bench                      | Median  | Throughput |
-|----------------------------|---------|------------|
+| -------------------------- | ------- | ---------- |
 | `dispatch/fill`            | 15.6 µs | 64.2 k/s   |
 | `dispatch/status_accepted` | 11.1 µs | 90.5 k/s   |
 | `dispatch/status_canceled` | 15.4 µs | 64.8 k/s   |
@@ -89,10 +89,10 @@ the component breakdown below).
 ## Component breakdown (`micros.rs`)
 
 Diagnostic benches that decompose the pipeline numbers above. Use these to
-localise where time goes when a pipeline bench regresses.
+localize where time goes when a pipeline bench regresses.
 
 | Bench                           | Median  |
-|---------------------------------|---------|
+| ------------------------------- | ------- |
 | `decode_only/trade`             | 549 ns  |
 | `decode_only/book`              | 3.25 µs |
 | `parse_only/trade`              | 59.0 ns |
@@ -117,7 +117,7 @@ localise where time goes when a pipeline bench regresses.
 - **Exec is signature-bound.** EIP-712 + keccak + secp256k1 dominates, and
   `lto = "fat"` collapses the per-variant differences so submit and modify
   converge at ~42 µs. Cancel sits at ~48 µs because the cancel action
-  serialises a different msgpack shape. Optimisations that don't change
+  serializes a different msgpack shape. Optimizations that don't change
   the signing scheme won't move these numbers.
 - **Dispatch in production is faster than the bench suggests.** The
   canonical bench rebuilds state per iteration; the steady-state cost on a
@@ -125,9 +125,9 @@ localise where time goes when a pipeline bench regresses.
   state is ~7 µs (`dispatch/fill` minus `state_construct_primed` +
   `state_drop_primed`).
 - **simd-json was piloted and reverted.** A `simd-json` feature flag plus
-  decode helper was prototyped, run side-by-side against `serde_json`, and
+  decoder was prototyped, run side-by-side against `serde_json`, and
   found to be 20-50% **slower** on hyperliquid payload sizes. The mutable-
   buffer requirement forces a per-call `to_vec()`, payloads are too small
-  to amortise SIMD setup, and owned-`String` deserialization negates the
+  to amortize SIMD setup, and owned-`String` deserialization negates the
   borrow advantage. Re-evaluate only if payloads grow materially or a
   zero-copy borrowed-string path lands.

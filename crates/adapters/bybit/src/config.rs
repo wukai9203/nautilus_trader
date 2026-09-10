@@ -17,12 +17,18 @@
 
 use std::collections::HashMap;
 
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::string::secret::SecretString;
 use nautilus_model::identifiers::AccountId;
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
 use crate::common::{
-    enums::{BybitEnvironment, BybitMarginMode, BybitPositionMode, BybitProductType},
+    enums::{
+        BybitEnvironment, BybitMarginMode, BybitOrderSmpType, BybitPositionMode, BybitProductType,
+    },
+    parse::deserialize_optional_smp_type,
     urls::{bybit_http_base_url, bybit_ws_private_url, bybit_ws_public_url, bybit_ws_trade_url},
 };
 
@@ -31,7 +37,7 @@ use crate::common::{
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -39,9 +45,9 @@ use crate::common::{
 )]
 pub struct BybitDataClientConfig {
     /// Optional API key for authenticated REST/WebSocket requests.
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     /// Optional API secret for authenticated REST/WebSocket requests.
-    pub api_secret: Option<String>,
+    pub api_secret: Option<SecretString>,
     /// Product types to subscribe to (e.g., Linear, Spot, Inverse, Option).
     #[builder(default = vec![BybitProductType::Linear])]
     pub product_types: Vec<BybitProductType>,
@@ -55,7 +61,7 @@ pub struct BybitDataClientConfig {
     /// Optional override for the private WebSocket URL.
     pub base_url_ws_private: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// REST timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -77,19 +83,36 @@ pub struct BybitDataClientConfig {
     /// Interval in minutes for instrument refresh from REST.
     /// When `None`, instrument refresh is disabled.
     pub update_instruments_interval_mins: Option<u64>,
-    /// Interval in seconds for polling instrument status changes.
-    /// When `None`, status polling is disabled.
-    pub instrument_status_poll_secs: Option<u64>,
+    /// Interval in seconds for polling instrument definitions and status changes from REST.
+    /// When `None`, instrument/status polling is disabled.
+    pub instrument_poll_interval_secs: Option<u64>,
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
 
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(BybitDataClientConfig {
+    product_types: Vec<BybitProductType>,
+    environment: BybitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws_public: Option<String>,
+    base_url_ws_private: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    recv_window_ms: u64,
+    update_instruments_interval_mins: Option<u64>,
+    transport_backend: TransportBackend,
+});
+
 impl Default for BybitDataClientConfig {
     fn default() -> Self {
         Self {
             update_instruments_interval_mins: Some(60),
-            instrument_status_poll_secs: Some(60),
+            instrument_poll_interval_secs: Some(60),
             ..Self::builder().build()
         }
     }
@@ -159,17 +182,17 @@ impl BybitDataClientConfig {
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.bybit", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
-pub struct BybitExecClientConfig {
+pub struct BybitExecutionClientConfig {
     /// API key for authenticated requests.
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     /// API secret for authenticated requests.
-    pub api_secret: Option<String>,
+    pub api_secret: Option<SecretString>,
     /// Product types to support (e.g., Linear, Spot, Inverse, Option).
     #[builder(default = vec![BybitProductType::Linear])]
     pub product_types: Vec<BybitProductType>,
@@ -183,7 +206,7 @@ pub struct BybitExecClientConfig {
     /// Optional override for the trade WebSocket URL.
     pub base_url_ws_trade: Option<String>,
     /// Optional proxy URL for HTTP and WebSocket transports.
-    pub proxy_url: Option<String>,
+    pub proxy_url: Option<SecretString>,
     /// REST timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -197,34 +220,70 @@ pub struct BybitExecClientConfig {
     #[builder(default = 10_000)]
     pub retry_delay_max_ms: u64,
     /// Heartbeat interval in seconds for WebSocket clients.
-    #[builder(default = 5)]
+    #[builder(default = 20)]
     pub heartbeat_interval_secs: u64,
+    /// Optional WebSocket authentication wait timeout (seconds), defaulting to
+    /// the client default when unset.
+    pub auth_timeout_secs: Option<u64>,
     /// Receive window in milliseconds for signed requests.
     #[builder(default = 5_000)]
     pub recv_window_ms: u64,
     /// Optional account identifier to associate with the execution client.
     pub account_id: Option<AccountId>,
-    /// Whether to generate position reports from wallet balances for SPOT positions.
+    /// Whether scoped execution-client SPOT position requests derive positions from wallet
+    /// balances. The HTTP client rejects enabled unscoped SPOT requests because balances cannot be
+    /// attributed to pairs. The execution client omits SPOT from bulk requests and reports its bulk
+    /// coverage as unavailable.
     #[builder(default)]
     pub use_spot_position_reports: bool,
+    /// Whether to automatically repay SPOT margin borrows after BUY orders tracked by
+    /// this client and reported on the standard `execution` channel (not `execution.fast`)
+    /// fully fill.
+    #[builder(default)]
+    pub auto_repay_spot_borrows: bool,
     /// Leverage configuration for futures (symbol -> leverage).
     pub futures_leverages: Option<HashMap<String, u32>>,
     /// Position mode configuration for symbols (symbol -> mode).
     pub position_mode: Option<HashMap<String, BybitPositionMode>>,
     /// Unified margin mode setting.
     pub margin_mode: Option<BybitMarginMode>,
+    /// Self-match prevention type sent on every submitted order. The `smp_type` order parameter
+    /// overrides it, and leaving both unset omits the field so the venue default applies.
+    #[serde(deserialize_with = "deserialize_optional_smp_type")]
+    pub smp_type: Option<BybitOrderSmpType>,
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
 }
 
-impl Default for BybitExecClientConfig {
+#[cfg(feature = "python")]
+nautilus_core::impl_pyo3_config_getters!(BybitExecutionClientConfig {
+    product_types: Vec<BybitProductType>,
+    environment: BybitEnvironment,
+    base_url_http: Option<String>,
+    base_url_ws_private: Option<String>,
+    base_url_ws_trade: Option<String>,
+    http_timeout_secs: u64,
+    max_retries: u32,
+    retry_delay_initial_ms: u64,
+    retry_delay_max_ms: u64,
+    heartbeat_interval_secs: u64,
+    auth_timeout_secs: Option<u64>,
+    recv_window_ms: u64,
+    account_id: Option<AccountId>,
+    use_spot_position_reports: bool,
+    auto_repay_spot_borrows: bool,
+    margin_mode: Option<BybitMarginMode>,
+    transport_backend: TransportBackend,
+});
+
+impl Default for BybitExecutionClientConfig {
     fn default() -> Self {
         Self::builder().build()
     }
 }
 
-impl BybitExecClientConfig {
+impl BybitExecutionClientConfig {
     /// Creates a configuration with default values.
     #[must_use]
     pub fn new() -> Self {
@@ -268,6 +327,72 @@ mod tests {
     use super::*;
 
     #[rstest]
+    fn test_config_debug_redacts_credentials() {
+        let data = BybitDataClientConfig {
+            api_key: Some("data-api-key".into()),
+            api_secret: Some("data-api-secret".into()),
+            proxy_url: Some("http://user:data-proxy@localhost".into()),
+            ..Default::default()
+        };
+        let execution = BybitExecutionClientConfig {
+            api_key: Some("exec-api-key".into()),
+            api_secret: Some("exec-api-secret".into()),
+            proxy_url: Some("http://user:exec-proxy@localhost".into()),
+            ..Default::default()
+        };
+
+        let formatted = format!("{data:?} {execution:?}");
+
+        assert_eq!(formatted.matches(REDACTED).count(), 6);
+
+        for secret in [
+            "data-api-key",
+            "data-api-secret",
+            "data-proxy",
+            "exec-api-key",
+            "exec-api-secret",
+            "exec-proxy",
+        ] {
+            assert!(!formatted.contains(secret));
+        }
+    }
+
+    #[rstest]
+    #[case("None", BybitOrderSmpType::None)]
+    #[case("CancelMaker", BybitOrderSmpType::CancelMaker)]
+    #[case("CancelTaker", BybitOrderSmpType::CancelTaker)]
+    #[case("CancelBoth", BybitOrderSmpType::CancelBoth)]
+    fn test_exec_config_deserializes_smp_type(
+        #[case] value: &str,
+        #[case] expected: BybitOrderSmpType,
+    ) {
+        let json = format!(r#"{{"smp_type": "{value}"}}"#);
+        let config: BybitExecutionClientConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(config.smp_type, Some(expected));
+    }
+
+    #[rstest]
+    #[case(r#"{"smp_type": "Other"}"#)]
+    #[case(r#"{"smp_type": "cancel-maker"}"#)]
+    #[case(r#"{"smp_type": ""}"#)]
+    fn test_exec_config_rejects_invalid_smp_type(#[case] json: &str) {
+        let err = serde_json::from_str::<BybitExecutionClientConfig>(json).unwrap_err();
+
+        assert!(
+            err.to_string().contains("invalid Bybit smp_type"),
+            "expected an smp_type rejection, was '{err}'"
+        );
+    }
+
+    #[rstest]
+    fn test_exec_config_smp_type_defaults_to_none() {
+        let config: BybitExecutionClientConfig = serde_json::from_str("{}").unwrap();
+
+        assert_eq!(config.smp_type, None);
+    }
+
+    #[rstest]
     fn test_data_config_default() {
         let config = BybitDataClientConfig::default();
 
@@ -280,8 +405,8 @@ mod tests {
     #[rstest]
     fn test_data_config_with_credentials() {
         let config = BybitDataClientConfig {
-            api_key: Some("test_key".to_string()),
-            api_secret: Some("test_secret".to_string()),
+            api_key: Some("test_key".into()),
+            api_secret: Some("test_secret".into()),
             ..Default::default()
         };
 
@@ -381,19 +506,19 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_default() {
-        let config = BybitExecClientConfig::default();
+        let config = BybitExecutionClientConfig::default();
 
         assert!(!config.has_api_credentials());
         assert_eq!(config.product_types, vec![BybitProductType::Linear]);
         assert_eq!(config.http_timeout_secs, 60);
-        assert_eq!(config.heartbeat_interval_secs, 5);
+        assert_eq!(config.heartbeat_interval_secs, 20);
     }
 
     #[rstest]
     fn test_exec_config_with_credentials() {
-        let config = BybitExecClientConfig {
-            api_key: Some("test_key".to_string()),
-            api_secret: Some("test_secret".to_string()),
+        let config = BybitExecutionClientConfig {
+            api_key: Some("test_key".into()),
+            api_secret: Some("test_secret".into()),
             ..Default::default()
         };
 
@@ -402,7 +527,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_urls() {
-        let config = BybitExecClientConfig {
+        let config = BybitExecutionClientConfig {
             environment: BybitEnvironment::Mainnet,
             ..Default::default()
         };
@@ -414,7 +539,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_urls_testnet() {
-        let config = BybitExecClientConfig {
+        let config = BybitExecutionClientConfig {
             environment: BybitEnvironment::Testnet,
             ..Default::default()
         };
@@ -432,7 +557,7 @@ mod tests {
 
     #[rstest]
     fn test_exec_config_custom_urls() {
-        let config = BybitExecClientConfig {
+        let config = BybitExecutionClientConfig {
             base_url_http: Some("https://custom-http.bybit.com".to_string()),
             base_url_ws_private: Some("wss://custom-private.bybit.com".to_string()),
             base_url_ws_trade: Some("wss://custom-trade.bybit.com".to_string()),
@@ -465,8 +590,8 @@ http_timeout_secs = 45
 
     #[rstest]
     fn test_exec_config_toml_empty_uses_defaults() {
-        let config: BybitExecClientConfig = toml::from_str("").unwrap();
-        let expected = BybitExecClientConfig::default();
+        let config: BybitExecutionClientConfig = toml::from_str("").unwrap();
+        let expected = BybitExecutionClientConfig::default();
 
         assert_eq!(config.environment, expected.environment);
         assert_eq!(config.product_types, expected.product_types);

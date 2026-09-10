@@ -8,19 +8,31 @@ https://data.oecd.org/
 # Rate limited sites
 https://codspeed.io/
 
+# Block bots. The explorer hosts are reached only from Rust doc comments; the two support
+# articles are pinned so the same hosts stay checked where Markdown references them.
+https://arbiscan.io/
+https://bscscan.com/
+https://support.bitmex.com/hc/en-gb/articles/6299296145565-What-are-the-Typ-Values-for-Instrument-endpoint
+https://support.deribit.com/hc/en-us/articles/25944603459613
+https://support.deribit.com/hc/en-us/articles/25944617523357-Rate-Limits
+
+# API roots documented next to endpoint constants: no document is served at `/`
+https://indexer.dydx.trade/
+https://indexer.v4testnet.dydx.exchange/
+https://mainnet.zklighter.elliot.ai/
+
+# Placeholder value in a configuration example
+https://my-s3-endpoint.com/
+
 # Relative paths starting with / (invalid URIs)
 ^/.*
 
 # Anchors without files (warnings about path-only references)
 ^#.*
 
-# Crates not yet published to docs.rs
-https://docs.rs/nautilus-bybit
-https://docs.rs/nautilus-hyperliquid
-
-# Documentation site URLs (these work when site is deployed, but return 404 for pre-deployment checks)
-https://nautilustrader.io/docs/
-https://nautilustrader.io/docs/developer_guide/
+# Pages relocated since the release notes referencing them were written.
+# Entries are substring regexes, so keep them specific: a bare
+# https://nautilustrader.io/docs/ entry suppresses every docs-site link.
 https://nautilustrader.io/docs/latest/concepts/advanced/
 https://nautilustrader.io/docs/nightly/developer_guide/
 

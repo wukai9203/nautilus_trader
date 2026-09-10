@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Parsing helpers for Bybit WebSocket payloads.
+//! Parsers for Bybit WebSocket payloads.
 
 use std::convert::TryFrom;
 
@@ -27,13 +27,13 @@ use nautilus_model::{
     },
     enums::{
         AccountType, AggressorSide, BookAction, GreeksConvention, LiquiditySide, OrderSide,
-        OrderStatus, PositionSideSpecified, RecordFlag, TimeInForce, TriggerType,
+        OrderStatus, PositionSide, RecordFlag, TimeInForce, TriggerType,
     },
     events::account::state::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, TradeId, VenueOrderId},
     instruments::{Instrument, any::InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance, Money, Price, Quantity},
+    types::{AccountBalance, MarginBalance, Money},
 };
 use rust_decimal::Decimal;
 
@@ -43,15 +43,16 @@ use super::{
         BybitWsAccountExecution, BybitWsAccountExecutionFast, BybitWsAccountOrder,
         BybitWsAccountPosition, BybitWsAccountWallet, BybitWsAuthResponse, BybitWsFrame,
         BybitWsKline, BybitWsOrderResponse, BybitWsOrderbookDepthMsg, BybitWsResponse,
-        BybitWsSubscriptionMsg, BybitWsTickerLinear, BybitWsTickerLinearMsg,
-        BybitWsTickerOptionMsg, BybitWsTrade,
+        BybitWsSubscriptionMsg, BybitWsTickerLinear, BybitWsTickerOptionMsg, BybitWsTrade,
     },
 };
 use crate::common::{
+    consts::BYBIT_QUOTE_DEPTH,
     enums::{BybitOrderStatus, BybitPositionSide, BybitTimeInForce},
     parse::{
-        get_currency, make_hedge_venue_position_id, parse_book_level, parse_bybit_order_type,
-        parse_millis_timestamp, parse_price_with_precision, parse_quantity_with_precision,
+        bybit_rejection_due_post_only, get_currency, make_hedge_venue_position_id,
+        parse_book_level, parse_bybit_order_type, parse_millis_timestamp,
+        parse_price_with_precision, parse_quantity_with_precision,
     },
 };
 
@@ -315,49 +316,37 @@ pub fn parse_orderbook_deltas(
         .context("failed to assemble OrderBookDeltas from Bybit message")
 }
 
-/// Parses an order book snapshot or delta into a [`QuoteTick`].
+/// Parses a depth-1 order book snapshot into a [`QuoteTick`].
+///
+/// # Errors
+///
+/// Returns an error for a different depth or message type, missing sides, or invalid price or size data.
 pub fn parse_orderbook_quote(
     msg: &BybitWsOrderbookDepthMsg,
     instrument: &InstrumentAny,
-    last_quote: Option<&QuoteTick>,
     ts_init: UnixNanos,
 ) -> anyhow::Result<QuoteTick> {
+    let (depth, _) = parse_orderbook_topic(msg.topic.as_str())?;
+    anyhow::ensure!(
+        depth == BYBIT_QUOTE_DEPTH && msg.msg_type == "snapshot",
+        "Expected depth-1 orderbook snapshot"
+    );
     let ts_event = parse_millis_i64(msg.ts, "orderbook.ts")?;
     let ts_init = if ts_init.is_zero() { ts_event } else { ts_init };
     let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
-
-    let get_best =
-        |levels: &[Vec<String>], label: &str| -> anyhow::Result<Option<(Price, Quantity)>> {
-            if let Some(values) = levels.first() {
-                parse_book_level(values, price_precision, size_precision, label).map(Some)
-            } else {
-                Ok(None)
-            }
-        };
-
-    let bids = get_best(&msg.data.b, "bid")?;
-    let asks = get_best(&msg.data.a, "ask")?;
-
-    let (bid_price, bid_size) = match (bids, last_quote) {
-        (Some(level), _) => level,
-        (None, Some(prev)) => (prev.bid_price, prev.bid_size),
-        (None, None) => {
-            anyhow::bail!(
-                "Bybit order book update missing bid levels and no previous quote provided"
-            );
-        }
-    };
-
-    let (ask_price, ask_size) = match (asks, last_quote) {
-        (Some(level), _) => level,
-        (None, Some(prev)) => (prev.ask_price, prev.ask_size),
-        (None, None) => {
-            anyhow::bail!(
-                "Bybit order book update missing ask levels and no previous quote provided"
-            );
-        }
-    };
+    let bid = msg
+        .data
+        .b
+        .first()
+        .context("orderbook snapshot missing bid")?;
+    let ask = msg
+        .data
+        .a
+        .first()
+        .context("orderbook snapshot missing ask")?;
+    let (bid_price, bid_size) = parse_book_level(bid, price_precision, size_precision, "bid")?;
+    let (ask_price, ask_size) = parse_book_level(ask, price_precision, size_precision, "ask")?;
 
     QuoteTick::new_checked(
         instrument.id(),
@@ -371,48 +360,18 @@ pub fn parse_orderbook_quote(
     .context("failed to construct QuoteTick from Bybit order book message")
 }
 
-/// Parses a linear or inverse ticker payload into a [`QuoteTick`].
-pub fn parse_ticker_linear_quote(
-    msg: &BybitWsTickerLinearMsg,
-    instrument: &InstrumentAny,
-    ts_init: UnixNanos,
-) -> anyhow::Result<QuoteTick> {
-    let ts_event = parse_millis_i64(msg.ts, "ticker.ts")?;
-    let ts_init = if ts_init.is_zero() { ts_event } else { ts_init };
-    let price_precision = instrument.price_precision();
-    let size_precision = instrument.size_precision();
-
-    let data = &msg.data;
-    let bid_price = data
-        .bid1_price
-        .as_ref()
-        .context("Bybit ticker message missing bid1Price")?
-        .as_str();
-    let ask_price = data
-        .ask1_price
-        .as_ref()
-        .context("Bybit ticker message missing ask1Price")?
-        .as_str();
-
-    let bid_price = parse_price_with_precision(bid_price, price_precision, "ticker.bid1Price")?;
-    let ask_price = parse_price_with_precision(ask_price, price_precision, "ticker.ask1Price")?;
-
-    let bid_size_str = data.bid1_size.as_deref().unwrap_or("0");
-    let ask_size_str = data.ask1_size.as_deref().unwrap_or("0");
-
-    let bid_size = parse_quantity_with_precision(bid_size_str, size_precision, "ticker.bid1Size")?;
-    let ask_size = parse_quantity_with_precision(ask_size_str, size_precision, "ticker.ask1Size")?;
-
-    QuoteTick::new_checked(
-        instrument.id(),
-        bid_price,
-        ask_price,
-        bid_size,
-        ask_size,
-        ts_event,
-        ts_init,
-    )
-    .context("failed to construct QuoteTick from Bybit linear ticker message")
+pub(crate) fn parse_orderbook_topic(topic: &str) -> anyhow::Result<(u32, &str)> {
+    let mut parts = topic.splitn(3, '.');
+    anyhow::ensure!(
+        parts.next() == Some("orderbook"),
+        "Invalid orderbook topic: {topic}"
+    );
+    let depth = parts.next().context("missing orderbook depth")?.parse()?;
+    let symbol = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .context("missing orderbook symbol")?;
+    Ok((depth, symbol))
 }
 
 /// Parses an option ticker payload into a [`QuoteTick`].
@@ -705,11 +664,7 @@ pub fn parse_ws_kline_bar(
     let mut ts_event = parse_millis_i64(kline.start, "kline.start")?;
 
     if timestamp_on_close {
-        let interval_ns = bar_type
-            .spec()
-            .timedelta()
-            .num_nanoseconds()
-            .context("bar specification produced non-integer interval")?;
+        let interval_ns = bar_type.spec().timedelta().as_nanos();
         let interval_ns = u64::try_from(interval_ns)
             .context("bar interval overflowed the u64 range for nanoseconds")?;
         let updated = ts_event
@@ -736,8 +691,8 @@ pub fn parse_ws_order_status_report(
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
     let instrument_id = instrument.id();
-    let venue_order_id = VenueOrderId::new(order.order_id.as_str());
-    let order_side: OrderSide = order.side.into();
+    let venue_order_id = VenueOrderId::new(order.order_id);
+    let order_side: Option<OrderSide> = order.side.into();
 
     let order_type = parse_bybit_order_type(
         order.order_type,
@@ -780,6 +735,15 @@ pub fn parse_ws_order_status_report(
         }
         BybitOrderStatus::PartiallyFilled => OrderStatus::PartiallyFilled,
         BybitOrderStatus::Filled => OrderStatus::Filled,
+        // A post-only order that would take liquidity is reported as Cancelled with
+        // rejectReason=EC_PostOnlyWillTakeLiquidity (not Rejected). Surface it as Rejected
+        // for consistency with the tracked-order event path.
+        BybitOrderStatus::Canceled
+            if filled_qty.is_zero()
+                && bybit_rejection_due_post_only(order.reject_reason.as_str()) =>
+        {
+            OrderStatus::Rejected
+        }
         BybitOrderStatus::Canceled | BybitOrderStatus::PartiallyFilledCanceled => {
             OrderStatus::Canceled
         }
@@ -808,7 +772,7 @@ pub fn parse_ws_order_status_report(
     );
 
     if !order.order_link_id.is_empty() {
-        report = report.with_client_order_id(ClientOrderId::new(order.order_link_id.as_str()));
+        report = report.with_client_order_id(ClientOrderId::new(order.order_link_id));
     }
 
     if !order.price.is_empty() && order.price != "0" {
@@ -818,11 +782,10 @@ pub fn parse_ws_order_status_report(
     }
 
     if !order.avg_price.is_empty() && order.avg_price != "0" {
-        let avg_px = order
-            .avg_price
-            .parse::<f64>()
-            .with_context(|| format!("Failed to parse avg_price='{}' as f64", order.avg_price))?;
-        report = report.with_avg_px(avg_px)?;
+        let avg_px = order.avg_price.parse::<Decimal>().with_context(|| {
+            format!("Failed to parse avg_price='{}' as Decimal", order.avg_price)
+        })?;
+        report = report.with_avg_px(avg_px);
     }
 
     if !order.trigger_price.is_empty() && order.trigger_price != "0" {
@@ -870,11 +833,11 @@ pub fn parse_ws_fill_report(
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
     let instrument_id = instrument.id();
-    let venue_order_id = VenueOrderId::new(execution.order_id.as_str());
+    let venue_order_id = VenueOrderId::new(execution.order_id);
     let trade_id = TradeId::new_checked(execution.exec_id.as_str())
         .context("invalid execId in Bybit WebSocket execution payload")?;
 
-    let order_side: OrderSide = execution.side.into();
+    let order_side = OrderSide::try_from(execution.side)?;
     let last_qty = parse_quantity_with_precision(
         &execution.exec_qty,
         instrument.size_precision(),
@@ -897,7 +860,7 @@ pub fn parse_ws_fill_report(
         .parse()
         .with_context(|| format!("Failed to parse execFee='{}'", execution.exec_fee))?;
 
-    let commission_currency = instrument.quote_currency();
+    let commission_currency = get_currency(&execution.fee_currency);
     let commission = Money::from_decimal(fee_decimal, commission_currency).with_context(|| {
         format!(
             "Failed to create commission from execFee='{}'",
@@ -909,7 +872,7 @@ pub fn parse_ws_fill_report(
     let client_order_id = if execution.order_link_id.is_empty() {
         None
     } else {
-        Some(ClientOrderId::new(execution.order_link_id.as_str()))
+        Some(ClientOrderId::new(execution.order_link_id))
     };
 
     Ok(FillReport::new(
@@ -952,11 +915,11 @@ pub fn parse_ws_fill_report_fast(
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
     let instrument_id = instrument.id();
-    let venue_order_id = VenueOrderId::new(execution.order_id.as_str());
+    let venue_order_id = VenueOrderId::new(execution.order_id);
     let trade_id = TradeId::new_checked(execution.exec_id.as_str())
         .context("invalid execId in Bybit WebSocket fast-execution payload")?;
 
-    let order_side: OrderSide = execution.side.into();
+    let order_side = OrderSide::try_from(execution.side)?;
     let last_qty = parse_quantity_with_precision(
         &execution.exec_qty,
         instrument.size_precision(),
@@ -974,6 +937,7 @@ pub fn parse_ws_fill_report_fast(
         LiquiditySide::Taker
     };
 
+    // execution.fast carries no fee data (no rate or currency)
     let commission_currency = instrument.quote_currency();
     let commission = Money::from_decimal(Decimal::ZERO, commission_currency)
         .with_context(|| format!("Failed to create zero commission for {commission_currency}"))?;
@@ -982,7 +946,7 @@ pub fn parse_ws_fill_report_fast(
     let client_order_id = if execution.order_link_id.is_empty() {
         None
     } else {
-        Some(ClientOrderId::new(execution.order_link_id.as_str()))
+        Some(ClientOrderId::new(execution.order_link_id))
     };
 
     Ok(FillReport::new(
@@ -1024,9 +988,9 @@ pub fn parse_ws_position_status_report(
     )?;
 
     let position_side = match position.side {
-        BybitPositionSide::Buy => PositionSideSpecified::Long,
-        BybitPositionSide::Sell => PositionSideSpecified::Short,
-        BybitPositionSide::Flat => PositionSideSpecified::Flat,
+        BybitPositionSide::Buy => PositionSide::Long,
+        BybitPositionSide::Sell => PositionSide::Short,
+        BybitPositionSide::Flat => PositionSide::Flat,
     };
 
     // Bybit ranks open positions 1-5 by ADL priority (5 = next to be deleveraged);
@@ -1113,6 +1077,8 @@ pub fn parse_ws_account_state(
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use nautilus_model::{
         data::BarSpecification,
         enums::{
@@ -1184,7 +1150,7 @@ mod tests {
         assert_eq!(tick.instrument_id, instrument.id());
         assert_eq!(tick.price, instrument.make_price(27451.00));
         assert_eq!(tick.size, instrument.make_qty(0.010, None));
-        assert_eq!(tick.aggressor_side, AggressorSide::Buyer);
+        assert_eq!(tick.aggressor_side, AggressorSide::Buy);
         assert_eq!(
             tick.trade_id.to_string(),
             "9dc75fca-4bdd-4773-9f78-6f5d7ab2a110"
@@ -1212,7 +1178,7 @@ mod tests {
             instrument.make_qty(0.500, None)
         );
         let last = deltas.deltas.last().unwrap();
-        assert_eq!(last.order.side, OrderSide::Sell);
+        assert_eq!(last.order.side, OrderSide::Sell.into());
         assert_eq!(last.order.price, instrument.make_price(27451.50));
         assert_eq!(
             last.flags & RecordFlag::F_LAST as u8,
@@ -1231,12 +1197,12 @@ mod tests {
         assert_eq!(deltas.deltas.len(), 2);
         let bid = &deltas.deltas[0];
         assert_eq!(bid.action, BookAction::Update);
-        assert_eq!(bid.order.side, OrderSide::Buy);
+        assert_eq!(bid.order.side, OrderSide::Buy.into());
         assert_eq!(bid.order.size, instrument.make_qty(0.400, None));
 
         let ask = &deltas.deltas[1];
         assert_eq!(ask.action, BookAction::Delete);
-        assert_eq!(ask.order.side, OrderSide::Sell);
+        assert_eq!(ask.order.side, OrderSide::Sell.into());
         assert_eq!(ask.order.size, instrument.make_qty(0.0, None));
         assert_eq!(
             ask.flags & RecordFlag::F_LAST as u8,
@@ -1250,7 +1216,7 @@ mod tests {
         let json = load_test_json("ws_orderbook_snapshot.json");
         let msg: BybitWsOrderbookDepthMsg = serde_json::from_str(&json).unwrap();
 
-        let quote = parse_orderbook_quote(&msg, &instrument, None, TS).unwrap();
+        let quote = parse_orderbook_quote(&msg, &instrument, TS).unwrap();
 
         assert_eq!(quote.instrument_id, instrument.id());
         assert_eq!(quote.bid_price, instrument.make_price(27450.00));
@@ -1260,37 +1226,60 @@ mod tests {
     }
 
     #[rstest]
-    fn parse_orderbook_quote_with_delta_updates_sizes() {
+    #[case::delta(
+        "orderbook.1.BTCUSDT",
+        "delta",
+        false,
+        false,
+        "Expected depth-1 orderbook snapshot"
+    )]
+    #[case::depth_50(
+        "orderbook.50.BTCUSDT",
+        "snapshot",
+        false,
+        false,
+        "Expected depth-1 orderbook snapshot"
+    )]
+    #[case::missing_bid(
+        "orderbook.1.BTCUSDT",
+        "snapshot",
+        true,
+        false,
+        "orderbook snapshot missing bid"
+    )]
+    #[case::missing_ask(
+        "orderbook.1.BTCUSDT",
+        "snapshot",
+        false,
+        true,
+        "orderbook snapshot missing ask"
+    )]
+    fn parse_orderbook_quote_rejects_non_top_of_book(
+        #[case] topic: &str,
+        #[case] msg_type: &str,
+        #[case] missing_bid: bool,
+        #[case] missing_ask: bool,
+        #[case] expected_error: &str,
+    ) {
         let instrument = linear_instrument();
-        let snapshot: BybitWsOrderbookDepthMsg =
+        let mut msg: BybitWsOrderbookDepthMsg =
             serde_json::from_str(&load_test_json("ws_orderbook_snapshot.json")).unwrap();
-        let base_quote = parse_orderbook_quote(&snapshot, &instrument, None, TS).unwrap();
+        msg.topic = topic.into();
+        msg.msg_type = msg_type.into();
+        if missing_bid {
+            msg.data.b.clear();
+        }
 
-        let delta: BybitWsOrderbookDepthMsg =
-            serde_json::from_str(&load_test_json("ws_orderbook_delta.json")).unwrap();
-        let updated = parse_orderbook_quote(&delta, &instrument, Some(&base_quote), TS).unwrap();
+        if missing_ask {
+            msg.data.a.clear();
+        }
 
-        assert_eq!(updated.bid_price, instrument.make_price(27450.00));
-        assert_eq!(updated.bid_size, instrument.make_qty(0.400, None));
-        assert_eq!(updated.ask_price, instrument.make_price(27451.00));
-        assert_eq!(updated.ask_size, instrument.make_qty(0.0, None));
-    }
-
-    #[rstest]
-    fn parse_linear_ticker_quote_to_quote_tick() {
-        let instrument = linear_instrument();
-        let json = load_test_json("ws_ticker_linear.json");
-        let msg: BybitWsTickerLinearMsg = serde_json::from_str(&json).unwrap();
-
-        let quote = parse_ticker_linear_quote(&msg, &instrument, TS).unwrap();
-
-        assert_eq!(quote.instrument_id, instrument.id());
-        assert_eq!(quote.bid_price, instrument.make_price(17215.50));
-        assert_eq!(quote.ask_price, instrument.make_price(17216.00));
-        assert_eq!(quote.bid_size, instrument.make_qty(84.489, None));
-        assert_eq!(quote.ask_size, instrument.make_qty(83.020, None));
-        assert_eq!(quote.ts_event, UnixNanos::new(1_673_272_861_686_000_000));
-        assert_eq!(quote.ts_init, TS);
+        assert_eq!(
+            parse_orderbook_quote(&msg, &instrument, TS)
+                .unwrap_err()
+                .to_string(),
+            expected_error
+        );
     }
 
     #[rstest]
@@ -1353,7 +1342,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument.id());
-        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_side, OrderSide::Buy.into());
         assert_eq!(report.order_type, OrderType::Limit);
         assert_eq!(report.time_in_force, TimeInForce::Gtc);
         assert_eq!(report.order_status, OrderStatus::Filled);
@@ -1370,6 +1359,30 @@ mod tests {
             UnixNanos::new(1_672_364_262_444_000_000)
         );
         assert_eq!(report.ts_last, UnixNanos::new(1_672_364_262_457_000_000));
+    }
+
+    #[rstest]
+    fn parse_ws_order_avg_price_keeps_every_digit_the_venue_sent() {
+        // 28 significant digits is exactly what `Decimal` holds, and more than `f64` can:
+        // routing the same string through `f64` first collapses it to 30000.500000000004.
+        let raw = "30000.50000000000372529029846";
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_order_filled.json");
+        let mut msg: crate::websocket::messages::BybitWsAccountOrderMsg =
+            serde_json::from_str(&json).unwrap();
+        msg.data[0].avg_price = raw.to_string();
+
+        let report = parse_ws_order_status_report(
+            &msg.data[0],
+            &instrument,
+            AccountId::new("BYBIT-001"),
+            TS,
+        )
+        .unwrap();
+
+        let via_f64: Decimal = raw.parse::<f64>().unwrap().to_string().parse().unwrap();
+        assert_eq!(report.avg_px, Some(Decimal::from_str(raw).unwrap()));
+        assert_ne!(report.avg_px, Some(via_f64));
     }
 
     #[rstest]
@@ -1391,6 +1404,28 @@ mod tests {
             "O-20251001-164609-APEX-000-49"
         );
         assert_eq!(report.cancel_reason, Some("UNKNOWN".to_string()));
+    }
+
+    #[rstest]
+    fn parse_ws_order_post_only_cancel_maps_to_rejected() {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_order.json");
+        let mut msg: crate::websocket::messages::BybitWsAccountOrderMsg =
+            serde_json::from_str(&json).unwrap();
+
+        let order = msg.data.first_mut().unwrap();
+        order.reject_reason = Ustr::from("EC_PostOnlyWillTakeLiquidity");
+        order.cum_exec_qty = "0".to_string();
+        let account_id = AccountId::new("BYBIT-001");
+
+        let report =
+            parse_ws_order_status_report(&msg.data[0], &instrument, account_id, TS).unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::Rejected);
+        assert_eq!(
+            report.cancel_reason,
+            Some("EC_PostOnlyWillTakeLiquidity".to_string())
+        );
     }
 
     #[rstest]
@@ -1418,6 +1453,7 @@ mod tests {
         assert_eq!(report.last_qty, instrument.make_qty(0.5, None));
         assert_eq!(report.last_px, instrument.make_price(95900.1));
         assert_eq!(report.commission.as_f64(), 26.3725275);
+        assert_eq!(report.commission.currency.code, "USDT");
         assert_eq!(report.liquidity_side, LiquiditySide::Taker);
         assert_eq!(
             report.client_order_id.as_ref().unwrap().to_string(),
@@ -1452,6 +1488,7 @@ mod tests {
         assert_eq!(report.last_qty, instrument.make_qty(0.5, None));
         assert_eq!(report.last_px, instrument.make_price(95850.0));
         assert_eq!(report.commission.as_f64(), 0.0);
+        assert_eq!(report.commission.currency.code, "USDT");
     }
 
     #[rstest]
@@ -1466,6 +1503,22 @@ mod tests {
         let report = parse_ws_fill_report(execution, account_id, &instrument, TS).unwrap();
 
         assert_eq!(report.venue_position_id, None);
+    }
+
+    #[rstest]
+    fn parse_ws_fill_report_uses_payload_fee_currency() {
+        let instrument = linear_instrument();
+        let json = load_test_json("ws_account_execution.json");
+        let msg: crate::websocket::messages::BybitWsAccountExecutionMsg =
+            serde_json::from_str(&json).unwrap();
+
+        let mut execution = msg.data[0].clone();
+        execution.fee_currency = Ustr::from("BTC");
+        let account_id = AccountId::new("BYBIT-001");
+
+        let report = parse_ws_fill_report(&execution, account_id, &instrument, TS).unwrap();
+
+        assert_eq!(report.commission.currency.code, "BTC");
     }
 
     fn fast_execution(is_maker: bool, order_link_id: &str) -> BybitWsAccountExecutionFast {
@@ -1608,7 +1661,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id, instrument.id());
-        assert_eq!(report.position_side.as_position_side(), PositionSide::Short);
+        assert_eq!(report.position_side, PositionSide::Short);
         assert_eq!(report.quantity, instrument.make_qty(0.01, None));
         assert_eq!(
             report.avg_px_open,
@@ -1664,7 +1717,7 @@ mod tests {
 
         assert_eq!(report.account_id, account_id);
         assert_eq!(report.instrument_id.symbol.as_str(), "ETHUSDT-LINEAR");
-        assert_eq!(report.position_side.as_position_side(), PositionSide::Short);
+        assert_eq!(report.position_side, PositionSide::Short);
         assert_eq!(report.quantity, instrument.make_qty(0.01, None));
         assert_eq!(
             report.avg_px_open,
@@ -1692,14 +1745,14 @@ mod tests {
 
         // Check BTC balance
         let btc_balance = &state.balances[0];
-        assert_eq!(btc_balance.currency.code.as_str(), "BTC");
+        assert_eq!(btc_balance.currency.code, "BTC");
         assert!((btc_balance.total.as_f64() - 0.00102964).abs() < 1e-8);
         assert!((btc_balance.free.as_f64() - 0.00092964).abs() < 1e-8);
         assert!((btc_balance.locked.as_f64() - 0.0001).abs() < 1e-8);
 
         // Check USDT balance
         let usdt_balance = &state.balances[1];
-        assert_eq!(usdt_balance.currency.code.as_str(), "USDT");
+        assert_eq!(usdt_balance.currency.code, "USDT");
         assert!((usdt_balance.total.as_f64() - 9647.75537647).abs() < 1e-6);
         assert!((usdt_balance.free.as_f64() - 9519.89806037).abs() < 1e-6);
         assert!((usdt_balance.locked.as_f64() - 127.8573161).abs() < 1e-6);
@@ -1711,7 +1764,7 @@ mod tests {
         let btc_margin = state
             .margins
             .iter()
-            .find(|m| m.currency.code.as_str() == "BTC")
+            .find(|m| m.currency.code == "BTC")
             .expect("BTC margin missing");
         assert!((btc_margin.initial.as_f64() - 0.0001).abs() < 1e-8);
         assert!(btc_margin.maintenance.as_f64().abs() < 1e-9);
@@ -1719,7 +1772,7 @@ mod tests {
         let usdt_margin = state
             .margins
             .iter()
-            .find(|m| m.currency.code.as_str() == "USDT")
+            .find(|m| m.currency.code == "USDT")
             .expect("USDT margin missing");
         assert!((usdt_margin.initial.as_f64() - 127.8573161).abs() < 1e-6);
         assert!((usdt_margin.maintenance.as_f64() - 12.78573161).abs() < 1e-6);
@@ -1747,7 +1800,7 @@ mod tests {
 
         // Check USDT balance
         let usdt_balance = &state.balances[0];
-        assert_eq!(usdt_balance.currency.code.as_str(), "USDT");
+        assert_eq!(usdt_balance.currency.code, "USDT");
 
         // Wallet has 51,333.82 USDT total
         assert!((usdt_balance.total.as_f64() - 51333.82543837).abs() < 1e-6);
@@ -1766,7 +1819,7 @@ mod tests {
         assert_eq!(state.margins.len(), 1);
         let usdt_margin = &state.margins[0];
         assert!(usdt_margin.instrument_id.is_none());
-        assert_eq!(usdt_margin.currency.code.as_str(), "USDT");
+        assert_eq!(usdt_margin.currency.code, "USDT");
         assert!((usdt_margin.initial.as_f64() - 50.028).abs() < 1e-6);
         assert!(usdt_margin.maintenance.as_f64().abs() < 1e-9);
     }
@@ -1866,7 +1919,7 @@ mod tests {
 
         // Verify sell StopMarket: orderType=Market + stopOrderType=Stop + triggerDirection=2 (falls to)
         assert_eq!(report.order_type, OrderType::StopMarket);
-        assert_eq!(report.order_side, OrderSide::Sell);
+        assert_eq!(report.order_side, OrderSide::Sell.into());
         assert_eq!(report.order_status, OrderStatus::Accepted); // Untriggered maps to Accepted
         assert_eq!(report.trigger_price, Some(instrument.make_price(45000.00)));
         assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
@@ -1889,7 +1942,7 @@ mod tests {
 
         // Verify buy StopMarket: orderType=Market + stopOrderType=Stop + triggerDirection=1 (rises to)
         assert_eq!(report.order_type, OrderType::StopMarket);
-        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_side, OrderSide::Buy.into());
         assert_eq!(report.order_status, OrderStatus::Accepted);
         assert_eq!(report.trigger_price, Some(instrument.make_price(55000.00)));
         assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
@@ -1912,7 +1965,7 @@ mod tests {
 
         // Verify buy MIT: orderType=Market + stopOrderType=Stop + triggerDirection=2 (falls to)
         assert_eq!(report.order_type, OrderType::MarketIfTouched);
-        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_side, OrderSide::Buy.into());
         assert_eq!(report.order_status, OrderStatus::Accepted); // Untriggered maps to Accepted
         assert_eq!(report.trigger_price, Some(instrument.make_price(55000.00)));
         assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
@@ -1935,7 +1988,7 @@ mod tests {
 
         // Verify sell MIT: orderType=Market + stopOrderType=Stop + triggerDirection=1 (rises to)
         assert_eq!(report.order_type, OrderType::MarketIfTouched);
-        assert_eq!(report.order_side, OrderSide::Sell);
+        assert_eq!(report.order_side, OrderSide::Sell.into());
         assert_eq!(report.order_status, OrderStatus::Accepted);
         assert_eq!(report.trigger_price, Some(instrument.make_price(55000.00)));
         assert_eq!(
@@ -1958,7 +2011,7 @@ mod tests {
         // Verify StopLimit order type is correctly parsed
         // orderType=Limit + stopOrderType=Stop + triggerDirection=2 (falls to)
         assert_eq!(report.order_type, OrderType::StopLimit);
-        assert_eq!(report.order_side, OrderSide::Sell);
+        assert_eq!(report.order_side, OrderSide::Sell.into());
         assert_eq!(report.order_status, OrderStatus::Accepted); // Untriggered maps to Accepted
         assert_eq!(report.price, Some(instrument.make_price(44500.00)));
         assert_eq!(report.trigger_price, Some(instrument.make_price(45000.00)));
@@ -1982,7 +2035,7 @@ mod tests {
         // Verify LimitIfTouched order type is correctly parsed
         // orderType=Limit + stopOrderType=Stop + triggerDirection=1 (rises to)
         assert_eq!(report.order_type, OrderType::LimitIfTouched);
-        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_side, OrderSide::Buy.into());
         assert_eq!(report.order_status, OrderStatus::Accepted); // Untriggered maps to Accepted
         assert_eq!(report.price, Some(instrument.make_price(55500.00)));
         assert_eq!(report.trigger_price, Some(instrument.make_price(55000.00)));
@@ -2006,7 +2059,7 @@ mod tests {
         let state = parse_ws_account_state(wallet, account_id, ts_event, TS).unwrap();
 
         let usdt_balance = &state.balances[0];
-        assert_eq!(usdt_balance.currency.code.as_str(), "USDT");
+        assert_eq!(usdt_balance.currency.code, "USDT");
         assert!((usdt_balance.total.as_f64() - 100.0).abs() < 1e-6);
         // Locked is capped at total to prevent negative free balance
         assert!((usdt_balance.locked.as_f64() - 100.0).abs() < 1e-6);
@@ -2025,7 +2078,7 @@ mod tests {
         let report = parse_ws_order_status_report(order, &instrument, account_id, TS).unwrap();
 
         assert_eq!(report.order_type, OrderType::MarketIfTouched);
-        assert_eq!(report.order_side, OrderSide::Sell);
+        assert_eq!(report.order_side, OrderSide::Sell.into());
         assert_eq!(report.trigger_price, Some(instrument.make_price(55000.00)));
         assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
         assert!(report.reduce_only);
@@ -2043,7 +2096,7 @@ mod tests {
         let report = parse_ws_order_status_report(order, &instrument, account_id, TS).unwrap();
 
         assert_eq!(report.order_type, OrderType::StopMarket);
-        assert_eq!(report.order_side, OrderSide::Sell);
+        assert_eq!(report.order_side, OrderSide::Sell.into());
         assert_eq!(report.trigger_price, Some(instrument.make_price(48000.00)));
         assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
         assert!(report.reduce_only);

@@ -21,12 +21,14 @@
 //!
 //! Decoding accepts both uppercase and lowercase hex. A `%` that is not
 //! followed by two hex digits is passed through literally, matching the
-//! behaviour of the `urlencoding` crate that this module replaces.
+//! behavior of the `urlencoding` crate that this module replaces.
 //!
 //! [RFC 3986]: https://datatracker.ietf.org/doc/html/rfc3986
 //! [RFC 3986 Section 2.1]: https://datatracker.ietf.org/doc/html/rfc3986#section-2.1
 
-use std::{borrow::Cow, fmt::Display, string::FromUtf8Error};
+use std::{borrow::Cow, string::FromUtf8Error};
+
+use thiserror::Error;
 
 const UNRESERVED: [bool; 256] = {
     let mut table = [false; 256];
@@ -190,36 +192,16 @@ pub fn decode_bytes(input: &[u8]) -> Cow<'_, [u8]> {
 }
 
 /// Errors from URL percent-decoding.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum DecodeError {
     /// Decoded bytes are not valid UTF-8.
-    InvalidUtf8(FromUtf8Error),
-}
-
-impl Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidUtf8(err) => write!(f, "invalid UTF-8 in decoded bytes: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for DecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidUtf8(err) => Some(err),
-        }
-    }
-}
-
-impl From<FromUtf8Error> for DecodeError {
-    fn from(err: FromUtf8Error) -> Self {
-        Self::InvalidUtf8(err)
-    }
+    #[error("invalid UTF-8 in decoded bytes: {0}")]
+    InvalidUtf8(#[from] FromUtf8Error),
 }
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use rstest::rstest;
 
     use super::*;
@@ -513,6 +495,17 @@ mod tests {
         out
     }
 
+    fn malformed_percent_sequence() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            Just(vec![b'%']),
+            (any::<u8>(), any::<u8>())
+                .prop_filter("contains a non-hex byte", |(hi, lo)| {
+                    !hi.is_ascii_hexdigit() || !lo.is_ascii_hexdigit()
+                })
+                .prop_map(|(hi, lo)| vec![b'%', hi, lo]),
+        ]
+    }
+
     proptest::proptest! {
         #[rstest]
         fn prop_encode_matches_reference(input: Vec<u8>) {
@@ -523,6 +516,21 @@ mod tests {
 
         #[rstest]
         fn prop_decode_matches_reference(input: Vec<u8>) {
+            let actual = decode_bytes(&input);
+            let expected = reference_decode(&input);
+            proptest::prop_assert_eq!(actual.as_ref(), expected.as_slice());
+        }
+
+        #[rstest]
+        fn prop_malformed_percent_sequences_match_reference(
+            prefix in proptest::collection::vec(any::<u8>(), 0..16),
+            malformed in malformed_percent_sequence(),
+            suffix in proptest::collection::vec(any::<u8>(), 0..16),
+        ) {
+            let mut input = prefix;
+            input.extend(malformed);
+            input.extend(suffix);
+
             let actual = decode_bytes(&input);
             let expected = reference_decode(&input);
             proptest::prop_assert_eq!(actual.as_ref(), expected.as_slice());

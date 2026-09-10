@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
     );
 
-    client.connect(&auth_response.token).await?;
+    client.connect(auth_response.token.expose_secret()).await?;
     log::info!("Connected and authenticated");
 
     log::info!("Requesting open orders...");
@@ -137,8 +137,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 AxOrdersWsMessage::OpenOrdersResponse(resp) => {
-                    log::info!("Open orders: {} orders", resp.res.len());
-                    for order in &resp.res {
+                    log::info!("Open orders: {} orders", resp.res.orders.len());
+                    for order in &resp.res.orders {
                         log::info!(
                             "  {} {} {:?} {} @ {} ({:?})",
                             order.oid,

@@ -15,11 +15,14 @@
 
 //! Wire frames and handler-output message types for Lighter streams.
 
-use std::fmt::Debug;
-
 use ahash::AHashMap;
-use nautilus_core::serialization::{
-    deserialize_decimal, deserialize_decimal_from_str, deserialize_optional_decimal,
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::{
+    serialization::{
+        deserialize_decimal, deserialize_decimal_from_str, deserialize_optional_decimal,
+    },
+    string::secret::SecretString,
 };
 use nautilus_model::{
     data::{
@@ -36,6 +39,7 @@ use serde::{
 };
 use serde_json::value::RawValue;
 use ustr::Ustr;
+use zeroize::Zeroize;
 
 use crate::{
     common::enums::LighterCandleResolution,
@@ -61,26 +65,65 @@ pub enum NautilusWsMessage {
     IndexPrice(IndexPriceUpdate),
     FundingRate(FundingRateUpdate),
     ExecutionReports(Vec<ExecutionReport>),
-    PositionSnapshot(Vec<PositionStatusReport>),
+    PositionSnapshot {
+        reports: Vec<PositionStatusReport>,
+        skipped_market_ids: Vec<i16>,
+    },
+    PositionUpdate {
+        reports: Vec<PositionStatusReport>,
+        closed_market_ids: Vec<i16>,
+        skipped_market_ids: Vec<i16>,
+    },
     AccountState(Box<AccountState>),
     SendTxAck {
+        connection_epoch: u64,
         tx_hash: Option<String>,
         code: i64,
     },
     SendTxRejected {
+        connection_epoch: u64,
         source: SendTxRejectionSource,
         code: Option<i64>,
         message: String,
         tx_hash: Option<String>,
     },
     Raw(serde_json::Value),
-    Reconnected,
+    Reconnected {
+        connection_epoch: u64,
+    },
     /// Marker emitted by the feed handler right after each account stream
     /// has delivered its first frame. The execution consumption loop forwards
     /// any preceding typed reports first, then marks the corresponding
     /// readiness flag, keeping `connect()` blocked until applied state is
     /// observable to strategies.
     AccountStreamFirstFrame(AccountStream),
+}
+
+impl NautilusWsMessage {
+    #[must_use]
+    pub(crate) fn with_connection_epoch(self, connection_epoch: u64) -> Self {
+        match self {
+            Self::SendTxAck { tx_hash, code, .. } => Self::SendTxAck {
+                connection_epoch,
+                tx_hash,
+                code,
+            },
+            Self::SendTxRejected {
+                source,
+                code,
+                message,
+                tx_hash,
+                ..
+            } => Self::SendTxRejected {
+                connection_epoch,
+                source,
+                code,
+                message,
+                tx_hash,
+            },
+            other => other,
+        }
+    }
 }
 
 /// Identifier for one of the five account-scoped WebSocket streams the
@@ -130,14 +173,14 @@ pub enum ExecutionReport {
     Fill(LighterTrade),
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum LighterWsRequest {
     #[serde(rename = "subscribe")]
     Subscribe {
         channel: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        auth: Option<String>,
+        auth: Option<SecretString>,
     },
     #[serde(rename = "unsubscribe")]
     Unsubscribe { channel: String },
@@ -145,26 +188,10 @@ pub enum LighterWsRequest {
     SendTx { data: LighterWsSendTx },
 }
 
-impl Debug for LighterWsRequest {
-    /// Custom `Debug` that redacts the `auth` field of `Subscribe`. The
-    /// serialized form of this enum is what hits the wire as a Lighter L2
-    /// bearer token; deriving `Debug` would otherwise leak it via any
-    /// `format!("{request:?}")` call in error or trace paths.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Subscribe { channel, auth } => f
-                .debug_struct(stringify!(Subscribe))
-                .field("channel", channel)
-                .field("authed", &auth.is_some())
-                .finish(),
-            Self::Unsubscribe { channel } => f
-                .debug_struct(stringify!(Unsubscribe))
-                .field("channel", channel)
-                .finish(),
-            Self::SendTx { data } => f
-                .debug_struct(stringify!(SendTx))
-                .field("data", data)
-                .finish(),
+impl Zeroize for LighterWsRequest {
+    fn zeroize(&mut self) {
+        if let Self::Subscribe { auth, .. } = self {
+            auth.zeroize();
         }
     }
 }
@@ -179,7 +206,7 @@ impl LighterWsRequest {
     }
 
     #[must_use]
-    pub fn subscribe_auth(channel: impl Into<String>, auth: impl Into<String>) -> Self {
+    pub fn subscribe_auth(channel: impl Into<String>, auth: impl Into<SecretString>) -> Self {
         Self::Subscribe {
             channel: channel.into(),
             auth: Some(auth.into()),
@@ -462,7 +489,7 @@ pub enum LighterWsFrame {
         #[serde(default, deserialize_with = "deserialize_trade_vec")]
         trades: Vec<LighterTrade>,
     },
-    #[serde(rename = "update/account_orders")]
+    #[serde(rename = "update/account_orders", alias = "subscribed/account_orders")]
     AccountOrders {
         account: i64,
         channel: Ustr,
@@ -496,10 +523,16 @@ pub enum LighterWsFrame {
         channel: Ustr,
         trades: AHashMap<Ustr, Vec<LighterTrade>>,
     },
-    #[serde(
-        rename = "update/account_all_positions",
-        alias = "subscribed/account_all_positions"
-    )]
+    #[serde(rename = "subscribed/account_all_positions")]
+    AccountAllPositionsSnapshot {
+        channel: Ustr,
+        positions: AHashMap<Ustr, LighterPosition>,
+        #[serde(default)]
+        shares: Vec<LighterPoolShares>,
+        last_funding_round: Option<AHashMap<Ustr, Decimal>>,
+        last_funding_discount: Option<AHashMap<Ustr, Decimal>>,
+    },
+    #[serde(rename = "update/account_all_positions")]
     AccountAllPositions {
         channel: Ustr,
         positions: AHashMap<Ustr, LighterPosition>,
@@ -523,7 +556,7 @@ pub enum LighterWsFrame {
         stats: LighterUserStats,
         timestamp: u64,
     },
-    #[serde(rename = "update/height")]
+    #[serde(rename = "update/height", alias = "subscribed/height")]
     Height {
         channel: Ustr,
         height: i64,
@@ -698,7 +731,7 @@ pub struct LighterPoolShares {
 
 /// Inner shape of the `user_stats.stats.cross_stats` and `.total_stats`
 /// substructs. Every field is a stringified decimal on the wire and
-/// denominated in USDC.
+/// denominated in the deployment settlement currency.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct LighterUserStatsScoped {
     #[serde(deserialize_with = "deserialize_decimal_from_str")]
@@ -741,15 +774,14 @@ pub struct LighterUserStats {
 pub struct LighterAsset {
     pub symbol: Ustr,
     pub asset_id: i16,
-    /// Spot-side balance for this asset (USDC sitting in the wallet bucket,
-    /// non-USDC spot holdings, etc).
+    /// Spot-side balance for this asset.
     #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub balance: Decimal,
     /// Spot-side amount reserved by resting spot orders.
     #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub locked_balance: Decimal,
-    /// Perp-side collateral for this asset. USDC on Lighter today; defaults
-    /// to zero when the wire omits the field (spot-only frames).
+    /// Perp-side collateral for this asset. Defaults to zero when the wire
+    /// omits the field (spot-only frames).
     #[serde(default, deserialize_with = "deserialize_decimal_from_str")]
     pub margin_balance: Decimal,
     /// Per-asset margin treatment. Observed values: "disabled" (asset not
@@ -885,7 +917,7 @@ mod tests {
     #[rstest]
     fn test_subscribe_request_debug_redacts_auth_token() {
         let token = "schnorr-signature-bytes-do-not-leak";
-        let request = LighterWsRequest::subscribe_auth("account_all/123", token);
+        let mut request = LighterWsRequest::subscribe_auth("account_all/123", token);
 
         let dbg = format!("{request:?}");
 
@@ -893,7 +925,13 @@ mod tests {
             !dbg.contains(token),
             "Debug output must not contain the auth token, found: {dbg}",
         );
-        assert!(dbg.contains("authed"), "Debug should include authed flag");
+        assert!(dbg.contains(REDACTED));
+
+        request.zeroize();
+        assert!(matches!(
+            &request,
+            LighterWsRequest::Subscribe { auth: None, .. }
+        ));
     }
 
     #[rstest]
@@ -1362,6 +1400,7 @@ mod tests {
                 let market_orders = orders.get(&Ustr::from("0")).unwrap();
                 assert_eq!(market_orders.len(), 1);
                 assert_eq!(market_orders[0].order_id, "281476929510110");
+                assert_eq!(market_orders[0].nonce, 281_474_720_725_346);
                 assert_eq!(
                     market_orders[0].filled_base_amount,
                     Decimal::from_str("0.0020").unwrap(),
@@ -1369,6 +1408,17 @@ mod tests {
             }
             _ => panic!("expected account orders frame, was {frame:?}"),
         }
+    }
+
+    #[rstest]
+    fn test_account_orders_subscribed_frame_deserializes() {
+        let mut payload: serde_json::Value =
+            serde_json::from_str(WS_ACCOUNT_ORDERS_UPDATE).unwrap();
+        payload["type"] = serde_json::json!("subscribed/account_orders");
+
+        let frame: LighterWsFrame = serde_json::from_value(payload).unwrap();
+
+        assert!(matches!(frame, LighterWsFrame::AccountOrders { .. }));
     }
 
     #[rstest]
@@ -1467,6 +1517,27 @@ mod tests {
     }
 
     #[rstest]
+    fn test_account_all_positions_snapshot_frame_deserializes() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(WS_ACCOUNT_ALL_POSITIONS_UPDATE).unwrap();
+        value["type"] = serde_json::json!("subscribed/account_all_positions");
+        let frame: LighterWsFrame = serde_json::from_value(value).unwrap();
+
+        match frame {
+            LighterWsFrame::AccountAllPositionsSnapshot {
+                channel, positions, ..
+            } => {
+                assert_eq!(channel, Ustr::from("account_all_positions:1234"));
+                let position = positions.get(&Ustr::from("0")).unwrap();
+                assert_eq!(position.market_id, 0);
+                assert_eq!(position.position, Decimal::from_str("1.5000").unwrap());
+                assert_eq!(position.sign, 1);
+            }
+            _ => panic!("expected account all positions snapshot, was {frame:?}"),
+        }
+    }
+
+    #[rstest]
     fn test_height_frame_deserializes() {
         let frame: LighterWsFrame = serde_json::from_str(WS_HEIGHT_UPDATE).unwrap();
 
@@ -1482,6 +1553,16 @@ mod tests {
             }
             _ => panic!("expected height frame"),
         }
+    }
+
+    #[rstest]
+    fn test_height_subscribed_frame_deserializes() {
+        let mut payload: serde_json::Value = serde_json::from_str(WS_HEIGHT_UPDATE).unwrap();
+        payload["type"] = serde_json::json!("subscribed/height");
+
+        let frame: LighterWsFrame = serde_json::from_value(payload).unwrap();
+
+        assert!(matches!(frame, LighterWsFrame::Height { .. }));
     }
 
     #[rstest]

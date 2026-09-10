@@ -17,13 +17,14 @@
 //!
 //! The `nautilus-testkit` crate provides testing utilities including test data management,
 //! file handling, and common testing patterns. This crate supports robust testing workflows
-//! across the entire NautilusTrader ecosystem with automated data downloads and validation:
+//! across the entire NautilusTrader ecosystem with explicit data preparation and local-only loading:
 //!
-//! - **Test data management**: Automated downloading and caching of test datasets.
+//! - **Test data management**: Explicit downloading, checksum verification, and caching of test datasets before tests.
 //! - **File utilities**: File integrity verification with SHA-256 checksums.
 //! - **Path resolution**: Platform-agnostic test data path management.
 //! - **Precision handling**: Support for both 64-bit and 128-bit precision test data.
-//! - **Common patterns**: Reusable test utilities and helper functions.
+//! - **Event collection**: Draining and correlating the data events a client emits.
+//! - **Common patterns**: Reusable fixtures and test support.
 //!
 //! # NautilusTrader
 //!
@@ -35,14 +36,18 @@
 //!
 //! # Feature Flags
 //!
-//! This crate provides feature flags to control source code inclusion during compilation,
-//! depending on the intended use case, i.e. whether to provide Python bindings
-//! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
-//! or as part of a Rust only build.
+//! This crate provides feature flags to control source code inclusion during compilation.
 //!
+//! - `datasets` (default): Enables test dataset discovery, download, validation, parsing, and
+//!   loading.
+//! - `extension-module`: Builds as a Python extension module.
+//! - `high-precision`: Enables
+//!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
+//!   to use 128-bit value types.
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
-//! - `high-precision`: Enables [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) to use 128-bit value types.
-//! - `extension-module`: Builds the crate as a Python extension module.
+//! - `testers` (default): Enables test actors, strategies, and in-memory cache backing.
+//!
+//! Event collection utilities remain available without enabling a feature.
 
 #![warn(rustc::all)]
 #![warn(clippy::pedantic)]
@@ -53,6 +58,10 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
 #![cfg_attr(
     test,
     allow(
@@ -64,12 +73,24 @@
     )
 )]
 
+#[cfg(feature = "testers")]
+pub mod cache;
+#[cfg(feature = "datasets")]
 pub mod common;
+#[cfg(feature = "testers")]
+pub mod components;
+pub mod events;
+
+#[cfg(feature = "datasets")]
 pub mod files;
+#[cfg(feature = "datasets")]
 pub mod itch;
+
+#[cfg(feature = "testers")]
 pub mod testers;
 
 // Re-export for convenience
+#[cfg(feature = "testers")]
 pub use testers::{DataTester, DataTesterConfig, ExecTester, ExecTesterConfig};
 
 #[cfg(feature = "python")]

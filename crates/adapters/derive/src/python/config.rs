@@ -15,12 +15,15 @@
 
 //! Python bindings for Derive configuration.
 
+use nautilus_core::string::secret::SecretString;
+use nautilus_model::identifiers::AccountId;
+use nautilus_network::websocket::TransportBackend;
 use pyo3::pymethods;
 use rust_decimal::Decimal;
 
 use crate::{
     common::enums::DeriveEnvironment,
-    config::{DeriveDataClientConfig, DeriveExecClientConfig},
+    config::{DeriveDataClientConfig, DeriveExecutionClientConfig},
 };
 
 #[pymethods]
@@ -39,6 +42,7 @@ impl DeriveDataClientConfig {
         currencies = None,
         include_expired = None,
         auto_load_missing_instruments = None,
+        transport_backend = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -52,41 +56,43 @@ impl DeriveDataClientConfig {
         currencies: Option<Vec<String>>,
         include_expired: Option<bool>,
         auto_load_missing_instruments: Option<bool>,
+        transport_backend: Option<TransportBackend>,
     ) -> Self {
         let defaults = Self::default();
         Self {
             base_url_rest,
             base_url_ws,
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
             environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
-            ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
+            ws_timeout_secs,
             update_instruments_interval_mins: update_instruments_interval_mins
                 .unwrap_or(defaults.update_instruments_interval_mins),
             currencies: currencies.unwrap_or(defaults.currencies),
             include_expired: include_expired.unwrap_or(defaults.include_expired),
             auto_load_missing_instruments: auto_load_missing_instruments
                 .unwrap_or(defaults.auto_load_missing_instruments),
-            transport_backend: defaults.transport_backend,
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         }
     }
 
     #[getter]
-    fn proxy_url(&self) -> Option<String> {
-        self.proxy_url.clone()
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(DeriveDataClientConfig).to_string()
     }
 }
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl DeriveExecClientConfig {
+impl DeriveExecutionClientConfig {
     /// Configuration for the Derive live execution client.
     #[new]
     #[pyo3(signature = (
+        account_id = None,
         wallet_address = None,
         session_key = None,
         subaccount_id = None,
@@ -98,6 +104,7 @@ impl DeriveExecClientConfig {
         max_retries = None,
         retry_delay_initial_ms = None,
         retry_delay_max_ms = None,
+        ws_timeout_secs = None,
         max_fee_per_contract = None,
         domain_separator = None,
         action_typehash = None,
@@ -105,9 +112,12 @@ impl DeriveExecClientConfig {
         signature_expiry_secs = None,
         market_order_slippage_bps = None,
         max_matching_requests_per_second = None,
+        max_per_instrument_matching_requests_per_second = None,
+        transport_backend = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
+        account_id: Option<AccountId>,
         wallet_address: Option<String>,
         session_key: Option<String>,
         subaccount_id: Option<u64>,
@@ -119,6 +129,7 @@ impl DeriveExecClientConfig {
         max_retries: Option<u32>,
         retry_delay_initial_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
+        ws_timeout_secs: Option<u64>,
         max_fee_per_contract: Option<Decimal>,
         domain_separator: Option<String>,
         action_typehash: Option<String>,
@@ -126,23 +137,27 @@ impl DeriveExecClientConfig {
         signature_expiry_secs: Option<u64>,
         market_order_slippage_bps: Option<u32>,
         max_matching_requests_per_second: Option<u32>,
+        max_per_instrument_matching_requests_per_second: Option<u32>,
+        transport_backend: Option<TransportBackend>,
     ) -> Self {
         let defaults = Self::default();
         Self {
+            account_id: account_id.unwrap_or(defaults.account_id),
             wallet_address,
-            session_key,
+            session_key: session_key.map(SecretString::from),
             subaccount_id,
             base_url_rest,
             base_url_ws,
-            proxy_url,
+            proxy_url: proxy_url.map(SecretString::from),
             environment: environment.unwrap_or(defaults.environment),
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             max_retries: max_retries.unwrap_or(defaults.max_retries),
             retry_delay_initial_ms: retry_delay_initial_ms
                 .unwrap_or(defaults.retry_delay_initial_ms),
             retry_delay_max_ms: retry_delay_max_ms.unwrap_or(defaults.retry_delay_max_ms),
+            ws_timeout_secs,
             max_fee_per_contract,
-            transport_backend: defaults.transport_backend,
+            transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
             domain_separator,
             action_typehash,
             trade_module_address,
@@ -150,15 +165,16 @@ impl DeriveExecClientConfig {
             market_order_slippage_bps: market_order_slippage_bps
                 .unwrap_or(defaults.market_order_slippage_bps),
             max_matching_requests_per_second,
+            max_per_instrument_matching_requests_per_second,
         }
     }
 
     #[getter]
-    fn proxy_url(&self) -> Option<String> {
-        self.proxy_url.clone()
+    const fn has_proxy_url(&self) -> bool {
+        self.proxy_url.is_some()
     }
 
     fn __repr__(&self) -> String {
-        format!("{self:?}")
+        stringify!(DeriveExecutionClientConfig).to_string()
     }
 }

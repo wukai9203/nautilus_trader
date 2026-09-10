@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_core::{UUID4, nanos::DurationNanos, python::IntoPyObjectNautilusExt};
+use nautilus_core::{UUID4, python::IntoPyObjectNautilusExt};
 use pyo3::{basic::CompareOp, prelude::*};
 
 use crate::{
@@ -24,8 +24,8 @@ use crate::{
     types::{Currency, Money, Price, Quantity},
 };
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl PositionClosed {
     #[staticmethod]
     #[pyo3(name = "create")]
@@ -118,6 +118,12 @@ impl PositionClosed {
     }
 
     #[getter]
+    #[pyo3(name = "peak_qty")]
+    fn py_peak_qty(&self) -> Quantity {
+        self.peak_quantity
+    }
+
+    #[getter]
     #[pyo3(name = "last_qty")]
     fn py_last_qty(&self) -> Quantity {
         self.last_qty
@@ -167,8 +173,8 @@ impl PositionClosed {
 
     #[getter]
     #[pyo3(name = "duration")]
-    fn py_duration(&self) -> DurationNanos {
-        self.duration
+    fn py_duration(&self) -> u64 {
+        self.duration.as_u64()
     }
 
     #[getter]

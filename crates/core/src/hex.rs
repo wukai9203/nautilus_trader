@@ -15,7 +15,7 @@
 
 //! Hexadecimal encoding and decoding for byte slices.
 
-use std::fmt::Display;
+use thiserror::Error;
 
 pub(crate) const ENCODE_PAIR: [[u8; 2]; 256] = {
     const NIBBLE: [u8; 16] = *b"0123456789abcdef";
@@ -89,7 +89,7 @@ pub fn decode(data: impl AsRef<[u8]>) -> Result<Vec<u8>, DecodeError> {
         return Err(DecodeError::OddLength);
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.chunks_exact(2) {
+    for pair in hex.as_chunks::<2>().0 {
         let hi = DECODE_NIBBLE[pair[0] as usize];
         let lo = DECODE_NIBBLE[pair[1] as usize];
         if (hi | lo) & 0xF0 != 0 {
@@ -120,7 +120,7 @@ pub fn decode_array<const N: usize>(data: impl AsRef<[u8]>) -> Result<[u8; N], D
     }
     let mut out = [0u8; N];
 
-    for (i, pair) in hex.chunks_exact(2).enumerate() {
+    for (i, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
         let hi = DECODE_NIBBLE[pair[0] as usize];
         let lo = DECODE_NIBBLE[pair[1] as usize];
         if (hi | lo) & 0xF0 != 0 {
@@ -136,13 +136,16 @@ pub fn decode_array<const N: usize>(data: impl AsRef<[u8]>) -> Result<[u8; N], D
 }
 
 /// Errors from hex decoding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DecodeError {
     /// Input has an odd number of characters.
+    #[error("odd number of hex characters")]
     OddLength,
     /// Input contains a non-hex byte.
+    #[error("invalid hex character: {0:#04x}")]
     InvalidChar(u8),
     /// Input length does not match expected size.
+    #[error("expected {expected} hex characters, was {actual}")]
     LengthMismatch {
         /// Expected hex string length.
         expected: usize,
@@ -150,20 +153,6 @@ pub enum DecodeError {
         actual: usize,
     },
 }
-
-impl Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OddLength => f.write_str("odd number of hex characters"),
-            Self::InvalidChar(b) => write!(f, "invalid hex character: {b:#04x}"),
-            Self::LengthMismatch { expected, actual } => {
-                write!(f, "expected {expected} hex characters, was {actual}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DecodeError {}
 
 #[cfg(test)]
 mod tests {

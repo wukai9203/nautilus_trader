@@ -41,7 +41,7 @@ fn determine_data_type(file_name: &str) -> Option<NautilusDataType> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
-        return Err("Usage: to_json <file>".into());
+        return Err("Usage: to-json <file>".into());
     }
     let file_path = PathBuf::from(&args[1]);
 
@@ -97,7 +97,7 @@ where
     // Read data
     session.add_file::<T>("data", file_path, None, None)?;
     let query_result = session.get_query_result();
-    let data = query_result.collect::<Vec<_>>();
+    let data = query_result.collect::<Result<Vec<_>, _>>()?;
     let data: Vec<T> = to_variant(data);
 
     // Extract metadata and add row group info

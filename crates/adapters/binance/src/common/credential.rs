@@ -29,8 +29,11 @@ use std::fmt::{Debug, Display};
 
 use aws_lc_rs::hmac;
 use ed25519_dalek::{Signature, Signer, SigningKey};
-use nautilus_core::{hex, string::secret::REDACTED};
-use zeroize::ZeroizeOnDrop;
+use nautilus_core::{
+    hex,
+    string::secret::{REDACTED, SecretString},
+};
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use super::enums::{BinanceEnvironment, BinanceProductType};
 
@@ -157,7 +160,7 @@ pub struct Ed25519Credential {
 impl Debug for Credential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(Credential))
-            .field("api_key", &self.api_key)
+            .field("api_key", &REDACTED)
             .field("api_secret", &REDACTED)
             .finish()
     }
@@ -191,7 +194,7 @@ impl Credential {
 impl Debug for Ed25519Credential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(Ed25519Credential))
-            .field("api_key", &self.api_key)
+            .field("api_key", &REDACTED)
             .field("signing_key", &REDACTED)
             .finish()
     }
@@ -222,16 +225,24 @@ impl Ed25519Credential {
     ///
     /// Returns an error if the private key is not valid base64, does not carry
     /// the Ed25519 PKCS#8 OID, or is shorter than 32 bytes after decoding.
-    pub fn new(api_key: String, private_key_base64: &str) -> Result<Self, Ed25519CredentialError> {
-        // Strip PEM headers/footers if present
-        let key_data: String = private_key_base64
-            .lines()
-            .filter(|line| !line.starts_with("-----"))
-            .collect();
+    pub fn new(
+        api_key: SecretString,
+        private_key_base64: SecretString,
+    ) -> Result<Self, Ed25519CredentialError> {
+        let private_key_base64 = Zeroizing::new(private_key_base64.into_inner());
 
-        let private_key_bytes =
+        // Strip PEM headers/footers if present
+        let key_data = Zeroizing::new(
+            private_key_base64
+                .lines()
+                .filter(|line| !line.starts_with("-----"))
+                .collect::<String>(),
+        );
+
+        let private_key_bytes = Zeroizing::new(
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &key_data)
-                .map_err(|e| Ed25519CredentialError::InvalidBase64(e.to_string()))?;
+                .map_err(|e| Ed25519CredentialError::InvalidBase64(e.to_string()))?,
+        );
 
         if !contains_subslice(&private_key_bytes, &ED25519_OID) {
             return Err(Ed25519CredentialError::NotEd25519);
@@ -241,14 +252,16 @@ impl Ed25519Credential {
             return Err(Ed25519CredentialError::InvalidKeyLength);
         }
         let seed_start = private_key_bytes.len() - 32;
-        let key_bytes: [u8; 32] = private_key_bytes[seed_start..]
-            .try_into()
-            .map_err(|_| Ed25519CredentialError::InvalidKeyLength)?;
+        let key_bytes = Zeroizing::new(
+            private_key_bytes[seed_start..]
+                .try_into()
+                .map_err(|_| Ed25519CredentialError::InvalidKeyLength)?,
+        );
 
         let signing_key = SigningKey::from_bytes(&key_bytes);
 
         Ok(Self {
-            api_key: api_key.into_boxed_str(),
+            api_key: api_key.into_inner().into_boxed_str(),
             signing_key,
         })
     }
@@ -326,14 +339,20 @@ impl SigningCredential {
     /// Falls back to HMAC if Ed25519 parsing fails.
     #[must_use]
     pub fn new(api_key: String, api_secret: String) -> Self {
-        match Ed25519Credential::new(api_key.clone(), &api_secret) {
+        let api_key = SecretString::from(api_key);
+        let api_secret = SecretString::from(api_secret);
+
+        match Ed25519Credential::new(api_key.clone(), api_secret.clone()) {
             Ok(ed25519) => {
-                log::info!("Auto-detected Ed25519 API key");
+                log::debug!("Auto-detected Ed25519 API key");
                 Self::Ed25519(Box::new(ed25519))
             }
             Err(_) => {
-                log::info!("Using HMAC SHA256 API key");
-                Self::Hmac(Credential::new(api_key, api_secret))
+                log::debug!("Using HMAC SHA256 API key");
+                Self::Hmac(Credential::new(
+                    api_key.into_inner(),
+                    api_secret.into_inner(),
+                ))
             }
         }
     }
@@ -371,7 +390,7 @@ impl SigningCredential {
 impl Clone for Ed25519Credential {
     fn clone(&self) -> Self {
         // SigningKey is 32 bytes; extract and reconstruct
-        let key_bytes = self.signing_key.to_bytes();
+        let key_bytes = Zeroizing::new(self.signing_key.to_bytes());
         Self {
             api_key: self.api_key.clone(),
             signing_key: SigningKey::from_bytes(&key_bytes),
@@ -384,6 +403,38 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         return false;
     }
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Builds the canonical query string that Binance's WebSocket API signs.
+///
+/// The WS API verifies a request's signature over its parameters **sorted by
+/// key**, so the signed query string must be key-sorted regardless of the order
+/// the parameters happen to iterate in. `serde_json`'s object backend is a
+/// sorted `BTreeMap` by default, but it silently becomes an insertion-ordered
+/// `IndexMap` if *any* crate anywhere in the build graph enables
+/// `serde_json/preserve_order` - a global Cargo feature-unification effect the
+/// adapter cannot control (e.g. a transitive `mongodb`/`bson` dependency).
+/// Signing the object in its raw iteration order therefore breaks intermittently
+/// with `-1022 Signature for this request is not valid` depending on unrelated
+/// dependencies. Sorting the keys here makes WS signing independent of that
+/// ambient feature.
+///
+/// This is not needed for the REST/HTTP path, which signs the exact query string
+/// it sends (Binance verifies REST signatures over the received order); only the
+/// WS API re-sorts before verifying.
+///
+/// See <https://github.com/nautechsystems/nautilus_trader/issues/4410>.
+pub(crate) fn canonical_ws_query_string<'a, I>(
+    params: I,
+) -> Result<String, serde_urlencoded::ser::Error>
+where
+    I: IntoIterator<Item = (&'a str, &'a serde_json::Value)>,
+{
+    // Collecting into a `BTreeMap` sorts by key regardless of the source order,
+    // and `serde_urlencoded` percent-encodes each value exactly as it would the
+    // original `serde_json::Value`.
+    let sorted: std::collections::BTreeMap<&str, &serde_json::Value> = params.into_iter().collect();
+    serde_urlencoded::to_string(sorted)
 }
 
 #[cfg(test)]
@@ -416,11 +467,54 @@ mod tests {
     }
 
     #[rstest]
+    fn test_canonical_ws_query_string_is_key_sorted_regardless_of_input_order() {
+        // Parameters in a deliberately non-alphabetical order - exactly what a
+        // `serde_json/preserve_order` (IndexMap) build yields, and what broke WS
+        // signing with -1022 (issue #4410). Binance verifies the WS signature
+        // over the *sorted* parameters, so the query string must come out
+        // key-sorted whatever order the caller supplied them in.
+        let symbol = serde_json::json!("LTCBTC");
+        let side = serde_json::json!("BUY");
+        let quantity = serde_json::json!("1");
+        let timestamp = serde_json::json!(1_499_827_319_559i64);
+        let api_key = serde_json::json!("mykey");
+        let unsorted = [
+            ("symbol", &symbol),
+            ("side", &side),
+            ("quantity", &quantity),
+            ("timestamp", &timestamp),
+            ("apiKey", &api_key),
+        ];
+
+        let query = canonical_ws_query_string(unsorted).unwrap();
+
+        assert_eq!(
+            query,
+            "apiKey=mykey&quantity=1&side=BUY&symbol=LTCBTC&timestamp=1499827319559"
+        );
+    }
+
+    #[rstest]
+    fn test_canonical_ws_query_string_preserves_urlencoding() {
+        let symbol = serde_json::json!("LTCBTC");
+        let new_client_order_id = serde_json::json!("desk alpha");
+        let unsorted = [
+            ("symbol", &symbol),
+            ("newClientOrderId", &new_client_order_id),
+        ];
+
+        let query = canonical_ws_query_string(unsorted).unwrap();
+
+        assert_eq!(query, "newClientOrderId=desk+alpha&symbol=LTCBTC");
+    }
+
+    #[rstest]
     fn test_debug_redacts_secret() {
         let cred = Credential::new("test_key".to_string(), BINANCE_TEST_SECRET.to_string());
         let dbg_out = format!("{cred:?}");
 
-        assert!(dbg_out.contains(REDACTED));
+        assert_eq!(dbg_out.matches(REDACTED).count(), 2);
+        assert!(!dbg_out.contains("test_key"));
         assert!(!dbg_out.contains("NhqPtmdSJYdKjVHjA7PZj4"));
     }
 
@@ -436,16 +530,20 @@ mod tests {
     ];
 
     #[rstest]
-    fn test_ed25519_accepts_pkcs8_wrapped_key() {
+    fn test_ed25519_matches_rfc_8032_vector() {
         let key_b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             ED25519_PKCS8_TEST_VECTOR,
         );
 
-        let cred = Ed25519Credential::new("test_key".to_string(), &key_b64).unwrap();
+        let cred = Ed25519Credential::new("test_key".into(), key_b64.into()).unwrap();
 
-        let signature = cred.sign(b"hello");
-        assert!(!signature.is_empty());
+        let signature = cred.sign(b"");
+
+        assert_eq!(
+            signature,
+            "5VZDAMNgrHKQhuLMgG6CioSHfx645dl02HPgZSJJAVVfuIIVkKM7rMYeOXAc+bRr0lv18FlbviRlUUFDjnoQCw=="
+        );
     }
 
     #[rstest]
@@ -455,7 +553,7 @@ mod tests {
         // seeds would silently misclassify HMAC secrets as Ed25519.
         let seed = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0xABu8; 32]);
 
-        let result = Ed25519Credential::new("test_key".to_string(), &seed);
+        let result = Ed25519Credential::new("test_key".into(), seed.into());
 
         assert!(matches!(result, Err(Ed25519CredentialError::NotEd25519)));
     }
@@ -465,7 +563,7 @@ mod tests {
         // Regression: Binance HMAC secrets are 64-char base64 (48 bytes
         // decoded). Before the OID check they matched the PKCS#8 length and
         // were silently accepted as Ed25519, producing garbage signatures.
-        let result = Ed25519Credential::new("test_key".to_string(), BINANCE_TEST_SECRET);
+        let result = Ed25519Credential::new("test_key".into(), BINANCE_TEST_SECRET.into());
 
         assert!(matches!(result, Err(Ed25519CredentialError::NotEd25519)));
     }
@@ -487,10 +585,11 @@ mod tests {
             ED25519_PKCS8_TEST_VECTOR,
         );
 
-        let cred = Ed25519Credential::new("test_key".to_string(), &key_b64).unwrap();
+        let cred = Ed25519Credential::new("test_key".into(), key_b64.clone().into()).unwrap();
         let dbg_out = format!("{cred:?}");
 
-        assert!(dbg_out.contains(REDACTED));
+        assert_eq!(dbg_out.matches(REDACTED).count(), 2);
+        assert!(!dbg_out.contains("test_key"));
         assert!(!dbg_out.contains(&key_b64));
     }
 }

@@ -16,11 +16,21 @@
 //! Python bindings for the message bus, including configuration types and the
 //! [`PyMessageBus`] wrapper that routes Python events through the Rust
 //! thread-local [`MessageBus`] via the Any-based dispatch path.
+//! [`PyMessageBusScope`] owns each component's Python subscriptions.
 
-use std::{any::Any, fmt::Debug, rc::Rc};
+use std::{
+    any::Any,
+    cell::{Cell, RefCell},
+    fmt::Debug,
+    rc::{Rc, Weak},
+    sync::LazyLock,
+};
 
 use ahash::AHashMap;
-use nautilus_core::{UUID4, python::to_pyruntime_err};
+use nautilus_core::{
+    UUID4,
+    python::{to_pyruntime_err, to_pytype_err, to_pyvalue_err},
+};
 use nautilus_model::identifiers::TraderId;
 use pyo3::{Py, Python, prelude::*, types::PyBytes};
 use ustr::Ustr;
@@ -28,15 +38,81 @@ use ustr::Ustr;
 use crate::{
     enums::SerializationEncoding,
     msgbus::{
-        self as msgbus_api, BusMessage, MessageBus,
+        self as msgbus_api, BusMessage, MessageBus, MessageBusBackingFactory, MessageBusConfig,
         core::Subscription,
-        database::{DatabaseConfig, MessageBusConfig},
         get_message_bus,
         matching::is_matching,
         mstr::{Endpoint, MStr, Pattern, Topic},
+        try_get_message_bus,
         typed_handler::{Handler, ShareableMessageHandler, TypedHandler},
     },
+    python::{
+        config_error_to_pyvalue_err,
+        factory::{FactoryExtractor, FactoryRegistry},
+    },
 };
+
+/// Function type for extracting a Python object into a boxed message bus backing factory.
+pub type MessageBusFactoryExtractor = FactoryExtractor<dyn MessageBusBackingFactory>;
+
+/// Registry for Python message bus backing factory extractors.
+#[derive(Debug)]
+pub struct MessageBusFactoryRegistry {
+    inner: FactoryRegistry<dyn MessageBusBackingFactory>,
+}
+
+impl MessageBusFactoryRegistry {
+    /// Creates an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: FactoryRegistry::new("message bus factory"),
+        }
+    }
+
+    // panics-doc-ok (transitive via FactoryRegistry mutex locking)
+    /// Registers an extractor for a Python factory type name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a different extractor is already registered for the type name.
+    pub fn register(
+        &self,
+        type_name: String,
+        extractor: MessageBusFactoryExtractor,
+    ) -> anyhow::Result<()> {
+        self.inner.register(type_name, extractor)
+    }
+
+    // panics-doc-ok (transitive via FactoryRegistry mutex locking)
+    /// Extracts a Python object into a boxed message bus backing factory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no extractor is registered for the Python type or extraction fails.
+    pub fn extract(
+        &self,
+        py: Python<'_>,
+        factory: Py<PyAny>,
+    ) -> PyResult<Box<dyn MessageBusBackingFactory>> {
+        self.inner.extract(py, factory)
+    }
+}
+
+impl Default for MessageBusFactoryRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static GLOBAL_MSGBUS_FACTORY_REGISTRY: LazyLock<MessageBusFactoryRegistry> =
+    LazyLock::new(MessageBusFactoryRegistry::new);
+
+/// Returns the global Python message bus backing factory registry.
+#[must_use]
+pub fn get_global_msgbus_factory_registry() -> &'static MessageBusFactoryRegistry {
+    &GLOBAL_MSGBUS_FACTORY_REGISTRY
+}
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -48,9 +124,21 @@ impl BusMessage {
     }
 
     #[getter]
+    #[pyo3(name = "payload_type")]
+    fn py_payload_type(&self) -> String {
+        self.payload_type.to_string()
+    }
+
+    #[getter]
     #[pyo3(name = "payload")]
     fn py_payload(&self, py: Python<'_>) -> Py<PyBytes> {
         PyBytes::new(py, self.payload.as_ref()).into()
+    }
+
+    #[getter]
+    #[pyo3(name = "encoding")]
+    fn py_encoding(&self) -> SerializationEncoding {
+        self.encoding
     }
 
     fn __repr__(&self) -> String {
@@ -64,128 +152,19 @@ impl BusMessage {
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
-impl DatabaseConfig {
-    /// Configuration for database connections.
-    ///
-    /// # Notes
-    ///
-    /// If `database_type` is `"redis"`, it requires Redis version 6.2 or higher for correct operation.
-    #[new]
-    #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (database_type=None, host=None, port=None, username=None, password=None, ssl=None, connection_timeout=None, response_timeout=None, number_of_retries=None, exponent_base=None, max_delay=None, factor=None))]
-    fn py_new(
-        database_type: Option<String>,
-        host: Option<String>,
-        port: Option<u16>,
-        username: Option<String>,
-        password: Option<String>,
-        ssl: Option<bool>,
-        connection_timeout: Option<u16>,
-        response_timeout: Option<u16>,
-        number_of_retries: Option<usize>,
-        exponent_base: Option<u64>,
-        max_delay: Option<u64>,
-        factor: Option<u64>,
-    ) -> Self {
-        let default = Self::default();
-        Self {
-            database_type: database_type.unwrap_or(default.database_type),
-            host,
-            port,
-            username,
-            password,
-            ssl: ssl.unwrap_or(default.ssl),
-            connection_timeout: connection_timeout.unwrap_or(default.connection_timeout),
-            response_timeout: response_timeout.unwrap_or(default.response_timeout),
-            number_of_retries: number_of_retries.unwrap_or(default.number_of_retries),
-            exponent_base: exponent_base.unwrap_or(default.exponent_base),
-            max_delay: max_delay.unwrap_or(default.max_delay),
-            factor: factor.unwrap_or(default.factor),
-        }
-    }
-
-    fn __repr__(&self) -> String {
-        format!("{self:?}")
-    }
-
-    fn __str__(&self) -> String {
-        format!("{self:?}")
-    }
-
-    #[getter]
-    fn database_type(&self) -> &str {
-        &self.database_type
-    }
-
-    #[getter]
-    fn host(&self) -> Option<&str> {
-        self.host.as_deref()
-    }
-
-    #[getter]
-    fn port(&self) -> Option<u16> {
-        self.port
-    }
-
-    #[getter]
-    fn username(&self) -> Option<&str> {
-        self.username.as_deref()
-    }
-
-    #[getter]
-    fn password(&self) -> Option<&str> {
-        self.password.as_deref()
-    }
-
-    #[getter]
-    fn ssl(&self) -> bool {
-        self.ssl
-    }
-
-    #[getter]
-    fn connection_timeout(&self) -> u16 {
-        self.connection_timeout
-    }
-
-    #[getter]
-    fn response_timeout(&self) -> u16 {
-        self.response_timeout
-    }
-
-    #[getter]
-    fn number_of_retries(&self) -> usize {
-        self.number_of_retries
-    }
-
-    #[getter]
-    fn exponent_base(&self) -> u64 {
-        self.exponent_base
-    }
-
-    #[getter]
-    fn max_delay(&self) -> u64 {
-        self.max_delay
-    }
-
-    #[getter]
-    fn factor(&self) -> u64 {
-        self.factor
-    }
-}
-
-#[pymethods]
-#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl MessageBusConfig {
     /// Configuration for `MessageBus` instances.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (database=None, encoding=None, timestamps_as_iso8601=None, buffer_interval_ms=None, autotrim_mins=None, use_trader_prefix=None, use_trader_id=None, use_instance_id=None, streams_prefix=None, stream_per_topic=None, external_streams=None, types_filter=None, heartbeat_interval_secs=None))]
+    #[pyo3(signature = (encoding=None, encoding_market_data=None, encoding_builtin=None, timestamps_as_iso8601=None, buffer_interval_ms=None, autotrim_mins=None, autotrim_maxlen=None, use_trader_prefix=None, use_trader_id=None, use_instance_id=None, streams_prefix=None, stream_per_topic=None, external_streams=None, types_filter=None, heartbeat_interval_secs=None))]
     fn py_new(
-        database: Option<DatabaseConfig>,
         encoding: Option<SerializationEncoding>,
+        encoding_market_data: Option<SerializationEncoding>,
+        encoding_builtin: Option<SerializationEncoding>,
         timestamps_as_iso8601: Option<bool>,
         buffer_interval_ms: Option<u32>,
         autotrim_mins: Option<u32>,
+        autotrim_maxlen: Option<u32>,
         use_trader_prefix: Option<bool>,
         use_trader_id: Option<bool>,
         use_instance_id: Option<bool>,
@@ -194,14 +173,16 @@ impl MessageBusConfig {
         external_streams: Option<Vec<String>>,
         types_filter: Option<Vec<String>>,
         heartbeat_interval_secs: Option<u16>,
-    ) -> Self {
+    ) -> PyResult<Self> {
         let default = Self::default();
-        Self {
-            database,
+        let config = Self {
             encoding: encoding.unwrap_or(default.encoding),
+            encoding_market_data,
+            encoding_builtin,
             timestamps_as_iso8601: timestamps_as_iso8601.unwrap_or(default.timestamps_as_iso8601),
             buffer_interval_ms,
             autotrim_mins,
+            autotrim_maxlen,
             use_trader_prefix: use_trader_prefix.unwrap_or(default.use_trader_prefix),
             use_trader_id: use_trader_id.unwrap_or(default.use_trader_id),
             use_instance_id: use_instance_id.unwrap_or(default.use_instance_id),
@@ -210,7 +191,10 @@ impl MessageBusConfig {
             external_streams,
             types_filter,
             heartbeat_interval_secs,
-        }
+        };
+
+        config.validate().map_err(config_error_to_pyvalue_err)?;
+        Ok(config)
     }
 
     fn __repr__(&self) -> String {
@@ -222,13 +206,18 @@ impl MessageBusConfig {
     }
 
     #[getter]
-    fn database(&self) -> Option<DatabaseConfig> {
-        self.database.clone()
+    fn encoding(&self) -> SerializationEncoding {
+        self.encoding
     }
 
     #[getter]
-    fn encoding(&self) -> SerializationEncoding {
-        self.encoding
+    fn encoding_market_data(&self) -> Option<SerializationEncoding> {
+        self.encoding_market_data
+    }
+
+    #[getter]
+    fn encoding_builtin(&self) -> Option<SerializationEncoding> {
+        self.encoding_builtin
     }
 
     #[getter]
@@ -244,6 +233,11 @@ impl MessageBusConfig {
     #[getter]
     fn autotrim_mins(&self) -> Option<u32> {
         self.autotrim_mins
+    }
+
+    #[getter]
+    fn autotrim_maxlen(&self) -> Option<u32> {
+        self.autotrim_maxlen
     }
 
     #[getter]
@@ -323,7 +317,11 @@ impl PyCallableHandler {
     pub fn new(py: Python<'_>, callable: Py<PyAny>) -> PyResult<Self> {
         let repr_str = callable.bind(py).repr()?.to_string();
         let id = Ustr::from(&repr_str);
-        Ok(Self { id, callable })
+        Ok(Self::with_id(id, callable))
+    }
+
+    pub(crate) fn with_id(id: Ustr, callable: Py<PyAny>) -> Self {
+        Self { id, callable }
     }
 }
 
@@ -355,14 +353,10 @@ fn make_handler(py: Python<'_>, callable: Py<PyAny>) -> PyResult<ShareableMessag
 
 /// Python message bus backed by the Rust thread-local [`MessageBus`].
 ///
-/// Provides the same API as the legacy Cython `MessageBus` while routing all
-/// messages through the single Rust bus. Python custom events travel through
-/// the Any-based dispatch path via [`PyMessage`] wrappers.
-#[pyclass(
-    module = "nautilus_trader.core.nautilus_pyo3.common",
-    name = "MessageBus",
-    unsendable
-)]
+/// Publish, subscribe, and request/response calls from Python route through the
+/// single Rust bus. Python custom events travel through the Any-based dispatch
+/// path via [`PyMessage`] wrappers.
+#[pyclass(module = "nautilus_trader.common", name = "MessageBus", unsendable)]
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.common")]
 pub struct PyMessageBus {
     trader_id: TraderId,
@@ -370,7 +364,7 @@ pub struct PyMessageBus {
     name: String,
     has_backing: bool,
     serializer: Option<Py<PyAny>>,
-    database: Option<Py<PyAny>>,
+    backing: Option<Py<PyAny>>,
     listeners: Vec<Py<PyAny>>,
     types_filter: Option<Py<PyAny>>,
     streaming_types: Vec<Py<PyAny>>,
@@ -398,7 +392,7 @@ impl PyMessageBus {
     /// This creates and registers the underlying Rust `MessageBus` as the
     /// thread-local bus, then wraps it for Python access.
     #[new]
-    #[pyo3(signature = (trader_id, clock=None, instance_id=None, name=None, serializer=None, database=None, config=None))]
+    #[pyo3(signature = (trader_id, clock=None, instance_id=None, name=None, serializer=None, backing=None, config=None))]
     #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_new(
         py: Python<'_>,
@@ -407,13 +401,13 @@ impl PyMessageBus {
         instance_id: Option<UUID4>,
         name: Option<String>,
         serializer: Option<Py<PyAny>>,
-        database: Option<Py<PyAny>>,
+        backing: Option<Py<PyAny>>,
         config: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let _ = clock;
         let instance_id = instance_id.unwrap_or_default();
         let bus_name = name.clone();
-        let has_backing = database.is_some();
+        let has_backing = backing.is_some();
 
         let msgbus = MessageBus::new(trader_id, instance_id, bus_name, None);
         msgbus.register_message_bus();
@@ -440,7 +434,7 @@ impl PyMessageBus {
             name: name.unwrap_or_else(|| "MessageBus".to_owned()),
             has_backing,
             serializer,
-            database,
+            backing,
             listeners: Vec::new(),
             types_filter,
             streaming_types: Vec::new(),
@@ -473,7 +467,7 @@ impl PyMessageBus {
         &self.name
     }
 
-    /// Returns whether the message bus is backed by a database.
+    /// Returns whether the message bus has an external backing.
     #[getter]
     #[pyo3(name = "has_backing")]
     fn py_has_backing(&self) -> bool {
@@ -530,60 +524,48 @@ impl PyMessageBus {
     /// Returns subscriptions matching the given topic pattern.
     #[pyo3(name = "subscriptions")]
     #[pyo3(signature = (pattern=None))]
-    fn py_subscriptions(&self, pattern: Option<&str>) -> Vec<String> {
+    fn py_subscriptions(&self, pattern: Option<&str>) -> PyResult<Vec<String>> {
+        let filter = pattern.map(parse_pattern).transpose()?;
+
         let bus = get_message_bus();
         let bus_ref = bus.borrow();
         let subs: Vec<&Subscription> = bus_ref.subscriptions();
 
-        match pattern {
-            Some(p) => {
-                let filter = MStr::<Pattern>::pattern(p);
-                subs.into_iter()
-                    .filter(|s| is_matching(s.pattern.as_bytes(), filter.as_bytes()))
-                    .map(|s| {
-                        format!(
-                            "Subscription(topic={}, handler={})",
-                            s.pattern, s.handler_id
-                        )
-                    })
-                    .collect()
-            }
-            None => subs
-                .into_iter()
-                .map(|s| {
-                    format!(
-                        "Subscription(topic={}, handler={})",
-                        s.pattern, s.handler_id
-                    )
-                })
-                .collect(),
-        }
+        Ok(subs
+            .into_iter()
+            .filter(|s| filter.is_none_or(|f| is_matching(s.pattern.as_bytes(), f.as_bytes())))
+            .map(|s| {
+                format!(
+                    "Subscription(topic={}, handler={})",
+                    s.pattern, s.handler_id
+                )
+            })
+            .collect())
     }
 
     /// Returns whether there are subscribers for the given topic pattern.
     #[pyo3(name = "has_subscribers")]
     #[pyo3(signature = (pattern=None))]
-    fn py_has_subscribers(&self, pattern: Option<&str>) -> bool {
+    fn py_has_subscribers(&self, pattern: Option<&str>) -> PyResult<bool> {
+        let filter = pattern.map(parse_pattern).transpose()?;
+
         let bus = get_message_bus();
         let bus_ref = bus.borrow();
 
-        match pattern {
-            Some(p) => {
-                let filter = MStr::<Pattern>::pattern(p);
-                bus_ref
-                    .subscriptions()
-                    .iter()
-                    .any(|s| is_matching(s.pattern.as_bytes(), filter.as_bytes()))
-            }
+        Ok(match filter {
+            Some(filter) => bus_ref
+                .subscriptions()
+                .iter()
+                .any(|s| is_matching(s.pattern.as_bytes(), filter.as_bytes())),
             None => !bus_ref.subscriptions().is_empty(),
-        }
+        })
     }
 
     /// Returns whether the given topic and handler is subscribed.
     #[pyo3(name = "is_subscribed")]
     fn py_is_subscribed(&self, py: Python<'_>, topic: &str, handler: Py<PyAny>) -> PyResult<bool> {
+        let pattern = parse_pattern(topic)?;
         let handler = make_handler(py, handler)?;
-        let pattern = MStr::<Pattern>::pattern(topic);
         let sub = Subscription::new(pattern, handler, None);
         Ok(get_message_bus().borrow().subscriptions.contains(&sub))
     }
@@ -614,8 +596,8 @@ impl PyMessageBus {
     /// Registers a handler at the given endpoint address.
     #[pyo3(name = "register")]
     fn py_register(&self, py: Python<'_>, endpoint: &str, handler: Py<PyAny>) -> PyResult<()> {
+        let endpoint = parse_endpoint(endpoint)?;
         let handler = make_handler(py, handler)?;
-        let endpoint = MStr::<Endpoint>::from(endpoint);
         msgbus_api::register_any(endpoint, handler);
         Ok(())
     }
@@ -624,24 +606,27 @@ impl PyMessageBus {
     #[pyo3(name = "deregister")]
     #[pyo3(signature = (endpoint, handler=None))]
     #[expect(clippy::needless_pass_by_value)]
-    fn py_deregister(&self, endpoint: &str, handler: Option<Py<PyAny>>) {
+    fn py_deregister(&self, endpoint: &str, handler: Option<Py<PyAny>>) -> PyResult<()> {
         let _ = handler;
-        let endpoint = MStr::<Endpoint>::from(endpoint);
+        let endpoint = parse_endpoint(endpoint)?;
         msgbus_api::deregister_any(endpoint);
+        Ok(())
     }
 
     /// Sends a message to the given endpoint address.
     #[pyo3(name = "send")]
-    fn py_send(&mut self, endpoint: &str, msg: Py<PyAny>) {
-        let endpoint = MStr::<Endpoint>::from(endpoint);
+    fn py_send(&mut self, endpoint: &str, msg: Py<PyAny>) -> PyResult<()> {
+        let endpoint = parse_endpoint(endpoint)?;
         let py_msg = PyMessage(msg);
         msgbus_api::send_any(endpoint, &py_msg);
         self.sent_count += 1;
+        Ok(())
     }
 
     /// Sends a request to the given endpoint with correlation tracking.
     #[pyo3(name = "request")]
     fn py_request(&mut self, py: Python<'_>, endpoint: &str, request: Py<PyAny>) -> PyResult<()> {
+        let endpoint = parse_endpoint(endpoint)?;
         let request_ref = request.bind(py);
 
         let request_id: UUID4 = request_ref.getattr("id")?.extract()?;
@@ -658,11 +643,9 @@ impl PyMessageBus {
             self.correlation_index.insert(request_id, callback.unbind());
         }
 
-        let endpoint = MStr::<Endpoint>::from(endpoint);
         let py_msg = PyMessage(request);
         msgbus_api::send_any(endpoint, &py_msg);
         self.req_count += 1;
-
         Ok(())
     }
 
@@ -692,8 +675,8 @@ impl PyMessageBus {
         handler: Py<PyAny>,
         priority: u32,
     ) -> PyResult<()> {
+        let pattern = parse_pattern(topic)?;
         let handler = make_handler(py, handler)?;
-        let pattern = MStr::<Pattern>::pattern(topic);
         msgbus_api::subscribe_any(pattern, handler, Some(priority));
         Ok(())
     }
@@ -701,8 +684,8 @@ impl PyMessageBus {
     /// Unsubscribes the given handler from the given topic.
     #[pyo3(name = "unsubscribe")]
     fn py_unsubscribe(&self, py: Python<'_>, topic: &str, handler: Py<PyAny>) -> PyResult<()> {
+        let pattern = parse_pattern(topic)?;
         let handler = make_handler(py, handler)?;
-        let pattern = MStr::<Pattern>::pattern(topic);
         msgbus_api::unsubscribe_any(pattern, &handler);
         Ok(())
     }
@@ -742,8 +725,8 @@ impl PyMessageBus {
         self.listeners.clear();
         self.streaming_types.clear();
 
-        if let Some(ref database) = self.database {
-            let db = database.bind(py);
+        if let Some(ref backing) = self.backing {
+            let db = backing.bind(py);
             if !db.call_method0("is_closed")?.extract::<bool>()? {
                 db.call_method0("close")?;
             }
@@ -789,8 +772,8 @@ impl PyMessageBus {
             return Ok(());
         };
 
-        if let Some(ref database) = self.database {
-            let db = database.bind(py);
+        if let Some(ref backing) = self.backing {
+            let db = backing.bind(py);
             if !db.call_method0("is_closed")?.extract::<bool>()? {
                 db.call_method1("publish", (topic, &payload))?;
             }
@@ -808,14 +791,260 @@ impl PyMessageBus {
     }
 }
 
+fn parse_endpoint(endpoint: &str) -> PyResult<MStr<Endpoint>> {
+    MStr::<Endpoint>::endpoint(endpoint).map_err(to_pyvalue_err)
+}
+
+fn parse_pattern(pattern: &str) -> PyResult<MStr<Pattern>> {
+    MStr::<Pattern>::pattern_checked(pattern).map_err(to_pyvalue_err)
+}
+
+/// Owns a component's Python subscriptions without owning the runtime bus.
+#[derive(Debug, Default)]
+pub struct PyMessageBusScope {
+    bus: RefCell<Weak<RefCell<MessageBus>>>,
+    subscriptions: RefCell<Vec<ScopedSubscription>>,
+    clearing: Cell<bool>,
+}
+
+impl PyMessageBusScope {
+    pub(crate) fn register(&self) {
+        *self.bus.borrow_mut() =
+            try_get_message_bus().map_or_else(Weak::new, |bus| Rc::downgrade(&bus));
+    }
+
+    /// Publishes the original Python object synchronously on an application topic.
+    ///
+    /// Handlers receive the same object. Nested publication finishes before the outer call
+    /// returns. Python handler exceptions are logged and do not interrupt other handlers.
+    /// This does not serialize or externally publish the object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the topic is invalid or the registered runtime bus is no longer active.
+    pub fn publish_message(&self, topic: &str, message: Py<PyAny>) -> PyResult<()> {
+        let topic = MStr::<Topic>::topic(topic).map_err(to_pyvalue_err)?;
+        self.active_bus()?;
+        msgbus_api::publish_any(topic, &PyMessage(message));
+        Ok(())
+    }
+
+    /// Subscribes a callable to an application topic pattern.
+    ///
+    /// Higher priorities run first. Repeating a pattern and callable within this component is
+    /// a no-op, even with a different priority. Unsubscribe first to change priority.
+    /// Python-defined bound methods are identified by their receiver and function; other callables
+    /// use object identity. Subscriptions owned by other components remain independent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid pattern, a non-callable handler, or an inactive runtime bus.
+    pub fn subscribe_topic(
+        &self,
+        py: Python<'_>,
+        topic: &str,
+        handler: Py<PyAny>,
+        priority: u32,
+    ) -> PyResult<()> {
+        let pattern = MStr::<Pattern>::pattern_checked(topic).map_err(to_pyvalue_err)?;
+        let identity = CallableIdentity::new(handler.bind(py))?;
+        self.active_bus()?;
+
+        if self
+            .subscriptions
+            .borrow()
+            .iter()
+            .any(|sub| sub.pattern == pattern && sub.identity == identity)
+        {
+            return Ok(());
+        }
+
+        let id = format!("python-component:{}", UUID4::new()).into();
+        let handler = TypedHandler(
+            Rc::new(PyCallableHandler::with_id(id, handler)) as Rc<dyn Handler<dyn Any>>
+        );
+        msgbus_api::subscribe_any(pattern, handler.clone(), Some(priority));
+
+        self.subscriptions.borrow_mut().push(ScopedSubscription {
+            pattern,
+            identity,
+            handler,
+        });
+
+        Ok(())
+    }
+
+    /// Removes this component's exact topic pattern and callable subscription.
+    ///
+    /// An absent subscription is a no-op. A callback already snapshotted by a synchronous
+    /// publication may still run in that publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid pattern, a non-callable handler, or an inactive runtime bus.
+    pub fn unsubscribe_topic(&self, topic: &str, handler: &Bound<'_, PyAny>) -> PyResult<()> {
+        let pattern = MStr::<Pattern>::pattern_checked(topic).map_err(to_pyvalue_err)?;
+        let identity = CallableIdentity::new(handler)?;
+        let bus = self.active_bus()?;
+
+        let removed = {
+            let mut subscriptions = self.subscriptions.borrow_mut();
+            subscriptions
+                .iter()
+                .position(|sub| sub.pattern == pattern && sub.identity == identity)
+                .map(|index| subscriptions.remove(index))
+        };
+
+        if let Some(sub) = removed {
+            bus.borrow_mut().unsubscribe_any(sub.pattern, &sub.handler);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn invalidate(&self) {
+        *self.bus.borrow_mut() = Weak::new();
+    }
+
+    pub(crate) fn clear(&self) {
+        if self.clearing.replace(true) {
+            return;
+        }
+
+        let subscriptions = std::mem::take(&mut *self.subscriptions.borrow_mut());
+
+        if let Some(bus) = self.bus.borrow().upgrade() {
+            let mut bus = bus.borrow_mut();
+            for sub in &subscriptions {
+                bus.unsubscribe_any(sub.pattern, &sub.handler);
+            }
+        }
+
+        // Callable finalizers may re-enter Python; release them after all bookkeeping borrows
+        drop(subscriptions);
+        self.clearing.set(false);
+    }
+
+    fn active_bus(&self) -> PyResult<Rc<RefCell<MessageBus>>> {
+        if self.clearing.get() {
+            return Err(to_pyruntime_err("Component is releasing subscriptions"));
+        }
+
+        let registered =
+            self.bus.borrow().upgrade().ok_or_else(|| {
+                to_pyruntime_err("Component's registered message bus is unavailable")
+            })?;
+        let active = try_get_message_bus()
+            .ok_or_else(|| to_pyruntime_err("No runtime message bus is active on this thread"))?;
+
+        if !Rc::ptr_eq(&registered, &active) {
+            return Err(to_pyruntime_err(
+                "Component's registered message bus has been replaced",
+            ));
+        }
+
+        Ok(registered)
+    }
+}
+
+#[derive(Debug)]
+struct ScopedSubscription {
+    pattern: MStr<Pattern>,
+    identity: CallableIdentity,
+    handler: ShareableMessageHandler,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CallableIdentity {
+    receiver: usize,
+    function: Option<usize>,
+}
+
+impl CallableIdentity {
+    fn new(callable: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if !callable.is_callable() {
+            return Err(to_pytype_err("handler must be callable"));
+        }
+
+        let method_type = callable.py().import("types")?.getattr("MethodType")?;
+        if callable.get_type().is(&method_type) {
+            return Ok(Self {
+                receiver: callable.getattr("__self__")?.as_ptr() as usize,
+                function: Some(callable.getattr("__func__")?.as_ptr() as usize),
+            });
+        }
+
+        Ok(Self {
+            receiver: callable.as_ptr() as usize,
+            function: None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::any::Any;
 
-    use pyo3::ffi::c_str;
+    use nautilus_model::{
+        data::QuoteTick,
+        identifiers::{ActorId, ComponentId},
+        types::{Price, Quantity},
+    };
+    use pyo3::{exceptions::PyValueError, ffi::c_str, types::PyDict};
     use rstest::rstest;
 
     use super::*;
+    use crate::{
+        actor::registry::with_actor_registry,
+        cache::Cache,
+        clock::TestClock,
+        component::{release_component_subscriptions, with_component_registry},
+        msgbus::set_message_bus,
+        python::{actor::PyDataActor, wrappers::release_python_wrapper},
+    };
+
+    #[rstest]
+    fn test_message_bus_factory_registry_compatibility_constructors() {
+        let registry = MessageBusFactoryRegistry::new();
+        let default_registry = MessageBusFactoryRegistry::default();
+
+        assert_eq!(format!("{registry:?}"), format!("{default_registry:?}"));
+        assert!(format!("{registry:?}").contains("message bus factory"));
+    }
+
+    #[rstest]
+    fn message_bus_config_py_new_maps_validate_error_to_value_error() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let err = MessageBusConfig::py_new(
+                Some(SerializationEncoding::Json),
+                None,
+                Some(SerializationEncoding::Capnp),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                err.value(py).to_string(),
+                format!(
+                    "MessageBusConfig.encoding_builtin has unsupported value: {} is not supported by AccountState, OrderEventAny, PositionEvent, PortfolioSnapshot",
+                    SerializationEncoding::Capnp
+                )
+            );
+        });
+    }
 
     #[rstest]
     fn test_py_message_downcast() {
@@ -873,5 +1102,430 @@ mod tests {
             let len: usize = results.len().unwrap();
             assert_eq!(len, 1);
         });
+    }
+    #[rstest]
+    fn test_py_message_bus_scope_object_identity_nested_delivery_and_subscription_ownership() {
+        Python::initialize();
+        Python::attach(|py| {
+            set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+            let first = registered_actor(py, "MESSAGE-FIRST");
+            let second = registered_actor(py, "MESSAGE-SECOND");
+            let locals = PyDict::new(py);
+            locals.set_item("first", &first).unwrap();
+            locals.set_item("second", &second).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+message = {"quantity": 73, "labels": ["alpha", "beta"]}
+seen = []
+def high(value):
+    seen.append(("high", value))
+    first.publish_message("app.nested", value)
+    seen.append(("returned", value))
+def nested(value):
+    seen.append(("nested", value))
+def low(value):
+    seen.append(("low", value))
+first.subscribe_topic("app.outer", high, 50)
+first.subscribe_topic("app.outer", high, 100)
+second.subscribe_topic("app.*", low, 2)
+second.subscribe_topic("app.nested", nested, 20)
+first.publish_message("app.outer", message)
+assert [name for name, _ in seen] == ["high", "nested", "low", "returned", "low"]
+assert all(value is message for _, value in seen)
+assert message == {"quantity": 73, "labels": ["alpha", "beta"]}
+first.unsubscribe_topic("app.outer", high)
+first.unsubscribe_topic("app.outer", high)
+seen.clear()
+first.publish_message("app.outer", message)
+assert seen == [("low", message)]
+first.subscribe_topic("app.shared", low)
+second.subscribe_topic("app.shared", low)
+first.unsubscribe_topic("app.shared", low)
+seen.clear()
+first.publish_message("app.shared", message)
+assert seen == [("low", message), ("low", message)]
+for owner, peer in [(first, second), (second, first)]:
+    owner.unsubscribe_topic("isolated.shared", low)
+    owner.subscribe_topic("isolated.shared", low)
+    peer.subscribe_topic("isolated.shared", low)
+    owner.unsubscribe_topic("isolated.shared", low)
+    seen.clear()
+    first.publish_message("isolated.shared", message)
+    assert seen == [("low", message)]
+    peer.unsubscribe_topic("isolated.shared", low)
+    seen.clear()
+    first.publish_message("isolated.shared", message)
+    assert seen == []
+"#
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            first.call_method0("dispose").unwrap();
+            second.call_method0("dispose").unwrap();
+            locals.clear();
+            release_actor("MESSAGE-FIRST");
+            release_actor("MESSAGE-SECOND");
+        });
+    }
+
+    #[rstest]
+    fn test_py_message_bus_scope_callable_identity_and_reference_release() {
+        Python::initialize();
+        Python::attach(|py| {
+            set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+            let actor = registered_actor(py, "MESSAGE-IDENTITY");
+            let locals = PyDict::new(py);
+            locals.set_item("actor", &actor).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import gc
+import weakref
+seen = []
+class Receiver:
+    def __init__(self, name): self.name = name
+    def __repr__(self): raise AssertionError("repr must not run")
+    def __eq__(self, other): raise AssertionError("equality must not run")
+    def __call__(self, value): seen.append((self.name, value))
+    def receive(self, value): seen.append((self.name, value))
+left = Receiver("left")
+right = Receiver("right")
+actor.subscribe_topic("app.callables", left, 2)
+actor.subscribe_topic("app.callables", right, 1)
+actor.unsubscribe_topic("app.callables", left)
+actor.subscribe_topic("app.methods", left.receive)
+actor.subscribe_topic("app.methods", left.receive)
+actor.unsubscribe_topic("app.methods", left.receive)
+actor.publish_message("app.methods", 19)
+actor.publish_message("app.callables", 23)
+assert seen == [("right", 23)]
+ref = weakref.ref(right)
+del right
+assert ref() is not None
+actor.dispose()
+gc.collect()
+assert ref() is None
+"#
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            locals.clear();
+            release_actor("MESSAGE-IDENTITY");
+        });
+    }
+
+    #[rstest]
+    fn test_py_message_bus_scope_lifecycle_and_foreign_thread_errors() {
+        Python::initialize();
+        Python::attach(|py| {
+            set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+            let actor = registered_actor(py, "MESSAGE-LIFECYCLE");
+            let locals = PyDict::new(py);
+            locals.set_item("actor", &actor).unwrap();
+            locals
+                .set_item(
+                    "unregistered",
+                    py.get_type::<PyDataActor>().call0().unwrap(),
+                )
+                .unwrap();
+            py.run(
+                c_str!(
+                    r#"
+import threading
+seen = []
+def handler(value): seen.append(value)
+def assert_runtime_errors(component):
+
+    for name, args in [("publish_message", ("app.events", 9)),
+                       ("subscribe_topic", ("app.events", handler)),
+                       ("unsubscribe_topic", ("app.events", handler))]:
+        try: getattr(component, name)(*args)
+        except RuntimeError: pass
+        else: raise AssertionError(name)
+assert_runtime_errors(unregistered)
+errors = []
+def foreign():
+    try: assert_runtime_errors(actor)
+    except BaseException as error: errors.append(error)
+thread = threading.Thread(target=foreign)
+thread.start()
+thread.join()
+assert errors == []
+actor.on_start = lambda: actor.subscribe_topic("app.events", handler)
+actor.start()
+actor.stop()
+actor.publish_message("app.events", 31)
+actor.resume()
+actor.publish_message("app.events", 37)
+actor.stop()
+actor.reset()
+actor.publish_message("app.events", 41)
+assert seen == [31, 37]
+actor.subscribe_topic("app.events", handler)
+actor.dispose()
+assert_runtime_errors(actor)
+"#
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            assert_eq!(get_message_bus().borrow().subscriptions().len(), 0);
+            locals.clear();
+            release_actor("MESSAGE-LIFECYCLE");
+        });
+    }
+
+    #[rstest]
+    fn test_py_message_bus_scope_replacement_rejected_and_original_cleaned() {
+        Python::initialize();
+        Python::attach(|py| {
+            let original = Rc::new(RefCell::new(MessageBus::default()));
+            set_message_bus(Rc::clone(&original));
+            let actor = registered_actor(py, "MESSAGE-REPLACED");
+            let handler = py.eval(c_str!("lambda value: None"), None, None).unwrap();
+            actor
+                .call_method1("subscribe_topic", ("app.events", &handler))
+                .unwrap();
+            let replacement = Rc::new(RefCell::new(MessageBus::default()));
+            set_message_bus(Rc::clone(&replacement));
+            let error = actor
+                .call_method1("publish_message", ("app.events", 43))
+                .unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            assert_eq!(original.borrow().subscriptions().len(), 1);
+            actor.call_method0("dispose").unwrap();
+            assert_eq!(original.borrow().subscriptions().len(), 0);
+            assert!(Rc::ptr_eq(&replacement, &get_message_bus()));
+            release_actor("MESSAGE-REPLACED");
+        });
+    }
+
+    #[rstest]
+    fn test_py_message_bus_scope_missing_runtime_does_not_create_one() {
+        Python::initialize();
+        Python::attach(|py| {
+            assert!(try_get_message_bus().is_none());
+            let actor = registered_actor(py, "MESSAGE-MISSING");
+            let error = actor
+                .call_method1("publish_message", ("app.events", 47))
+                .unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            assert_eq!(
+                error.value(py).str().unwrap().to_str().unwrap(),
+                "Component's registered message bus is unavailable"
+            );
+            assert!(try_get_message_bus().is_none());
+            release_actor("MESSAGE-MISSING");
+        });
+    }
+
+    #[rstest]
+    fn test_py_message_bus_scope_input_errors_and_existing_routes() {
+        Python::initialize();
+        Python::attach(|py| {
+            let bus = Rc::new(RefCell::new(MessageBus::default()));
+            set_message_bus(Rc::clone(&bus));
+            let endpoint_received = Rc::new(RefCell::new(Vec::<i32>::new()));
+            let received = Rc::clone(&endpoint_received);
+            let endpoint_handler = ShareableMessageHandler::from_typed(move |value: &i32| {
+                received.borrow_mut().push(*value);
+            });
+            msgbus_api::register_any("app.endpoint".into(), endpoint_handler);
+            let quotes_received = Rc::new(RefCell::new(Vec::new()));
+            let received = Rc::clone(&quotes_received);
+            let quote_handler =
+                TypedHandler::from(move |quote: &QuoteTick| received.borrow_mut().push(*quote));
+            msgbus_api::subscribe_quotes("app.quotes".into(), quote_handler.clone(), None);
+            let actor = registered_actor(py, "MESSAGE-ERRORS");
+            let locals = PyDict::new(py);
+            locals.set_item("actor", &actor).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+def handler(value): pass
+
+for name, args, expected in [
+    ("publish_message", ("", 53), ValueError),
+    ("publish_message", ("app.*", 59), ValueError),
+    ("subscribe_topic", ("", handler), ValueError),
+    ("unsubscribe_topic", ("", handler), ValueError),
+    ("subscribe_topic", ("app.events", 61), TypeError),
+    ("unsubscribe_topic", ("app.events", 67), TypeError),
+    ("subscribe_topic", ("app.events", handler, -1), OverflowError),
+    ("subscribe_topic", ("app.events", handler, 2**32), OverflowError),
+]:
+    try: getattr(actor, name)(*args)
+    except expected: pass
+    else: raise AssertionError((name, args))
+actor.subscribe_topic("app.events", handler)
+actor.publish_message("app.events", 71)
+actor.unsubscribe_topic("app.events", handler)
+actor.dispose()
+"#
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            msgbus_api::send_any("app.endpoint".into(), &73_i32);
+            let quote = QuoteTick::new(
+                "BTCUSDT.BINANCE".into(),
+                Price::from("101.25"),
+                Price::from("102.50"),
+                Quantity::from("3.75"),
+                Quantity::from("4.50"),
+                123.into(),
+                456.into(),
+            );
+            msgbus_api::publish_quote("app.quotes".into(), &quote);
+            assert_eq!(*endpoint_received.borrow(), vec![73]);
+            assert_eq!(*quotes_received.borrow(), vec![quote]);
+            assert!(Rc::ptr_eq(&bus, &get_message_bus()));
+            msgbus_api::unsubscribe_quotes("app.quotes".into(), &quote_handler);
+            msgbus_api::deregister_any("app.endpoint".into());
+            locals.clear();
+            release_actor("MESSAGE-ERRORS");
+        });
+    }
+
+    #[rstest]
+    fn test_py_message_bus_scope_failed_disposal_and_finalizer_reentry() {
+        Python::initialize();
+        Python::attach(|py| {
+            set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+            let actor = registered_actor(py, "MESSAGE-FINALIZER");
+            let locals = PyDict::new(py);
+            locals.set_item("actor", &actor).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+seen = []
+finalized = []
+def handler(value): seen.append(value)
+def fail(): raise ValueError("disposal refused")
+actor.subscribe_topic("app.events", handler)
+actor.on_dispose = fail
+try: actor.dispose()
+except RuntimeError as error: assert "disposal refused" in str(error)
+else: raise AssertionError("disposal must fail")
+actor.publish_message("app.events", 79)
+assert seen == [79]
+class Finalizer:
+    def __call__(self, value): pass
+    def __del__(self):
+        try: actor.subscribe_topic("app.events", handler)
+        except RuntimeError: finalized.append("rejected")
+        else: finalized.append("subscribed")
+actor.subscribe_topic("app.finalize", Finalizer())
+
+"#
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            release_component_subscriptions(&"MESSAGE-FINALIZER".into()).unwrap();
+            assert_eq!(
+                locals
+                    .get_item("finalized")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<Vec<String>>()
+                    .unwrap(),
+                vec!["rejected"]
+            );
+            assert_eq!(get_message_bus().borrow().subscriptions().len(), 0);
+            locals.clear();
+            release_actor("MESSAGE-FINALIZER");
+        });
+    }
+
+    #[rstest]
+    fn test_py_message_bus_scope_snapshot_delivery_survives_unsubscription_and_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+            let actor = registered_actor(py, "MESSAGE-SNAPSHOT");
+            let locals = PyDict::new(py);
+            locals.set_item("actor", &actor).unwrap();
+            py.run(
+                c_str!(
+                    r#"
+seen = []
+def high(value):
+    actor.unsubscribe_topic("app.events", low)
+    raise ValueError("handler failed")
+def low(value): seen.append(value)
+actor.subscribe_topic("app.events", high, 2)
+actor.subscribe_topic("app.events", low, 1)
+actor.publish_message("app.events", 83)
+actor.publish_message("app.events", 89)
+assert seen == [83]
+actor.dispose()
+"#
+                ),
+                Some(&locals),
+                None,
+            )
+            .unwrap();
+            locals.clear();
+            release_actor("MESSAGE-SNAPSHOT");
+        });
+    }
+
+    fn release_actor(id: &str) {
+        release_python_wrapper(ComponentId::from(id));
+        with_actor_registry(|registry| registry.remove(&id.into()));
+        with_component_registry(|registry| registry.remove(&id.into()));
+    }
+
+    fn registered_actor<'py>(py: Python<'py>, id: &str) -> Bound<'py, PyDataActor> {
+        let locals = PyDict::new(py);
+        locals
+            .set_item("DataActor", py.get_type::<PyDataActor>())
+            .unwrap();
+        py.run(
+            c_str!(
+                r#"
+class Actor(DataActor):
+    def on_start(self): pass
+    def on_stop(self): pass
+    def on_resume(self): pass
+    def on_reset(self): pass
+    def on_dispose(self): pass
+"#
+            ),
+            Some(&locals),
+            None,
+        )
+        .unwrap();
+        let actor = locals
+            .get_item("Actor")
+            .unwrap()
+            .unwrap()
+            .call0()
+            .unwrap()
+            .cast_into::<PyDataActor>()
+            .unwrap();
+        {
+            let mut borrowed = actor.borrow_mut();
+            borrowed.set_actor_id(ActorId::from(id));
+            borrowed.set_python_instance(actor.as_any()).unwrap();
+            borrowed
+                .register(
+                    TraderId::from("TRADER-001"),
+                    Rc::new(RefCell::new(TestClock::new())),
+                    Rc::new(RefCell::new(Cache::default())),
+                )
+                .unwrap();
+            borrowed.register_in_global_registries().unwrap();
+        }
+        actor
     }
 }

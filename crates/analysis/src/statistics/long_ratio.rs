@@ -19,17 +19,23 @@ use nautilus_model::{enums::OrderSide, position::Position};
 
 use crate::{Returns, statistic::PortfolioStatistic};
 
+/// Calculates the ratio of long positions to total positions.
+///
+/// A position counts as long when its entry (opening order) side is `Buy`.
+/// The result is in `[0, 1]`, rounded to `precision` decimal places, and is
+/// `None` for an empty position list.
 #[repr(C)]
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.analysis", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.analysis", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.analysis")
 )]
 pub struct LongRatio {
+    /// The number of decimal places to round the ratio to (default: 2).
     pub precision: usize,
 }
 
@@ -86,9 +92,9 @@ impl PortfolioStatistic for LongRatio {
 mod tests {
     use ahash::AHashSet;
     use indexmap::IndexMap;
-    use nautilus_core::{UnixNanos, approx_eq};
+    use nautilus_core::{DurationNanos, UnixNanos, approx_eq};
     use nautilus_model::{
-        enums::{InstrumentClass, PositionSide},
+        enums::{InstrumentClass, OrderSide, PositionSide},
         identifiers::{
             AccountId, ClientOrderId, PositionId,
             stubs::{instrument_id_aud_usd_sim, strategy_id_ema_cross, trader_id},
@@ -105,6 +111,8 @@ mod tests {
     fn create_closed_position(entry: OrderSide) -> Position {
         Position {
             events: Vec::new(),
+            replay_events: Vec::new(),
+            fill_voids: Vec::new(),
             trader_id: trader_id(),
             strategy_id: strategy_id_ema_cross(),
             instrument_id: instrument_id_aud_usd_sim(),
@@ -128,7 +136,7 @@ mod tests {
             ts_opened: UnixNanos::default(),
             ts_last: UnixNanos::default(),
             ts_closed: Some(UnixNanos::from(1)), // Mark as closed
-            duration_ns: 2,
+            duration_ns: DurationNanos::new(2),
             avg_px_open: 0.0,
             avg_px_close: Some(0.0),
             realized_return: 0.0,

@@ -18,7 +18,9 @@
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use arrow::{
-    array::{BinaryArray, BinaryBuilder, StringArray, StringBuilder, UInt8Array, UInt64Array},
+    array::{
+        Array, BinaryArray, BinaryBuilder, StringArray, StringBuilder, UInt8Array, UInt64Array,
+    },
     datatypes::{DataType, Field, Schema},
     error::ArrowError,
     record_batch::RecordBatch,
@@ -30,66 +32,15 @@ use nautilus_model::{
     instruments::option_contract::OptionContract,
     types::{price::Price, quantity::Quantity},
 };
-#[allow(unused)]
 use rust_decimal::Decimal;
-#[allow(unused)]
-use serde_json::Value;
 use ustr::Ustr;
 
+use super::KEY_CLASS;
 use crate::arrow::{
     ArrowSchemaProvider, EncodeToRecordBatch, EncodingError, KEY_INSTRUMENT_ID,
-    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column,
+    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column, extract_column_by_name_or_index,
+    extract_optional_string_column_by_name, optional_ustr_value,
 };
-
-// Helper function to convert AssetClass to string
-fn asset_class_to_string(ac: AssetClass) -> String {
-    match ac {
-        AssetClass::FX => "FX".to_string(),
-        AssetClass::Equity => "Equity".to_string(),
-        AssetClass::Commodity => "Commodity".to_string(),
-        AssetClass::Debt => "Debt".to_string(),
-        AssetClass::Index => "Index".to_string(),
-        AssetClass::Cryptocurrency => "Cryptocurrency".to_string(),
-        AssetClass::Alternative => "Alternative".to_string(),
-    }
-}
-
-// Helper function to parse AssetClass from string
-fn asset_class_from_str(s: &str) -> Result<AssetClass, EncodingError> {
-    match s {
-        "FX" => Ok(AssetClass::FX),
-        "Equity" => Ok(AssetClass::Equity),
-        "Commodity" => Ok(AssetClass::Commodity),
-        "Debt" => Ok(AssetClass::Debt),
-        "Index" => Ok(AssetClass::Index),
-        "Cryptocurrency" => Ok(AssetClass::Cryptocurrency),
-        "Alternative" => Ok(AssetClass::Alternative),
-        _ => Err(EncodingError::ParseError(
-            "asset_class",
-            format!("Unknown asset class: {s}"),
-        )),
-    }
-}
-
-// Helper function to convert OptionKind to string
-fn option_kind_to_string(ok: OptionKind) -> String {
-    match ok {
-        OptionKind::Call => "Call".to_string(),
-        OptionKind::Put => "Put".to_string(),
-    }
-}
-
-// Helper function to parse OptionKind from string
-fn option_kind_from_str(s: &str) -> Result<OptionKind, EncodingError> {
-    match s {
-        "Call" => Ok(OptionKind::Call),
-        "Put" => Ok(OptionKind::Put),
-        _ => Err(EncodingError::ParseError(
-            "option_kind",
-            format!("Unknown option kind: {s}"),
-        )),
-    }
-}
 
 impl ArrowSchemaProvider for OptionContract {
     fn get_schema(metadata: Option<HashMap<String, String>>) -> Schema {
@@ -110,17 +61,22 @@ impl ArrowSchemaProvider for OptionContract {
             Field::new("size_increment", DataType::Utf8, false),
             Field::new("multiplier", DataType::Utf8, false),
             Field::new("lot_size", DataType::Utf8, false),
+            Field::new("max_quantity", DataType::Utf8, true), // nullable
+            Field::new("min_quantity", DataType::Utf8, true), // nullable
+            Field::new("max_price", DataType::Utf8, true),    // nullable
+            Field::new("min_price", DataType::Utf8, true),    // nullable
             Field::new("margin_init", DataType::Utf8, false),
             Field::new("margin_maint", DataType::Utf8, false),
             Field::new("maker_fee", DataType::Utf8, false),
             Field::new("taker_fee", DataType::Utf8, false),
+            Field::new("tick_scheme", DataType::Utf8, true),
             Field::new("info", DataType::Binary, true), // nullable
             Field::new("ts_event", DataType::UInt64, false),
             Field::new("ts_init", DataType::UInt64, false),
         ];
 
         let mut final_metadata = HashMap::new();
-        final_metadata.insert("class".to_string(), "OptionContract".to_string());
+        final_metadata.insert(KEY_CLASS.to_string(), "OptionContract".to_string());
 
         if let Some(meta) = metadata {
             final_metadata.extend(meta);
@@ -151,10 +107,15 @@ impl EncodeToRecordBatch for OptionContract {
         let mut size_increment_builder = StringBuilder::new();
         let mut multiplier_builder = StringBuilder::new();
         let mut lot_size_builder = StringBuilder::new();
+        let mut max_quantity_builder = StringBuilder::new();
+        let mut min_quantity_builder = StringBuilder::new();
+        let mut max_price_builder = StringBuilder::new();
+        let mut min_price_builder = StringBuilder::new();
         let mut margin_init_builder = StringBuilder::new();
         let mut margin_maint_builder = StringBuilder::new();
         let mut maker_fee_builder = StringBuilder::new();
         let mut taker_fee_builder = StringBuilder::new();
+        let mut tick_scheme_builder = StringBuilder::new();
         let mut info_builder = BinaryBuilder::new();
         let mut ts_event_builder = UInt64Array::builder(data.len());
         let mut ts_init_builder = UInt64Array::builder(data.len());
@@ -163,7 +124,7 @@ impl EncodeToRecordBatch for OptionContract {
             id_builder.append_value(oc.id.to_string());
             raw_symbol_builder.append_value(oc.raw_symbol);
             underlying_builder.append_value(oc.underlying);
-            asset_class_builder.append_value(asset_class_to_string(oc.asset_class));
+            asset_class_builder.append_value(oc.asset_class);
 
             if let Some(exchange) = oc.exchange {
                 exchange_builder.append_value(exchange);
@@ -171,7 +132,7 @@ impl EncodeToRecordBatch for OptionContract {
                 exchange_builder.append_null();
             }
 
-            option_kind_builder.append_value(option_kind_to_string(oc.option_kind));
+            option_kind_builder.append_value(oc.option_kind);
             strike_price_builder.append_value(oc.strike_price.to_string());
             currency_builder.append_value(oc.currency.to_string());
             activation_ns_builder.append_value(oc.activation_ns.as_u64());
@@ -182,10 +143,41 @@ impl EncodeToRecordBatch for OptionContract {
             size_increment_builder.append_value(oc.size_increment.to_string());
             multiplier_builder.append_value(oc.multiplier.to_string());
             lot_size_builder.append_value(oc.lot_size.to_string());
+
+            if let Some(max_quantity) = oc.max_quantity {
+                max_quantity_builder.append_value(max_quantity.to_string());
+            } else {
+                max_quantity_builder.append_null();
+            }
+
+            if let Some(min_quantity) = oc.min_quantity {
+                min_quantity_builder.append_value(min_quantity.to_string());
+            } else {
+                min_quantity_builder.append_null();
+            }
+
+            if let Some(max_price) = oc.max_price {
+                max_price_builder.append_value(max_price.to_string());
+            } else {
+                max_price_builder.append_null();
+            }
+
+            if let Some(min_price) = oc.min_price {
+                min_price_builder.append_value(min_price.to_string());
+            } else {
+                min_price_builder.append_null();
+            }
+
             margin_init_builder.append_value(oc.margin_init.to_string());
             margin_maint_builder.append_value(oc.margin_maint.to_string());
             maker_fee_builder.append_value(oc.maker_fee.to_string());
             taker_fee_builder.append_value(oc.taker_fee.to_string());
+
+            if let Some(tick_scheme) = oc.tick_scheme {
+                tick_scheme_builder.append_value(tick_scheme);
+            } else {
+                tick_scheme_builder.append_null();
+            }
 
             // Encode info dict as JSON bytes (matching Python's msgspec.json.encode)
             if let Some(ref info) = oc.info {
@@ -208,7 +200,7 @@ impl EncodeToRecordBatch for OptionContract {
         }
 
         let mut final_metadata = metadata.clone();
-        final_metadata.insert("class".to_string(), "OptionContract".to_string());
+        final_metadata.insert(KEY_CLASS.to_string(), "OptionContract".to_string());
 
         RecordBatch::try_new(
             Self::get_schema(Some(final_metadata)).into(),
@@ -229,10 +221,15 @@ impl EncodeToRecordBatch for OptionContract {
                 Arc::new(size_increment_builder.finish()),
                 Arc::new(multiplier_builder.finish()),
                 Arc::new(lot_size_builder.finish()),
+                Arc::new(max_quantity_builder.finish()),
+                Arc::new(min_quantity_builder.finish()),
+                Arc::new(max_price_builder.finish()),
+                Arc::new(min_price_builder.finish()),
                 Arc::new(margin_init_builder.finish()),
                 Arc::new(margin_maint_builder.finish()),
                 Arc::new(maker_fee_builder.finish()),
                 Arc::new(taker_fee_builder.finish()),
+                Arc::new(tick_scheme_builder.finish()),
                 Arc::new(info_builder.finish()),
                 Arc::new(ts_event_builder.finish()),
                 Arc::new(ts_init_builder.finish()),
@@ -255,12 +252,15 @@ impl EncodeToRecordBatch for OptionContract {
     }
 }
 
-/// Helper function to decode OptionContract from RecordBatch
-/// (Cannot implement DecodeFromRecordBatch trait due to `Into<Data>` bound)
+/// Decodes [`OptionContract`] instruments from a record batch.
+///
+/// Not a [`DecodeFromRecordBatch`] implementation because that trait requires `Into<Data>`.
 ///
 /// # Errors
 ///
-/// Returns an `EncodingError` if the RecordBatch cannot be decoded.
+/// Returns an `EncodingError` if the record batch cannot be decoded.
+///
+/// [`DecodeFromRecordBatch`]: crate::arrow::DecodeFromRecordBatch
 pub fn decode_option_contract_batch(
     #[allow(unused)] metadata: &HashMap<String, String>,
     record_batch: &RecordBatch,
@@ -293,17 +293,31 @@ pub fn decode_option_contract_batch(
         extract_column::<StringArray>(cols, "size_increment", 13, DataType::Utf8)?;
     let multiplier_values = extract_column::<StringArray>(cols, "multiplier", 14, DataType::Utf8)?;
     let lot_size_values = extract_column::<StringArray>(cols, "lot_size", 15, DataType::Utf8)?;
+    let max_quantity_values = extract_optional_string_column_by_name(record_batch, "max_quantity")?;
+    let min_quantity_values = extract_optional_string_column_by_name(record_batch, "min_quantity")?;
+    let max_price_values = extract_optional_string_column_by_name(record_batch, "max_price")?;
+    let min_price_values = extract_optional_string_column_by_name(record_batch, "min_price")?;
     let margin_init_values =
-        extract_column::<StringArray>(cols, "margin_init", 16, DataType::Utf8)?;
+        extract_column::<StringArray>(cols, "margin_init", 20, DataType::Utf8)?;
     let margin_maint_values =
-        extract_column::<StringArray>(cols, "margin_maint", 17, DataType::Utf8)?;
-    let maker_fee_values = extract_column::<StringArray>(cols, "maker_fee", 18, DataType::Utf8)?;
-    let taker_fee_values = extract_column::<StringArray>(cols, "taker_fee", 19, DataType::Utf8)?;
-    let info_values = cols
-        .get(20)
-        .ok_or_else(|| EncodingError::MissingColumn("info", 20))?;
-    let ts_event_values = extract_column::<UInt64Array>(cols, "ts_event", 21, DataType::UInt64)?;
-    let ts_init_values = extract_column::<UInt64Array>(cols, "ts_init", 22, DataType::UInt64)?;
+        extract_column::<StringArray>(cols, "margin_maint", 21, DataType::Utf8)?;
+    let maker_fee_values = extract_column::<StringArray>(cols, "maker_fee", 22, DataType::Utf8)?;
+    let taker_fee_values = extract_column::<StringArray>(cols, "taker_fee", 23, DataType::Utf8)?;
+    let tick_scheme_values = extract_optional_string_column_by_name(record_batch, "tick_scheme")?;
+    let info_values =
+        extract_column_by_name_or_index::<BinaryArray>(record_batch, "info", 25, DataType::Binary)?;
+    let ts_event_values = extract_column_by_name_or_index::<UInt64Array>(
+        record_batch,
+        "ts_event",
+        26,
+        DataType::UInt64,
+    )?;
+    let ts_init_values = extract_column_by_name_or_index::<UInt64Array>(
+        record_batch,
+        "ts_init",
+        27,
+        DataType::UInt64,
+    )?;
 
     let mut result = Vec::with_capacity(num_rows);
 
@@ -312,7 +326,8 @@ pub fn decode_option_contract_batch(
             .map_err(|e| EncodingError::ParseError("id", format!("row {i}: {e}")))?;
         let raw_symbol = Symbol::from(raw_symbol_values.value(i));
         let underlying = Ustr::from(underlying_values.value(i));
-        let asset_class = asset_class_from_str(asset_class_values.value(i))?;
+        let asset_class = AssetClass::from_str(asset_class_values.value(i))
+            .map_err(|e| EncodingError::ParseError("asset_class", format!("row {i}: {e}")))?;
 
         let exchange = if exchange_values.is_null(i) {
             None
@@ -327,7 +342,8 @@ pub fn decode_option_contract_batch(
             Some(Ustr::from(exchange_str))
         };
 
-        let option_kind = option_kind_from_str(option_kind_values.value(i))?;
+        let option_kind = OptionKind::from_str(option_kind_values.value(i))
+            .map_err(|e| EncodingError::ParseError("option_kind", format!("row {i}: {e}")))?;
         let strike_price = Price::from_str(strike_price_values.value(i))
             .map_err(|e| EncodingError::ParseError("strike_price", format!("row {i}: {e}")))?;
         let currency = super::decode_currency(
@@ -383,33 +399,53 @@ pub fn decode_option_contract_batch(
         let ts_event = nautilus_core::UnixNanos::from(ts_event_values.value(i));
         let ts_init = nautilus_core::UnixNanos::from(ts_init_values.value(i));
 
-        let option_contract = OptionContract::new(
-            id,
-            raw_symbol,
-            asset_class,
-            exchange,
-            underlying,
-            option_kind,
-            strike_price,
-            currency,
-            activation_ns,
-            expiration_ns,
-            price_prec,
-            price_increment,
-            multiplier,
-            lot_size,
-            None, // max_quantity - not in Python schema
-            None, // min_quantity - not in Python schema
-            None, // max_price - not in Python schema
-            None, // min_price - not in Python schema
-            Some(margin_init),
-            Some(margin_maint),
-            Some(maker_fee),
-            Some(taker_fee),
-            info,
-            ts_event,
-            ts_init,
-        );
+        let tick_scheme = optional_ustr_value(tick_scheme_values, i);
+
+        let option_contract = OptionContract::builder()
+            .instrument_id(id)
+            .raw_symbol(raw_symbol)
+            .asset_class(asset_class)
+            .maybe_exchange(exchange)
+            .underlying(underlying)
+            .option_kind(option_kind)
+            .strike_price(strike_price)
+            .currency(currency)
+            .activation_ns(activation_ns)
+            .expiration_ns(expiration_ns)
+            .price_precision(price_prec)
+            .price_increment(price_increment)
+            .multiplier(multiplier)
+            .lot_size(lot_size)
+            .maybe_max_quantity(super::optional_quantity_value(
+                max_quantity_values,
+                "max_quantity",
+                i,
+            )?)
+            .maybe_min_quantity(super::optional_quantity_value(
+                min_quantity_values,
+                "min_quantity",
+                i,
+            )?)
+            .maybe_max_price(super::optional_price_value(
+                max_price_values,
+                "max_price",
+                i,
+            )?)
+            .maybe_min_price(super::optional_price_value(
+                min_price_values,
+                "min_price",
+                i,
+            )?)
+            .margin_init(margin_init)
+            .margin_maint(margin_maint)
+            .maker_fee(maker_fee)
+            .taker_fee(taker_fee)
+            .maybe_tick_scheme(tick_scheme)
+            .maybe_info(info)
+            .ts_event(ts_event)
+            .ts_init(ts_init)
+            .build()
+            .map_err(|e| super::instrument_validation_error::<OptionContract>(i, e))?;
 
         result.push(option_contract);
     }

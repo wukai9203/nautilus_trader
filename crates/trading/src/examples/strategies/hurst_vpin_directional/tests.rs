@@ -19,7 +19,9 @@ use nautilus_common::{
     actor::DataActor,
     cache::Cache,
     clock::{Clock, TestClock},
+    config::ConfigError,
 };
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, BarSpecification, BarType, TradeTick},
     enums::{AggregationSource, AggressorSide, BarAggregation, PriceType},
@@ -32,35 +34,31 @@ use rstest::rstest;
 use rust_decimal_macros::dec;
 
 use super::{HurstVpinDirectional, HurstVpinDirectionalConfig};
+use crate::{
+    examples::strategies::hurst_vpin_directional::config::MAX_HURST_VPIN_WINDOW,
+    strategy::StrategyConfig,
+};
 
 fn pf_xbtusd() -> CryptoPerpetual {
-    CryptoPerpetual::new(
-        InstrumentId::from("PF_XBTUSD.KRAKEN"),
-        Symbol::from("PF_XBTUSD"),
-        Currency::BTC(),
-        Currency::USD(),
-        Currency::USD(),
-        false,
-        1,
-        4,
-        Price::from("0.5"),
-        Quantity::from("0.0001"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(dec!(0.02)),
-        Some(dec!(0.01)),
-        Some(dec!(0.0002)),
-        Some(dec!(0.0005)),
-        None,
-        0.into(),
-        0.into(),
-    )
+    CryptoPerpetual::builder()
+        .instrument_id(InstrumentId::from("PF_XBTUSD.KRAKEN"))
+        .raw_symbol(Symbol::from("PF_XBTUSD"))
+        .base_currency(Currency::BTC())
+        .quote_currency(Currency::USD())
+        .settlement_currency(Currency::USD())
+        .is_inverse(false)
+        .price_precision(1)
+        .size_precision(4)
+        .price_increment(Price::from("0.5"))
+        .size_increment(Quantity::from("0.0001"))
+        .margin_init(dec!(0.02))
+        .margin_maint(dec!(0.01))
+        .maker_fee(dec!(0.0002))
+        .taker_fee(dec!(0.0005))
+        .ts_event(0.into())
+        .ts_init(0.into())
+        .build()
+        .unwrap()
 }
 
 fn bar_type(instrument_id: InstrumentId) -> BarType {
@@ -72,11 +70,11 @@ fn bar_type(instrument_id: InstrumentId) -> BarType {
 }
 
 fn create_strategy(instrument_id: InstrumentId) -> HurstVpinDirectional {
-    let config = HurstVpinDirectionalConfig::new(
-        instrument_id,
-        bar_type(instrument_id),
-        Quantity::from("0.01"),
-    );
+    let config = HurstVpinDirectionalConfig::builder()
+        .instrument_id(instrument_id)
+        .bar_type(bar_type(instrument_id))
+        .trade_size(Quantity::from("0.01"))
+        .build();
     HurstVpinDirectional::new(config)
 }
 
@@ -85,14 +83,117 @@ fn create_strategy_with_windows(
     hurst_window: usize,
     hurst_lags: Vec<usize>,
 ) -> HurstVpinDirectional {
-    let config = HurstVpinDirectionalConfig::new(
-        instrument_id,
-        bar_type(instrument_id),
-        Quantity::from("0.01"),
-    )
-    .with_hurst_window(hurst_window)
-    .with_hurst_lags(hurst_lags);
+    let config = HurstVpinDirectionalConfig::builder()
+        .instrument_id(instrument_id)
+        .bar_type(bar_type(instrument_id))
+        .trade_size(Quantity::from("0.01"))
+        .hurst_window(hurst_window)
+        .hurst_lags(hurst_lags)
+        .build();
     HurstVpinDirectional::new(config)
+}
+
+#[rstest]
+#[case(1, 1)]
+#[case(128, 50)]
+#[case(MAX_HURST_VPIN_WINDOW, MAX_HURST_VPIN_WINDOW)]
+fn test_config_accepts_supported_windows(#[case] hurst_window: usize, #[case] vpin_window: usize) {
+    let instrument_id = InstrumentId::from("PF_XBTUSD.KRAKEN");
+    let config = HurstVpinDirectionalConfig::builder()
+        .instrument_id(instrument_id)
+        .bar_type(bar_type(instrument_id))
+        .trade_size(Quantity::from("0.01"))
+        .hurst_window(hurst_window)
+        .vpin_window(vpin_window)
+        .build();
+
+    assert!(config.validate().is_ok());
+}
+
+#[rstest]
+#[case(0, 1, "hurst_window")]
+#[case(1, 0, "vpin_window")]
+#[case(MAX_HURST_VPIN_WINDOW + 1, 1, "hurst_window")]
+#[case(1, MAX_HURST_VPIN_WINDOW + 1, "vpin_window")]
+#[case(usize::MAX, 1, "hurst_window")]
+#[case(1, usize::MAX, "vpin_window")]
+fn test_config_rejects_invalid_windows(
+    #[case] hurst_window: usize,
+    #[case] vpin_window: usize,
+    #[case] expected_field: &str,
+) {
+    let instrument_id = InstrumentId::from("PF_XBTUSD.KRAKEN");
+    let config = HurstVpinDirectionalConfig::builder()
+        .instrument_id(instrument_id)
+        .bar_type(bar_type(instrument_id))
+        .trade_size(Quantity::from("0.01"))
+        .hurst_window(hurst_window)
+        .vpin_window(vpin_window)
+        .build();
+
+    let err = config
+        .validate()
+        .expect_err("invalid window must be rejected");
+
+    assert!(matches!(err, ConfigError::Range { field, .. } if field == expected_field));
+}
+
+#[rstest]
+fn test_strategy_new_checked_returns_invalid_window() {
+    let instrument_id = InstrumentId::from("PF_XBTUSD.KRAKEN");
+    let config = HurstVpinDirectionalConfig::builder()
+        .instrument_id(instrument_id)
+        .bar_type(bar_type(instrument_id))
+        .trade_size(Quantity::from("0.01"))
+        .hurst_window(0)
+        .build();
+
+    let result = HurstVpinDirectional::new_checked(config);
+
+    assert!(matches!(
+        result,
+        Err(ConfigError::Range { field, .. }) if field == "hurst_window"
+    ));
+}
+
+#[rstest]
+fn test_strategy_new_checked_returns_invalid_order_id_tag() {
+    let instrument_id = InstrumentId::from("PF_XBTUSD.KRAKEN");
+    let config = HurstVpinDirectionalConfig::builder()
+        .base(StrategyConfig {
+            strategy_id: Some(StrategyId::from("HURST_VPIN-001")),
+            order_id_tag: Some("T01€".to_string()),
+            ..Default::default()
+        })
+        .instrument_id(instrument_id)
+        .bar_type(bar_type(instrument_id))
+        .trade_size(Quantity::from("0.01"))
+        .build();
+
+    let result = HurstVpinDirectional::new_checked(config);
+
+    assert!(matches!(
+        result,
+        Err(ConfigError::InvalidValue { field, .. }) if field == "order_id_tag"
+    ));
+}
+
+#[rstest]
+fn test_strategy_allocates_maximum_supported_windows() {
+    let instrument_id = InstrumentId::from("PF_XBTUSD.KRAKEN");
+    let config = HurstVpinDirectionalConfig::builder()
+        .instrument_id(instrument_id)
+        .bar_type(bar_type(instrument_id))
+        .trade_size(Quantity::from("0.01"))
+        .hurst_window(MAX_HURST_VPIN_WINDOW)
+        .vpin_window(MAX_HURST_VPIN_WINDOW)
+        .build();
+
+    let strategy = HurstVpinDirectional::new_checked(config).unwrap();
+
+    assert!(strategy.returns.capacity() >= MAX_HURST_VPIN_WINDOW);
+    assert!(strategy.abs_imbalances.capacity() >= MAX_HURST_VPIN_WINDOW);
+    assert!(strategy.signed_imbalances.capacity() >= MAX_HURST_VPIN_WINDOW);
 }
 
 fn register_strategy(strategy: &mut HurstVpinDirectional) {
@@ -100,8 +201,8 @@ fn register_strategy(strategy: &mut HurstVpinDirectional) {
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
     let cache = Rc::new(RefCell::new(Cache::default()));
     let portfolio = Rc::new(RefCell::new(Portfolio::new(
-        cache.clone(),
         clock.clone(),
+        cache.clone(),
         None,
     )));
     strategy
@@ -178,7 +279,7 @@ fn test_buyer_aggressor_adds_to_buy_volume() {
         .on_trade(&trade(
             strategy.config.instrument_id,
             "5.0",
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             1,
         ))
         .unwrap();
@@ -195,7 +296,7 @@ fn test_seller_aggressor_adds_to_sell_volume() {
         .on_trade(&trade(
             strategy.config.instrument_id,
             "7.0",
-            AggressorSide::Seller,
+            AggressorSide::Sell,
             1,
         ))
         .unwrap();
@@ -276,7 +377,7 @@ fn test_bar_finalizes_bucket_and_resets_accumulators() {
         .on_trade(&trade(
             strategy.config.instrument_id,
             "7.0",
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             1,
         ))
         .unwrap();
@@ -284,7 +385,7 @@ fn test_bar_finalizes_bucket_and_resets_accumulators() {
         .on_trade(&trade(
             strategy.config.instrument_id,
             "3.0",
-            AggressorSide::Seller,
+            AggressorSide::Sell,
             2,
         ))
         .unwrap();
@@ -402,8 +503,11 @@ fn test_signals_ready_false_during_warmup() {
 fn test_on_start_rejects_mismatched_bar_type() {
     let instrument_id = InstrumentId::from("PF_XBTUSD.KRAKEN");
     let other_id = InstrumentId::from("OTHER.KRAKEN");
-    let config =
-        HurstVpinDirectionalConfig::new(instrument_id, bar_type(other_id), Quantity::from("0.01"));
+    let config = HurstVpinDirectionalConfig::builder()
+        .instrument_id(instrument_id)
+        .bar_type(bar_type(other_id))
+        .trade_size(Quantity::from("0.01"))
+        .build();
     let mut strategy = HurstVpinDirectional::new(config);
     register_strategy(&mut strategy);
 
@@ -428,7 +532,7 @@ fn test_on_reset_clears_all_state() {
     strategy.hurst = Some(0.6);
     strategy.vpin = Some(0.4);
     strategy.signed_vpin = Some(0.4);
-    strategy.position_opened_ns = Some(12_345);
+    strategy.position_opened_ns = Some(UnixNanos::new(12_345));
     strategy.exit_cooldown = true;
     strategy.entry_order_id = Some(ClientOrderId::from("O-1"));
     strategy.exit_order_ids.insert(ClientOrderId::from("O-2"));

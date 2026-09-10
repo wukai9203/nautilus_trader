@@ -32,14 +32,13 @@ use nautilus_model::{
     instruments::crypto_perpetual::CryptoPerpetual,
     types::{money::Money, price::Price, quantity::Quantity},
 };
-#[allow(unused)]
 use rust_decimal::Decimal;
-#[allow(unused)]
-use serde_json::Value;
 
+use super::KEY_CLASS;
 use crate::arrow::{
     ArrowSchemaProvider, EncodeToRecordBatch, EncodingError, KEY_INSTRUMENT_ID,
-    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column,
+    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column, extract_column_by_name_or_index,
+    extract_optional_string_column_by_name, optional_ustr_value,
 };
 
 impl ArrowSchemaProvider for CryptoPerpetual {
@@ -67,13 +66,14 @@ impl ArrowSchemaProvider for CryptoPerpetual {
             Field::new("margin_maint", DataType::Utf8, false),
             Field::new("maker_fee", DataType::Utf8, false),
             Field::new("taker_fee", DataType::Utf8, false),
+            Field::new("tick_scheme", DataType::Utf8, true),
             Field::new("info", DataType::Binary, true), // nullable
             Field::new("ts_event", DataType::UInt64, false),
             Field::new("ts_init", DataType::UInt64, false),
         ];
 
         let mut final_metadata = HashMap::new();
-        final_metadata.insert("class".to_string(), "CryptoPerpetual".to_string());
+        final_metadata.insert(KEY_CLASS.to_string(), "CryptoPerpetual".to_string());
 
         if let Some(meta) = metadata {
             final_metadata.extend(meta);
@@ -110,6 +110,7 @@ impl EncodeToRecordBatch for CryptoPerpetual {
         let mut margin_maint_builder = StringBuilder::new();
         let mut maker_fee_builder = StringBuilder::new();
         let mut taker_fee_builder = StringBuilder::new();
+        let mut tick_scheme_builder = StringBuilder::new();
         let mut info_builder = BinaryBuilder::new();
         let mut ts_event_builder = UInt64Array::builder(data.len());
         let mut ts_init_builder = UInt64Array::builder(data.len());
@@ -169,6 +170,12 @@ impl EncodeToRecordBatch for CryptoPerpetual {
             maker_fee_builder.append_value(cp.maker_fee.to_string());
             taker_fee_builder.append_value(cp.taker_fee.to_string());
 
+            if let Some(tick_scheme) = cp.tick_scheme {
+                tick_scheme_builder.append_value(tick_scheme);
+            } else {
+                tick_scheme_builder.append_null();
+            }
+
             // Encode info dict as JSON bytes (matching Python's msgspec.json.encode)
             if let Some(ref info) = cp.info {
                 match serde_json::to_vec(info) {
@@ -190,7 +197,7 @@ impl EncodeToRecordBatch for CryptoPerpetual {
         }
 
         let mut final_metadata = metadata.clone();
-        final_metadata.insert("class".to_string(), "CryptoPerpetual".to_string());
+        final_metadata.insert(KEY_CLASS.to_string(), "CryptoPerpetual".to_string());
 
         RecordBatch::try_new(
             Self::get_schema(Some(final_metadata)).into(),
@@ -217,6 +224,7 @@ impl EncodeToRecordBatch for CryptoPerpetual {
                 Arc::new(margin_maint_builder.finish()),
                 Arc::new(maker_fee_builder.finish()),
                 Arc::new(taker_fee_builder.finish()),
+                Arc::new(tick_scheme_builder.finish()),
                 Arc::new(info_builder.finish()),
                 Arc::new(ts_event_builder.finish()),
                 Arc::new(ts_init_builder.finish()),
@@ -239,12 +247,15 @@ impl EncodeToRecordBatch for CryptoPerpetual {
     }
 }
 
-/// Helper function to decode CryptoPerpetual from RecordBatch
-/// (Cannot implement DecodeFromRecordBatch trait due to `Into<Data>` bound)
+/// Decodes [`CryptoPerpetual`] instruments from a record batch.
+///
+/// Not a [`DecodeFromRecordBatch`] implementation because that trait requires `Into<Data>`.
 ///
 /// # Errors
 ///
-/// Returns an `EncodingError` if the RecordBatch cannot be decoded.
+/// Returns an `EncodingError` if the record batch cannot be decoded.
+///
+/// [`DecodeFromRecordBatch`]: crate::arrow::DecodeFromRecordBatch
 pub fn decode_crypto_perpetual_batch(
     #[allow(unused)] metadata: &HashMap<String, String>,
     record_batch: &RecordBatch,
@@ -304,13 +315,25 @@ pub fn decode_crypto_perpetual_batch(
         extract_column::<StringArray>(cols, "maker_fee", 19 + lot_size_offset, DataType::Utf8)?;
     let taker_fee_values =
         extract_column::<StringArray>(cols, "taker_fee", 20 + lot_size_offset, DataType::Utf8)?;
-    let info_values = cols
-        .get(21 + lot_size_offset)
-        .ok_or_else(|| EncodingError::MissingColumn("info", 21 + lot_size_offset))?;
-    let ts_event_values =
-        extract_column::<UInt64Array>(cols, "ts_event", 22 + lot_size_offset, DataType::UInt64)?;
-    let ts_init_values =
-        extract_column::<UInt64Array>(cols, "ts_init", 23 + lot_size_offset, DataType::UInt64)?;
+    let tick_scheme_values = extract_optional_string_column_by_name(record_batch, "tick_scheme")?;
+    let info_values = extract_column_by_name_or_index::<BinaryArray>(
+        record_batch,
+        "info",
+        21 + lot_size_offset,
+        DataType::Binary,
+    )?;
+    let ts_event_values = extract_column_by_name_or_index::<UInt64Array>(
+        record_batch,
+        "ts_event",
+        22 + lot_size_offset,
+        DataType::UInt64,
+    )?;
+    let ts_init_values = extract_column_by_name_or_index::<UInt64Array>(
+        record_batch,
+        "ts_init",
+        23 + lot_size_offset,
+        DataType::UInt64,
+    )?;
 
     let mut result = Vec::with_capacity(num_rows);
 
@@ -488,33 +511,37 @@ pub fn decode_crypto_perpetual_batch(
         let ts_event = nautilus_core::UnixNanos::from(ts_event_values.value(i));
         let ts_init = nautilus_core::UnixNanos::from(ts_init_values.value(i));
 
-        let crypto_perp = CryptoPerpetual::new(
-            id,
-            raw_symbol,
-            base_currency,
-            quote_currency,
-            settlement_currency,
-            is_inverse,
-            price_prec,
-            size_prec,
-            price_increment,
-            size_increment,
-            Some(multiplier),
-            lot_size,
-            max_quantity,
-            min_quantity,
-            max_notional,
-            min_notional,
-            max_price,
-            min_price,
-            Some(margin_init),
-            Some(margin_maint),
-            Some(maker_fee),
-            Some(taker_fee),
-            info,
-            ts_event,
-            ts_init,
-        );
+        let tick_scheme = optional_ustr_value(tick_scheme_values, i);
+
+        let crypto_perp = CryptoPerpetual::builder()
+            .instrument_id(id)
+            .raw_symbol(raw_symbol)
+            .base_currency(base_currency)
+            .quote_currency(quote_currency)
+            .settlement_currency(settlement_currency)
+            .is_inverse(is_inverse)
+            .price_precision(price_prec)
+            .size_precision(size_prec)
+            .price_increment(price_increment)
+            .size_increment(size_increment)
+            .multiplier(multiplier)
+            .maybe_lot_size(lot_size)
+            .maybe_max_quantity(max_quantity)
+            .maybe_min_quantity(min_quantity)
+            .maybe_max_notional(max_notional)
+            .maybe_min_notional(min_notional)
+            .maybe_max_price(max_price)
+            .maybe_min_price(min_price)
+            .margin_init(margin_init)
+            .margin_maint(margin_maint)
+            .maker_fee(maker_fee)
+            .taker_fee(taker_fee)
+            .maybe_tick_scheme(tick_scheme)
+            .maybe_info(info)
+            .ts_event(ts_event)
+            .ts_init(ts_init)
+            .build()
+            .map_err(|e| super::instrument_validation_error::<CryptoPerpetual>(i, e))?;
 
         result.push(crypto_perp);
     }

@@ -36,13 +36,14 @@ use std::{
     collections::VecDeque,
     fmt::Debug,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 use ahash::AHashSet;
 use nautilus_core::{UUID4, UnixNanos};
+use parking_lot::Mutex;
 
 use crate::{
     capture::{encoder::EncodeError, registry::EncoderRegistry},
@@ -232,15 +233,17 @@ impl BusCaptureAdapter {
             return Err(CaptureError::Halted);
         }
 
+        // Encode before noting the identity: a rejected encode must be re-attempted
+        // on the message's next dispatch hop, not dropped as a duplicate.
+        let Some((payload_type, encoded)) = self.registry.encode_any(message)? else {
+            return Ok(false);
+        };
+
         if let Some(identity) = self.registry.identity_for_any(message)
             && !self.note_fresh_identity(identity)
         {
             return Ok(false);
         }
-
-        let Some((payload_type, encoded)) = self.registry.encode_any(message)? else {
-            return Ok(false);
-        };
 
         let draft = EntryDraft {
             headers,
@@ -266,12 +269,7 @@ impl BusCaptureAdapter {
     }
 
     fn note_fresh_identity(&self, identity: UUID4) -> bool {
-        // The dedup window is a cache: on the (panic-only) poisoned path the prior state
-        // is still internally consistent, so recover the guard rather than propagate.
-        self.recent_identities
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .note_fresh(identity)
+        self.recent_identities.lock().note_fresh(identity)
     }
 
     fn fail_stop(&self, err: &SubmitError) {
@@ -309,15 +307,16 @@ fn halt_reason_from_submit(err: &SubmitError) -> HaltReason {
 mod tests {
     use std::{
         sync::{
-            Arc, Mutex,
-            atomic::{AtomicU64, Ordering},
+            Arc,
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
     use bytes::Bytes;
     use indexmap::IndexMap;
-    use nautilus_core::{UnixNanos, time::get_atomic_clock_static};
+    use nautilus_core::{UUID4, UnixNanos, time::get_atomic_clock_static};
+    use parking_lot::Mutex;
     use rstest::{fixture, rstest};
     use ustr::Ustr;
 
@@ -347,6 +346,12 @@ mod tests {
 
     #[derive(Debug)]
     struct FailingMessage;
+
+    #[derive(Debug)]
+    struct StubIdentifiedCommand {
+        id: UUID4,
+        payload: String,
+    }
 
     fn manifest(run_id: &str) -> RunManifest {
         RunManifest {
@@ -401,10 +406,7 @@ mod tests {
         let captured: Arc<Mutex<Vec<HaltReason>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_for_cb = Arc::clone(&captured);
         let halt: HaltCallback = Arc::new(move |reason| {
-            captured_for_cb
-                .lock()
-                .expect("captured halt poisoned")
-                .push(reason);
+            captured_for_cb.lock().push(reason);
         });
         (halt, captured)
     }
@@ -416,7 +418,6 @@ mod tests {
         let backend_arc: Arc<Mutex<MemoryBackend>> = Arc::new(Mutex::new(MemoryBackend::new()));
         backend_arc
             .lock()
-            .expect("inner")
             .open_run(manifest(run_id))
             .expect("open run");
 
@@ -442,7 +443,7 @@ mod tests {
         }
 
         fn append_batch(&mut self, entries: &[AppendEntry]) -> Result<u64, EventStoreError> {
-            self.0.lock().expect("shared").append_batch(entries)
+            self.0.lock().append_batch(entries)
         }
 
         fn scan_range(
@@ -451,34 +452,31 @@ mod tests {
             to: u64,
             direction: ScanDirection,
         ) -> Result<Vec<EventStoreEntry>, EventStoreError> {
-            self.0
-                .lock()
-                .expect("shared")
-                .scan_range(from, to, direction)
+            self.0.lock().scan_range(from, to, direction)
         }
 
         fn scan_seq(&self, seq: u64) -> Result<Option<EventStoreEntry>, EventStoreError> {
-            self.0.lock().expect("shared").scan_seq(seq)
+            self.0.lock().scan_seq(seq)
         }
 
         fn lookup(&self, kind: IndexKind, key: &str) -> Result<Option<u64>, EventStoreError> {
-            self.0.lock().expect("shared").lookup(kind, key)
+            self.0.lock().lookup(kind, key)
         }
 
         fn iter_index_keys(&self, kind: IndexKind) -> Result<Vec<(String, u64)>, EventStoreError> {
-            self.0.lock().expect("shared").iter_index_keys(kind)
+            self.0.lock().iter_index_keys(kind)
         }
 
         fn seal(&mut self, status: RunStatus) -> Result<(), EventStoreError> {
-            self.0.lock().expect("shared").seal(status)
+            self.0.lock().seal(status)
         }
 
         fn manifest(&self) -> Result<RunManifest, EventStoreError> {
-            self.0.lock().expect("shared").manifest()
+            self.0.lock().manifest()
         }
 
         fn high_watermark(&self) -> Result<u64, EventStoreError> {
-            self.0.lock().expect("shared").high_watermark()
+            self.0.lock().high_watermark()
         }
     }
 
@@ -520,7 +518,7 @@ mod tests {
         assert!(captured_flag);
         drain(&writer, 1);
 
-        let backend = backend.lock().expect("backend");
+        let backend = backend.lock();
         let entry = backend.scan_seq(1).expect("scan").expect("present");
         assert_eq!(entry.payload_type.as_str(), "StubCommand");
         assert_eq!(entry.topic.as_ref(), "exec.command.SubmitOrder");
@@ -532,7 +530,7 @@ mod tests {
             .expect("indexed");
         assert_eq!(seq, 1);
 
-        assert!(captured.lock().expect("captured").is_empty());
+        assert!(captured.lock().is_empty());
         assert!(!adapter.is_halted());
     }
 
@@ -623,7 +621,7 @@ mod tests {
             .expect("capture");
         drain(&writer, 1);
 
-        let backend = backend.lock().expect("backend");
+        let backend = backend.lock();
         let by_client = backend
             .lookup(IndexKind::ClientOrderId, "O-2")
             .expect("lookup")
@@ -666,7 +664,7 @@ mod tests {
             !adapter.is_halted(),
             "encoder failure must not fail-stop the adapter",
         );
-        assert!(captured.lock().expect("captured").is_empty());
+        assert!(captured.lock().is_empty());
 
         // Subsequent capture for a registered type still works.
         adapter
@@ -680,7 +678,112 @@ mod tests {
             )
             .expect("capture after encoder error");
         drain(&writer, 1);
-        let backend = backend.lock().expect("backend");
+        let backend = backend.lock();
+        assert_eq!(backend.high_watermark().expect("hwm"), 1);
+    }
+
+    #[rstest]
+    fn capture_dedupes_second_dispatch_hop_by_identity(
+        captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
+    ) {
+        let (halt, _captured) = captured_halt;
+        let (writer, backend) = writer_with_open_run("run-dedup", Arc::clone(&halt));
+
+        let mut registry = EncoderRegistry::new();
+        registry.register::<StubIdentifiedCommand, _>(Ustr::from("StubIdentified"), |c| {
+            Ok(EncodedPayload::new(
+                Bytes::copy_from_slice(c.payload.as_bytes()),
+                Vec::new(),
+            ))
+        });
+        registry.register_identity::<StubIdentifiedCommand, _>(|c| Some(c.id));
+        let adapter = BusCaptureAdapter::new(Arc::clone(&writer), Arc::new(registry), halt);
+
+        let command = StubIdentifiedCommand {
+            id: UUID4::new(),
+            payload: "queued-command".to_string(),
+        };
+        let first = adapter
+            .capture::<StubIdentifiedCommand>(
+                Topic::from("DataEngine.queue_execute"),
+                &command,
+                Headers::empty(),
+                UnixNanos::from(100),
+            )
+            .expect("first hop");
+        let second = adapter
+            .capture::<StubIdentifiedCommand>(
+                Topic::from("DataEngine.execute"),
+                &command,
+                Headers::empty(),
+                UnixNanos::from(101),
+            )
+            .expect("second hop");
+
+        assert!(first, "first dispatch hop must capture");
+        assert!(
+            !second,
+            "second dispatch hop of the same identity must dedupe"
+        );
+        drain(&writer, 1);
+        let backend = backend.lock();
+        assert_eq!(backend.high_watermark().expect("hwm"), 1);
+    }
+
+    #[rstest]
+    fn capture_retries_encode_on_next_hop_after_encoder_failure(
+        captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
+    ) {
+        // The identity is noted only after a successful encode, so the next hop
+        // re-attempts a failed encode instead of deduping it.
+        let (halt, _captured) = captured_halt;
+        let (writer, backend) = writer_with_open_run("run-encode-retry", Arc::clone(&halt));
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_encoder = Arc::clone(&attempts);
+        let mut registry = EncoderRegistry::new();
+        registry.register::<StubIdentifiedCommand, _>(Ustr::from("StubIdentified"), move |c| {
+            let attempt = attempts_for_encoder.fetch_add(1, Ordering::AcqRel);
+            if attempt == 0 {
+                return Err(EncodeError::Serialize(
+                    "transient encoder failure".to_string(),
+                ));
+            }
+            Ok(EncodedPayload::new(
+                Bytes::copy_from_slice(c.payload.as_bytes()),
+                Vec::new(),
+            ))
+        });
+        registry.register_identity::<StubIdentifiedCommand, _>(|c| Some(c.id));
+        let adapter = BusCaptureAdapter::new(Arc::clone(&writer), Arc::new(registry), halt);
+
+        let command = StubIdentifiedCommand {
+            id: UUID4::new(),
+            payload: "retry-me".to_string(),
+        };
+        let err = adapter
+            .capture::<StubIdentifiedCommand>(
+                Topic::from("DataEngine.queue_execute"),
+                &command,
+                Headers::empty(),
+                UnixNanos::from(100),
+            )
+            .expect_err("first encode must fail");
+        assert!(matches!(err, CaptureError::Encode(_)));
+
+        let retried = adapter
+            .capture::<StubIdentifiedCommand>(
+                Topic::from("DataEngine.execute"),
+                &command,
+                Headers::empty(),
+                UnixNanos::from(101),
+            )
+            .expect("second hop re-attempts encode");
+
+        assert!(retried, "encode retry must capture, was deduped");
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+        drain(&writer, 1);
+        let backend = backend.lock();
         assert_eq!(backend.high_watermark().expect("hwm"), 1);
     }
 
@@ -767,7 +870,7 @@ mod tests {
             .expect_err("first submit fails");
         assert!(matches!(err, CaptureError::Submit(SubmitError::Closed)));
         assert!(stub_adapter.is_halted());
-        assert_eq!(captured.lock().expect("captured").len(), 1);
+        assert_eq!(captured.lock().len(), 1);
 
         let err2 = stub_adapter
             .capture::<StubCommand>(
@@ -781,7 +884,7 @@ mod tests {
             .expect_err("second submit short-circuits");
         assert!(matches!(err2, CaptureError::Halted));
         assert_eq!(
-            captured.lock().expect("captured").len(),
+            captured.lock().len(),
             1,
             "halt callback must not refire after the first failure",
         );
@@ -793,10 +896,7 @@ mod tests {
     fn adapter_halt_for(captured: &Arc<Mutex<Vec<HaltReason>>>) -> HaltCallback {
         let captured_for_cb = Arc::clone(captured);
         Arc::new(move |reason| {
-            captured_for_cb
-                .lock()
-                .expect("captured halt poisoned")
-                .push(reason);
+            captured_for_cb.lock().push(reason);
         })
     }
 

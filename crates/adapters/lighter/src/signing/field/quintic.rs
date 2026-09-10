@@ -25,7 +25,7 @@
 //!
 //! Arithmetic, inversion, and the [`Fp5::legendre`] descent inherit `Fp`'s
 //! constant-time guarantees. [`Fp5::sqrt`] / [`Fp5::canonical_sqrt`] inherit
-//! the variable-time behaviour of [`Fp::sqrt`] and are intended for the
+//! the variable-time behavior of [`Fp::sqrt`] and are intended for the
 //! public-input curve decode path; do not feed them secret operands.
 
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
@@ -175,25 +175,150 @@ impl Fp5 {
 
     #[inline]
     fn mul_inner(self, rhs: Self) -> Self {
-        let w = Fp::from_u64_reduce(W);
-        let a = &self.0;
-        let b = &rhs.0;
+        Self([
+            self.mul_coefficient_0(rhs),
+            self.mul_coefficient_1(rhs),
+            self.mul_coefficient_2(rhs),
+            self.mul_coefficient_3(rhs),
+            self.mul_coefficient_4(rhs),
+        ])
+    }
 
-        // Schoolbook cross-product with `z^5 = W = 3`.
-        let c0 = a[0] * b[0] + w * (a[1] * b[4] + a[2] * b[3] + a[3] * b[2] + a[4] * b[1]);
-        let c1 = a[0] * b[1] + a[1] * b[0] + w * (a[2] * b[4] + a[3] * b[3] + a[4] * b[2]);
-        let c2 = a[0] * b[2] + a[1] * b[1] + a[2] * b[0] + w * (a[3] * b[4] + a[4] * b[3]);
-        let c3 = a[0] * b[3] + a[1] * b[2] + a[2] * b[1] + a[3] * b[0] + w * (a[4] * b[4]);
-        let c4 = a[0] * b[4] + a[1] * b[3] + a[2] * b[2] + a[3] * b[1] + a[4] * b[0];
+    #[inline(always)]
+    fn mul_coefficient_0(self, rhs: Self) -> Fp {
+        let p0 = (self.0[0].0 as u128) * (rhs.0[0].0 as u128);
+        let p1 = (self.0[1].0 as u128) * (rhs.0[4].0 as u128);
+        let p2 = (self.0[2].0 as u128) * (rhs.0[3].0 as u128);
+        let p3 = (self.0[3].0 as u128) * (rhs.0[2].0 as u128);
+        let p4 = (self.0[4].0 as u128) * (rhs.0[1].0 as u128);
+        let hi = (p0 >> 64) + 3 * ((p1 >> 64) + (p2 >> 64) + (p3 >> 64) + (p4 >> 64));
+        let lo = (p0 as u64 as u128)
+            + 3 * (p1 as u64 as u128 + p2 as u64 as u128 + p3 as u64 as u128 + p4 as u64 as u128);
+        Fp::from_montgomery_products(lo, hi)
+    }
 
-        Self([c0, c1, c2, c3, c4])
+    #[inline(always)]
+    fn mul_coefficient_1(self, rhs: Self) -> Fp {
+        let p0 = (self.0[0].0 as u128) * (rhs.0[1].0 as u128);
+        let p1 = (self.0[1].0 as u128) * (rhs.0[0].0 as u128);
+        let p2 = (self.0[2].0 as u128) * (rhs.0[4].0 as u128);
+        let p3 = (self.0[3].0 as u128) * (rhs.0[3].0 as u128);
+        let p4 = (self.0[4].0 as u128) * (rhs.0[2].0 as u128);
+        let hi = (p0 >> 64) + (p1 >> 64) + 3 * ((p2 >> 64) + (p3 >> 64) + (p4 >> 64));
+        let lo = (p0 as u64 as u128)
+            + (p1 as u64 as u128)
+            + 3 * (p2 as u64 as u128 + p3 as u64 as u128 + p4 as u64 as u128);
+        Fp::from_montgomery_products(lo, hi)
+    }
+
+    #[inline(always)]
+    fn mul_coefficient_2(self, rhs: Self) -> Fp {
+        let p0 = (self.0[0].0 as u128) * (rhs.0[2].0 as u128);
+        let p1 = (self.0[1].0 as u128) * (rhs.0[1].0 as u128);
+        let p2 = (self.0[2].0 as u128) * (rhs.0[0].0 as u128);
+        let p3 = (self.0[3].0 as u128) * (rhs.0[4].0 as u128);
+        let p4 = (self.0[4].0 as u128) * (rhs.0[3].0 as u128);
+        let hi = (p0 >> 64) + (p1 >> 64) + (p2 >> 64) + 3 * ((p3 >> 64) + (p4 >> 64));
+        let lo = (p0 as u64 as u128)
+            + (p1 as u64 as u128)
+            + (p2 as u64 as u128)
+            + 3 * (p3 as u64 as u128 + p4 as u64 as u128);
+        Fp::from_montgomery_products(lo, hi)
+    }
+
+    #[inline(always)]
+    fn mul_coefficient_3(self, rhs: Self) -> Fp {
+        let p0 = (self.0[0].0 as u128) * (rhs.0[3].0 as u128);
+        let p1 = (self.0[1].0 as u128) * (rhs.0[2].0 as u128);
+        let p2 = (self.0[2].0 as u128) * (rhs.0[1].0 as u128);
+        let p3 = (self.0[3].0 as u128) * (rhs.0[0].0 as u128);
+        let p4 = (self.0[4].0 as u128) * (rhs.0[4].0 as u128);
+        let hi = (p0 >> 64) + (p1 >> 64) + (p2 >> 64) + (p3 >> 64) + 3 * (p4 >> 64);
+        let lo = (p0 as u64 as u128)
+            + (p1 as u64 as u128)
+            + (p2 as u64 as u128)
+            + (p3 as u64 as u128)
+            + 3 * (p4 as u64 as u128);
+        Fp::from_montgomery_products(lo, hi)
+    }
+
+    #[inline(always)]
+    fn mul_coefficient_4(self, rhs: Self) -> Fp {
+        let p0 = (self.0[0].0 as u128) * (rhs.0[4].0 as u128);
+        let p1 = (self.0[1].0 as u128) * (rhs.0[3].0 as u128);
+        let p2 = (self.0[2].0 as u128) * (rhs.0[2].0 as u128);
+        let p3 = (self.0[3].0 as u128) * (rhs.0[1].0 as u128);
+        let p4 = (self.0[4].0 as u128) * (rhs.0[0].0 as u128);
+        let hi = (p0 >> 64) + (p1 >> 64) + (p2 >> 64) + (p3 >> 64) + (p4 >> 64);
+        let lo = (p0 as u64 as u128)
+            + (p1 as u64 as u128)
+            + (p2 as u64 as u128)
+            + (p3 as u64 as u128)
+            + (p4 as u64 as u128);
+        Fp::from_montgomery_products(lo, hi)
     }
 
     /// Squaring in `Fp5`.
     #[inline]
     #[must_use]
     pub fn square(self) -> Self {
-        self.mul_inner(self)
+        Self([
+            self.square_coefficient_0(),
+            self.square_coefficient_1(),
+            self.square_coefficient_2(),
+            self.square_coefficient_3(),
+            self.square_coefficient_4(),
+        ])
+    }
+
+    #[inline(always)]
+    fn square_coefficient_0(self) -> Fp {
+        let p0 = (self.0[0].0 as u128) * (self.0[0].0 as u128);
+        let p1 = (self.0[1].0 as u128) * (self.0[4].0 as u128);
+        let p2 = (self.0[2].0 as u128) * (self.0[3].0 as u128);
+        let hi = (p0 >> 64) + 6 * ((p1 >> 64) + (p2 >> 64));
+        let lo = (p0 as u64 as u128) + 6 * (p1 as u64 as u128 + p2 as u64 as u128);
+        Fp::from_montgomery_products(lo, hi)
+    }
+
+    #[inline(always)]
+    fn square_coefficient_1(self) -> Fp {
+        let p0 = (self.0[0].0 as u128) * (self.0[1].0 as u128);
+        let p2 = (self.0[2].0 as u128) * (self.0[4].0 as u128);
+        let p3 = (self.0[3].0 as u128) * (self.0[3].0 as u128);
+        let hi = 2 * (p0 >> 64) + 6 * (p2 >> 64) + 3 * (p3 >> 64);
+        let lo = 2 * (p0 as u64 as u128) + 6 * (p2 as u64 as u128) + 3 * (p3 as u64 as u128);
+        Fp::from_montgomery_products(lo, hi)
+    }
+
+    #[inline(always)]
+    fn square_coefficient_2(self) -> Fp {
+        let p0 = (self.0[0].0 as u128) * (self.0[2].0 as u128);
+        let p1 = (self.0[1].0 as u128) * (self.0[1].0 as u128);
+        let p3 = (self.0[3].0 as u128) * (self.0[4].0 as u128);
+        let hi = 2 * (p0 >> 64) + (p1 >> 64) + 6 * (p3 >> 64);
+        let lo = 2 * (p0 as u64 as u128) + (p1 as u64 as u128) + 6 * (p3 as u64 as u128);
+        Fp::from_montgomery_products(lo, hi)
+    }
+
+    #[inline(always)]
+    fn square_coefficient_3(self) -> Fp {
+        let p0 = (self.0[0].0 as u128) * (self.0[3].0 as u128);
+        let p1 = (self.0[1].0 as u128) * (self.0[2].0 as u128);
+        let p4 = (self.0[4].0 as u128) * (self.0[4].0 as u128);
+        let hi = 2 * ((p0 >> 64) + (p1 >> 64)) + 3 * (p4 >> 64);
+        let lo = 2 * (p0 as u64 as u128 + p1 as u64 as u128) + 3 * (p4 as u64 as u128);
+        Fp::from_montgomery_products(lo, hi)
+    }
+
+    #[inline(always)]
+    fn square_coefficient_4(self) -> Fp {
+        let p0 = (self.0[0].0 as u128) * (self.0[4].0 as u128);
+        let p1 = (self.0[1].0 as u128) * (self.0[3].0 as u128);
+        let p2 = (self.0[2].0 as u128) * (self.0[2].0 as u128);
+        let hi = 2 * ((p0 >> 64) + (p1 >> 64)) + (p2 >> 64);
+        let lo = 2 * (p0 as u64 as u128 + p1 as u64 as u128) + (p2 as u64 as u128);
+        Fp::from_montgomery_products(lo, hi)
     }
 
     /// Repeated squaring: returns `self^(2^n)`.
@@ -248,7 +373,7 @@ impl Fp5 {
     /// by [`Self::canonical_sqrt`] to fix the sign of square roots.
     ///
     /// The latch `sign = sign || (zero && sign_i)` with `sign_i = (limb is
-    /// even)` reproduces the upstream behaviour bit-for-bit, including a
+    /// even)` reproduces the upstream behavior bit-for-bit, including a
     /// known wrinkle: an element whose first non-zero coefficient is preceded
     /// by zero coefficients (e.g. `[0, 1, 0, 0, 0]`) reports `true` because a
     /// leading zero satisfies `sign_i`. This wrinkle has no observable effect
@@ -568,6 +693,17 @@ mod tests {
         );
     }
 
+    #[rstest]
+    fn multiplication_matches_schoolbook_at_modulus_boundary() {
+        let value = Fp5::from_u64s_reduce([MODULUS - 1; 5]);
+        let product = value * value;
+        let square = value.square();
+        let expected = schoolbook_product(value, value);
+
+        assert_eq!(product, expected);
+        assert_eq!(square, expected);
+    }
+
     proptest! {
         /// `Fp5` addition is commutative.
         #[rstest]
@@ -597,6 +733,11 @@ mod tests {
         #[rstest]
         fn prop_mul_associative(a in arb_fp5(), b in arb_fp5(), c in arb_fp5()) {
             prop_assert_eq!((a * b) * c, a * (b * c));
+        }
+
+        #[rstest]
+        fn prop_mul_matches_schoolbook(a in arb_fp5(), b in arb_fp5()) {
+            prop_assert_eq!(a * b, schoolbook_product(a, b));
         }
 
         /// `a + (-a) == 0`.
@@ -650,7 +791,7 @@ mod tests {
         /// returns the negated root which still reports `true`. That branch
         /// has no observable effect on `Point::decode` per the doc on
         /// `Fp5::sgn0`, and the byte-equality oracle vectors pin the wider
-        /// behaviour end-to-end.
+        /// behavior end-to-end.
         #[rstest]
         fn prop_canonical_sqrt_round_trip(a in arb_fp5_nonzero()) {
             let sq = a.square();
@@ -740,6 +881,19 @@ mod tests {
                 prop_assert_eq!(ct, 0);
             }
         }
+    }
+
+    fn schoolbook_product(lhs: Fp5, rhs: Fp5) -> Fp5 {
+        let w = Fp::from_u64_reduce(W);
+        let a = &lhs.0;
+        let b = &rhs.0;
+        Fp5([
+            a[0] * b[0] + w * (a[1] * b[4] + a[2] * b[3] + a[3] * b[2] + a[4] * b[1]),
+            a[0] * b[1] + a[1] * b[0] + w * (a[2] * b[4] + a[3] * b[3] + a[4] * b[2]),
+            a[0] * b[2] + a[1] * b[1] + a[2] * b[0] + w * (a[3] * b[4] + a[4] * b[3]),
+            a[0] * b[3] + a[1] * b[2] + a[2] * b[1] + a[3] * b[0] + w * (a[4] * b[4]),
+            a[0] * b[4] + a[1] * b[3] + a[2] * b[2] + a[3] * b[1] + a[4] * b[0],
+        ])
     }
 
     #[rstest]

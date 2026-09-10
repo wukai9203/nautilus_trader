@@ -19,8 +19,9 @@
 //! instance directory for crashed predecessors before a fresh run opens, seals each
 //! survivor, opens the new run, blocks `start()` until the writer acknowledges the
 //! `RunStarted` entry, and seals the manifest with a final `RunEnded` entry on graceful
-//! stop. The writer's halt callback is wrapped in a typed [`HaltSignal`] that the kernel
-//! caller polls to convert a fail-stop into kernel shutdown rather than a panic.
+//! stop. The writer's halt callback is wrapped in a typed [`HaltSignal`] that records
+//! the first fail-stop reason for supervision; no runtime component polls it to stop
+//! the trader.
 
 use std::{
     any::Any,
@@ -29,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -54,6 +55,7 @@ use nautilus_system::{
     KernelEventStore as KernelEventStoreTrait, RegisteredComponents,
     event_store::{DataMarkerClass, DataMarkerConfig, EventStoreConfig, RetentionMode},
 };
+use parking_lot::Mutex;
 use ustr::Ustr;
 
 use crate::{
@@ -219,9 +221,10 @@ pub enum BootError {
 
 /// A thread-safe halt signal the kernel registers with the writer.
 ///
-/// The writer thread fires the callback once on the first unrecoverable condition;
-/// the kernel polls [`HaltSignal::is_halted`] and converts it into a typed kernel
-/// shutdown rather than letting the writer-thread error escape as a panic.
+/// Each fail-stop source fires the shared callback at most once: the submitting
+/// thread on a backpressure stall, the writer thread on a backend failure, and the
+/// capture adapter on a rejected submit. The signal records the first reason for
+/// supervision; no runtime component polls it to stop the trader.
 #[derive(Clone, Debug)]
 pub struct HaltSignal {
     halted: Arc<AtomicBool>,
@@ -248,21 +251,19 @@ impl HaltSignal {
     /// occurs.
     ///
     /// The callback records the [`HaltReason`] (preserving only the first one when
-    /// multiple submits race past the halt threshold) and then flips the halted flag,
-    /// so a poller that observes `is_halted()` never reads back an empty reason.
+    /// the writer and the capture adapter both signal) and then flips the halted
+    /// flag, so a poller that observes `is_halted()` never reads back an empty
+    /// reason.
     #[must_use]
     pub fn callback(&self) -> HaltCallback {
         let halted = Arc::clone(&self.halted);
         let reason = Arc::clone(&self.reason);
         Arc::new(move |r| {
-            // The mutex gates first-reason-wins; the flag flips after the reason is
-            // stored. On the (panic-only) poisoned path the reason is lost but the
-            // halt itself must still be observable.
-            if let Ok(mut slot) = reason.lock()
-                && slot.is_none()
-            {
+            let mut slot = reason.lock();
+            if slot.is_none() {
                 *slot = Some(r);
             }
+            drop(slot);
             halted.store(true, Ordering::Release);
         })
     }
@@ -279,7 +280,7 @@ impl HaltSignal {
     /// subsequent submits surface as fail-stopped.
     #[must_use]
     pub fn reason(&self) -> Option<HaltReason> {
-        self.reason.lock().ok().and_then(|guard| guard.clone())
+        self.reason.lock().clone()
     }
 }
 
@@ -838,6 +839,7 @@ pub fn recover_predecessors(
                 }
                 Err(
                     EventStoreError::HashMismatch { .. }
+                    | EventStoreError::SeqMismatch { .. }
                     | EventStoreError::Corrupted(_)
                     | EventStoreError::Gap { .. },
                 ) => RunStatus::Quarantined,
@@ -1199,10 +1201,10 @@ pub(crate) fn submit_run_started_blocking(
 }
 
 fn encode_run_started(components: &RegisteredComponents) -> Bytes {
-    // bincode keeps the payload compact and matches the manifest encoding the backend
-    // already uses; replay's RunStarted decoder pairs with this representation.
-    let bytes = bincode::serde::encode_to_vec(components, bincode::config::standard())
-        .expect("RegisteredComponents serializes via serde, must not fail under standard config");
+    // The payload uses the same positional codec as the event-store envelope.
+    let bytes = crate::codec::encode_to_vec(components).expect(
+        "RegisteredComponents serializes via serde, must not fail under the positional codec",
+    );
     Bytes::from(bytes)
 }
 
@@ -1520,36 +1522,16 @@ mod tests {
         registry
     }
 
-    fn wait_for_high_watermark(store: &EventStoreLifecycle, expected: u64) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-
-        loop {
-            let hwm = store
-                .session
-                .as_ref()
-                .map_or(0, EventStoreSession::high_watermark);
-
-            if hwm >= expected {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "event store high_watermark did not reach {expected} within deadline (hwm={hwm})",
-            );
-            thread::sleep(Duration::from_millis(2));
-        }
-    }
-
     #[derive(Debug, Clone)]
     struct SharedMemoryBackend(Arc<Mutex<MemoryBackend>>);
 
     impl EventStore for SharedMemoryBackend {
         fn open_run(&mut self, manifest: RunManifest) -> Result<(), EventStoreError> {
-            self.0.lock().expect("memory backend").open_run(manifest)
+            self.0.lock().open_run(manifest)
         }
 
         fn append_batch(&mut self, entries: &[AppendEntry]) -> Result<u64, EventStoreError> {
-            self.0.lock().expect("memory backend").append_batch(entries)
+            self.0.lock().append_batch(entries)
         }
 
         fn scan_range(
@@ -1558,51 +1540,42 @@ mod tests {
             to: u64,
             direction: ScanDirection,
         ) -> Result<Vec<EventStoreEntry>, EventStoreError> {
-            self.0
-                .lock()
-                .expect("memory backend")
-                .scan_range(from, to, direction)
+            self.0.lock().scan_range(from, to, direction)
         }
 
         fn scan_seq(&self, seq: u64) -> Result<Option<EventStoreEntry>, EventStoreError> {
-            self.0.lock().expect("memory backend").scan_seq(seq)
+            self.0.lock().scan_seq(seq)
         }
 
         fn lookup(&self, kind: IndexKind, key: &str) -> Result<Option<u64>, EventStoreError> {
-            self.0.lock().expect("memory backend").lookup(kind, key)
+            self.0.lock().lookup(kind, key)
         }
 
         fn iter_index_keys(&self, kind: IndexKind) -> Result<Vec<(String, u64)>, EventStoreError> {
-            self.0.lock().expect("memory backend").iter_index_keys(kind)
+            self.0.lock().iter_index_keys(kind)
         }
 
         fn record_snapshot_anchor(
             &mut self,
             anchor: SnapshotAnchor,
         ) -> Result<(), EventStoreError> {
-            self.0
-                .lock()
-                .expect("memory backend")
-                .record_snapshot_anchor(anchor)
+            self.0.lock().record_snapshot_anchor(anchor)
         }
 
         fn latest_snapshot_anchor(&self) -> Result<Option<SnapshotAnchor>, EventStoreError> {
-            self.0
-                .lock()
-                .expect("memory backend")
-                .latest_snapshot_anchor()
+            self.0.lock().latest_snapshot_anchor()
         }
 
         fn seal(&mut self, status: RunStatus) -> Result<(), EventStoreError> {
-            self.0.lock().expect("memory backend").seal(status)
+            self.0.lock().seal(status)
         }
 
         fn manifest(&self) -> Result<RunManifest, EventStoreError> {
-            self.0.lock().expect("memory backend").manifest()
+            self.0.lock().manifest()
         }
 
         fn high_watermark(&self) -> Result<u64, EventStoreError> {
-            self.0.lock().expect("memory backend").high_watermark()
+            self.0.lock().high_watermark()
         }
     }
 
@@ -1765,9 +1738,7 @@ mod tests {
 
         let topic: MStr<msgbus::Topic> = MStr::from("events.test.audit");
         msgbus::publish_any(topic, &TestAuditMessage { value: 42 });
-        wait_for_high_watermark(&store, 2);
-
-        drop(store);
+        store.seal(UnixNanos::from(0));
 
         let sealed = RedbBackend::open_sealed(tmp.path(), &instance_id.to_string(), &run_id)
             .expect("open sealed");
@@ -1791,10 +1762,7 @@ mod tests {
         let options = EventStoreLifecycleOptions::new()
             .with_encoder_registry(test_registry())
             .with_backend_opener(move |_, manifest| {
-                opener_memory
-                    .lock()
-                    .expect("memory backend")
-                    .open_run(manifest.clone())?;
+                opener_memory.lock().open_run(manifest.clone())?;
                 Ok(Box::new(SharedMemoryBackend(Arc::clone(&opener_memory))))
             });
 
@@ -1815,11 +1783,9 @@ mod tests {
 
         let topic: MStr<msgbus::Topic> = MStr::from("events.test.memory");
         msgbus::publish_any(topic, &TestAuditMessage { value: 7 });
-        wait_for_high_watermark(&store, 2);
-
         store.seal(UnixNanos::from(1_000));
 
-        let backend = memory.lock().expect("memory backend");
+        let backend = memory.lock();
         let manifest = backend.manifest().expect("manifest");
         let captured = backend
             .scan_seq(2)
@@ -1964,10 +1930,7 @@ mod tests {
         let options = EventStoreLifecycleOptions::new()
             .with_encoder_registry(test_registry())
             .with_backend_opener(move |_, manifest| {
-                opener_memory
-                    .lock()
-                    .expect("memory backend")
-                    .open_run(manifest.clone())?;
+                opener_memory.lock().open_run(manifest.clone())?;
                 Ok(Box::new(SharedMemoryBackend(Arc::clone(&opener_memory))))
             });
 
@@ -1999,7 +1962,7 @@ mod tests {
         get_atomic_clock_static().set_time(UnixNanos::from(40_000));
         store.seal(UnixNanos::from(40_000));
 
-        let backend = memory.lock().expect("memory backend");
+        let backend = memory.lock();
         let manifest = backend.manifest().expect("manifest");
         assert_eq!(manifest.seed, Some(seed));
         assert_eq!(manifest.status, RunStatus::Ended);
@@ -2189,6 +2152,81 @@ mod tests {
             .find(|m| m.run_id == run_id)
             .expect("manifest present");
         assert_eq!(manifest.status, RunStatus::Ended);
+    }
+
+    #[rstest]
+    fn recovery_quarantines_run_with_rows_swapped_between_keys() {
+        // A row moved under a different table key still hashes correctly; the sweep
+        // must quarantine rather than chain the next run through a tampered parent.
+        let tmp = TempDir::new().expect("tempdir");
+        let config = make_config(tmp.path().to_path_buf());
+        let run_id = "1700000000-swapped1";
+
+        let path = {
+            let mut backend = RedbBackend::new(config.base_dir.clone());
+            backend.open_run(manifest_for(run_id)).expect("open run");
+            backend
+                .append_batch(&[
+                    append_entry(
+                        1,
+                        "events.order.1",
+                        "OrderAccepted",
+                        Bytes::from_static(b"\x01"),
+                    ),
+                    append_entry(
+                        2,
+                        "events.order.2",
+                        "OrderFilled",
+                        Bytes::from_static(b"\x02"),
+                    ),
+                ])
+                .expect("append");
+            config
+                .base_dir
+                .join(INSTANCE_ID)
+                .join(format!("{run_id}.redb"))
+        };
+
+        {
+            let entries: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("entries");
+            let db = redb::Database::create(&path).expect("open redb");
+            let txn = db.begin_write().expect("begin write");
+            {
+                let mut table = txn.open_table(entries).expect("open table");
+                let bytes_1 = table
+                    .remove(1_u64)
+                    .expect("remove seq 1")
+                    .expect("seq 1 present")
+                    .value()
+                    .to_vec();
+                let bytes_2 = table
+                    .remove(2_u64)
+                    .expect("remove seq 2")
+                    .expect("seq 2 present")
+                    .value()
+                    .to_vec();
+                table
+                    .insert(1_u64, bytes_2.as_slice())
+                    .expect("insert under key 1");
+                table
+                    .insert(2_u64, bytes_1.as_slice())
+                    .expect("insert under key 2");
+            }
+            txn.commit().expect("commit swap");
+        }
+
+        let outcome = recover_predecessors(&config.base_dir, INSTANCE_ID).expect("recover sweep");
+
+        assert_eq!(outcome.recovered.len(), 1);
+        assert_eq!(outcome.recovered[0].run_id, run_id);
+        assert_eq!(outcome.recovered[0].status, RunStatus::Quarantined);
+        assert!(
+            outcome.parent_run_id.is_none(),
+            "quarantined runs must not become parents",
+        );
+
+        let manifests = RedbBackend::list_runs(&config.base_dir, INSTANCE_ID).expect("list");
+        assert_eq!(manifests[0].status, RunStatus::Quarantined);
     }
 
     #[rstest]
@@ -2537,6 +2575,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(madsim))]
     #[rstest]
     fn submit_run_started_returns_timeout_when_writer_stalls() {
         // A backend whose append_batch never returns simulates a stuck writer. The
@@ -2577,6 +2616,7 @@ mod tests {
         stub.release();
     }
 
+    #[cfg(not(madsim))]
     #[rstest]
     fn submit_run_started_returns_halted_when_writer_halts_during_wait() {
         // A halt signal fired before the writer can commit must surface
@@ -2646,37 +2686,41 @@ mod tests {
     /// Stub backend whose `append_batch` blocks until `release()` is called. Used to
     /// hold the writer's high-watermark at zero so the boot path's wait loop can
     /// exercise its timeout and halt branches deterministically.
+    #[cfg(not(madsim))]
     #[derive(Debug, Default, Clone)]
     struct StallBackend {
         inner: Arc<Mutex<StallInner>>,
-        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        gate: Arc<(Mutex<bool>, parking_lot::Condvar)>,
     }
 
+    #[cfg(not(madsim))]
     #[derive(Debug, Default)]
     struct StallInner {
         manifest: Option<RunManifest>,
     }
 
+    #[cfg(not(madsim))]
     impl StallBackend {
         fn release(&self) {
             let (lock, cvar) = &*self.gate;
-            *lock.lock().expect("gate") = true;
+            *lock.lock() = true;
             cvar.notify_all();
         }
     }
 
+    #[cfg(not(madsim))]
     impl crate::EventStore for StallBackend {
         fn open_run(&mut self, manifest: RunManifest) -> Result<(), EventStoreError> {
-            self.inner.lock().expect("inner").manifest = Some(manifest);
+            self.inner.lock().manifest = Some(manifest);
             Ok(())
         }
 
         fn append_batch(&mut self, _: &[crate::AppendEntry]) -> Result<u64, EventStoreError> {
             let (lock, cvar) = &*self.gate;
-            let mut released = lock.lock().expect("gate");
+            let mut released = lock.lock();
 
             while !*released {
-                released = cvar.wait(released).expect("gate wait");
+                cvar.wait(&mut released);
             }
             Ok(0)
         }
@@ -2712,7 +2756,6 @@ mod tests {
         fn manifest(&self) -> Result<RunManifest, EventStoreError> {
             self.inner
                 .lock()
-                .expect("inner")
                 .manifest
                 .clone()
                 .ok_or_else(|| EventStoreError::Backend("no manifest".to_string()))
@@ -2776,28 +2819,7 @@ mod tests {
         let endpoint = MStr::<Endpoint>::from("test.exec.engine.process");
         msgbus::send_any_value(endpoint, &submit_order);
 
-        // RunStarted is seq=1; the captured SubmitOrder lands at seq=2 once the
-        // writer commits.
-        let deadline = Instant::now() + Duration::from_secs(2);
-
-        loop {
-            let hwm = store
-                .session
-                .as_ref()
-                .map_or(0, EventStoreSession::high_watermark);
-
-            if hwm >= 2 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "captured SubmitOrder did not commit within deadline (hwm={hwm})",
-            );
-            thread::sleep(Duration::from_millis(2));
-        }
-
-        // Seal cleanly so we can re-open the run read-only
-        drop(store);
+        store.seal(UnixNanos::from(0));
 
         let sealed = RedbBackend::open_sealed(tmp.path(), &instance_id.to_string(), &run_id)
             .expect("open sealed");
@@ -2851,7 +2873,6 @@ mod tests {
 
         let second = make_submit_order(ClientOrderId::from("O-marker-2"));
         msgbus::send_any_value(MStr::<Endpoint>::from("test.exec.process"), &second);
-        wait_for_high_watermark(&store, 3);
         store.seal(UnixNanos::from(500));
 
         let marker_path = tmp
@@ -2939,10 +2960,7 @@ mod tests {
         let options = EventStoreLifecycleOptions::new()
             .with_encoder_registry(test_registry())
             .with_backend_opener(move |_, manifest| {
-                opener_memory
-                    .lock()
-                    .expect("memory backend")
-                    .open_run(manifest.clone())?;
+                opener_memory.lock().open_run(manifest.clone())?;
                 Ok(Box::new(SharedMemoryBackend(Arc::clone(&opener_memory))))
             });
 
@@ -2972,21 +2990,11 @@ mod tests {
                 UnixNanos::from(5_001),
             )
             .expect("capture");
-        let deadline = Instant::now() + Duration::from_secs(2);
-
-        while session.high_watermark() < 2 {
-            assert!(
-                Instant::now() < deadline,
-                "event-store high_watermark {} did not reach 2 within deadline",
-                session.high_watermark(),
-            );
-            thread::sleep(Duration::from_millis(2));
-        }
         session
             .close(UnixNanos::from(6_000))
             .expect("close session");
 
-        let backend = memory.lock().expect("memory backend");
+        let backend = memory.lock();
         let captured = backend
             .scan_seq(2)
             .expect("scan")
@@ -3013,10 +3021,7 @@ mod tests {
         });
         let options =
             EventStoreLifecycleOptions::new().with_marker_registry_factory(move |classes| {
-                seen_for_factory
-                    .lock()
-                    .expect("seen classes")
-                    .push(classes.to_vec());
+                seen_for_factory.lock().push(classes.to_vec());
                 DataMarkerExtractorRegistry::default_registry(classes)
             });
 
@@ -3032,7 +3037,7 @@ mod tests {
             .expect("open run");
         store.seal(UnixNanos::from(1_000));
 
-        let seen = seen_classes.lock().expect("seen classes");
+        let seen = seen_classes.lock();
         assert_eq!(seen.as_slice(), &[vec![DataClass::Trade, DataClass::Quote]]);
     }
 
@@ -3110,25 +3115,7 @@ mod tests {
         let callback = TimeEventCallback::from(|_: TimeEvent| {});
         TimeEventHandler::new(event, callback).run();
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-
-        loop {
-            let hwm = store
-                .session
-                .as_ref()
-                .map_or(0, EventStoreSession::high_watermark);
-
-            if hwm >= 2 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "captured TimeEvent did not commit within deadline (hwm={hwm})",
-            );
-            thread::sleep(Duration::from_millis(2));
-        }
-
-        drop(store);
+        store.seal(UnixNanos::from(0));
 
         let sealed = RedbBackend::open_sealed(tmp.path(), &instance_id.to_string(), &run_id)
             .expect("open sealed");
@@ -3240,25 +3227,7 @@ mod tests {
         let endpoint = MStr::<Endpoint>::from("test.exec.engine.envelope");
         msgbus::send_trading_command(endpoint, command);
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-
-        loop {
-            let hwm = store
-                .session
-                .as_ref()
-                .map_or(0, EventStoreSession::high_watermark);
-
-            if hwm >= 2 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "captured TradingCommand did not commit within deadline (hwm={hwm})",
-            );
-            thread::sleep(Duration::from_millis(2));
-        }
-
-        drop(store);
+        store.seal(UnixNanos::from(0));
 
         let sealed = RedbBackend::open_sealed(tmp.path(), &instance_id.to_string(), &run_id)
             .expect("open sealed");
@@ -3327,30 +3296,12 @@ mod tests {
             .ts_init(UnixNanos::from(11))
             .commission(Money::new(0.10, Currency::USDT()))
             .build();
-        let event = OrderEventAny::Filled(filled);
+        let event = OrderEventAny::Filled(filled.clone());
 
         let topic: MStr<msgbus::Topic> = MStr::from("events.order.ETHUSDT-PERP.BINANCE");
         msgbus::publish_order_event(topic, &event);
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-
-        loop {
-            let hwm = store
-                .session
-                .as_ref()
-                .map_or(0, EventStoreSession::high_watermark);
-
-            if hwm >= 2 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "captured OrderEventAny did not commit within deadline (hwm={hwm})",
-            );
-            thread::sleep(Duration::from_millis(2));
-        }
-
-        drop(store);
+        store.seal(UnixNanos::from(0));
 
         let sealed = RedbBackend::open_sealed(tmp.path(), &instance_id.to_string(), &run_id)
             .expect("open sealed");
@@ -3438,25 +3389,7 @@ mod tests {
             DataCommand::Subscribe(subscribe.clone()),
         );
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-
-        loop {
-            let hwm = store
-                .session
-                .as_ref()
-                .map_or(0, EventStoreSession::high_watermark);
-
-            if hwm >= 3 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "captured DataCommand entries did not commit within deadline (hwm={hwm})",
-            );
-            thread::sleep(Duration::from_millis(2));
-        }
-
-        drop(store);
+        store.seal(UnixNanos::from(0));
 
         let sealed = RedbBackend::open_sealed(tmp.path(), &instance_id.to_string(), &run_id)
             .expect("open sealed");
@@ -3550,26 +3483,8 @@ mod tests {
         );
         msgbus::send_response(&correlation_id, &DataResponse::Quotes(response.clone()));
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-
-        loop {
-            let hwm = store
-                .session
-                .as_ref()
-                .map_or(0, EventStoreSession::high_watermark);
-
-            if hwm >= 2 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "captured DataResponse did not commit within deadline (hwm={hwm})",
-            );
-            thread::sleep(Duration::from_millis(2));
-        }
-
         assert!(*handler_called.borrow());
-        drop(store);
+        store.seal(UnixNanos::from(0));
 
         let sealed = RedbBackend::open_sealed(tmp.path(), &instance_id.to_string(), &run_id)
             .expect("open sealed");

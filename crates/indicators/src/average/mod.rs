@@ -25,6 +25,7 @@ pub mod sma;
 pub mod vidya;
 pub mod vwap;
 pub mod wma;
+pub mod zscore;
 
 use nautilus_model::enums::PriceType;
 use strum::{AsRefStr, Display, EnumIter, EnumString, FromRepr};
@@ -62,7 +63,7 @@ use crate::{
         eq,
         eq_int,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.indicators",
+        module = "nautilus_trader.indicators",
         from_py_object,
     )
 )]

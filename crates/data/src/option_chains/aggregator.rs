@@ -15,9 +15,12 @@
 
 //! Per-series option chain aggregator for event accumulation and snapshots.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap, HashSet},
+};
 
-use nautilus_core::UnixNanos;
+use nautilus_core::{DurationNanos, UnixNanos};
 use nautilus_model::{
     data::{
         QuoteTick,
@@ -27,10 +30,11 @@ use nautilus_model::{
     identifiers::{InstrumentId, OptionSeriesId},
     types::Price,
 };
+use rust_decimal::prelude::ToPrimitive;
 
 use super::{
     AtmTracker,
-    constants::{DEFAULT_REBALANCE_COOLDOWN_NS, DEFAULT_REBALANCE_HYSTERESIS},
+    constants::{DEFAULT_REBALANCE_COOLDOWN, DEFAULT_REBALANCE_HYSTERESIS},
 };
 
 /// Per-series aggregator that accumulates quotes and greeks between snapshots.
@@ -55,7 +59,7 @@ pub struct OptionChainAggregator {
     /// Hysteresis band for ATM rebalancing.
     hysteresis: f64,
     /// Minimum nanoseconds between rebalances.
-    cooldown_ns: u64,
+    cooldown_ns: DurationNanos,
     /// Timestamp of the last rebalance.
     last_rebalance_ns: Option<UnixNanos>,
     /// Maximum `ts_event` seen across all quote updates.
@@ -89,7 +93,7 @@ impl OptionChainAggregator {
             active_ids: HashSet::new(),
             last_atm_strike: None,
             hysteresis: DEFAULT_REBALANCE_HYSTERESIS,
-            cooldown_ns: DEFAULT_REBALANCE_COOLDOWN_NS,
+            cooldown_ns: DEFAULT_REBALANCE_COOLDOWN,
             last_rebalance_ns: None,
             max_ts_event: UnixNanos::default(),
             pending_greeks: HashMap::new(),
@@ -385,11 +389,7 @@ impl OptionChainAggregator {
     fn find_closest_strike(all_strikes: &[Price], atm: Price) -> Option<Price> {
         all_strikes
             .iter()
-            .min_by(|a, b| {
-                let da = (a.as_f64() - atm.as_f64()).abs();
-                let db = (b.as_f64() - atm.as_f64()).abs();
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .min_by_key(|strike| strike.raw.abs_diff(atm.raw))
             .copied()
     }
 
@@ -570,26 +570,18 @@ impl OptionChainAggregator {
             if let Some(last_strike) = self.last_atm_strike
                 && self.hysteresis > 0.0
             {
-                let last_f = last_strike.as_f64();
-                let atm_f = atm_price.as_f64();
-                let direction = atm_f - last_f;
-
                 // Find the next strike in the direction of price movement
-                let next_strike = if direction > 0.0 {
-                    all_strikes.iter().find(|s| s.as_f64() > last_f)
-                } else {
-                    all_strikes.iter().rev().find(|s| s.as_f64() < last_f)
+                let next_strike = match atm_price.cmp(&last_strike) {
+                    Ordering::Greater => all_strikes.iter().find(|s| **s > last_strike),
+                    Ordering::Less => all_strikes.iter().rev().find(|s| **s < last_strike),
+                    Ordering::Equal => None,
                 };
 
                 if let Some(next) = next_strike {
-                    let gap = (next.as_f64() - last_f).abs();
-                    let threshold = last_f + direction.signum() * self.hysteresis * gap;
-                    // Check if price has not crossed the threshold
-                    if direction > 0.0 && atm_f < threshold {
-                        return None;
-                    }
-
-                    if direction < 0.0 && atm_f > threshold {
+                    let progress = (atm_price.as_decimal() - last_strike.as_decimal()).abs();
+                    let gap = (next.as_decimal() - last_strike.as_decimal()).abs();
+                    let progress_ratio = (progress / gap).to_f64().unwrap_or(f64::MAX);
+                    if progress_ratio < self.hysteresis {
                         return None;
                     }
                 }
@@ -597,9 +589,9 @@ impl OptionChainAggregator {
         }
 
         // Cooldown check
-        if self.cooldown_ns > 0
+        if !self.cooldown_ns.is_zero()
             && let Some(last_ts) = self.last_rebalance_ns
-            && now_ns.as_u64().saturating_sub(last_ts.as_u64()) < self.cooldown_ns
+            && now_ns.saturating_duration_since(last_ts) < self.cooldown_ns
         {
             return None;
         }
@@ -693,7 +685,7 @@ impl OptionChainAggregator {
         self.hysteresis = h;
     }
 
-    fn set_cooldown_ns(&mut self, ns: u64) {
+    fn set_cooldown_ns(&mut self, ns: DurationNanos) {
         self.cooldown_ns = ns;
     }
 
@@ -763,6 +755,18 @@ mod tests {
         );
 
         (agg, call_id, put_id)
+    }
+
+    #[rstest]
+    fn test_find_closest_strike_prefers_exact_high_value_match() {
+        let collapsed = Price::from("9007199253.999000000");
+        let atm = Price::from("9007199253.999000001");
+        let strikes = [collapsed, atm];
+        assert_eq!(collapsed.as_f64(), atm.as_f64());
+
+        let result = OptionChainAggregator::find_closest_strike(&strikes, atm);
+
+        assert_eq!(result, Some(atm));
     }
 
     #[rstest]
@@ -871,7 +875,7 @@ mod tests {
         );
         // Disable guards so existing tests exercise pure rebalance logic
         agg.set_hysteresis(0.0);
-        agg.set_cooldown_ns(0);
+        agg.set_cooldown_ns(DurationNanos::default());
         agg
     }
 
@@ -1078,7 +1082,7 @@ mod tests {
             instruments,
         );
         agg.set_hysteresis(0.6);
-        agg.set_cooldown_ns(0);
+        agg.set_cooldown_ns(DurationNanos::default());
 
         // Set ATM to 50000
         set_atm_via_greeks(&mut agg, 50000.0);
@@ -1113,7 +1117,7 @@ mod tests {
             instruments,
         );
         agg.set_hysteresis(0.6);
-        agg.set_cooldown_ns(0);
+        agg.set_cooldown_ns(DurationNanos::default());
 
         // Set ATM to 50000
         set_atm_via_greeks(&mut agg, 50000.0);
@@ -1126,10 +1130,46 @@ mod tests {
     }
 
     #[rstest]
+    fn test_hysteresis_exact_strike_gap_boundary() {
+        let lower = Price::from("9007199253.999000000");
+        let upper = Price::from("9007199253.999002800");
+        let blocked = Price::from("9007199253.999001673");
+        let allowed = Price::from("9007199253.999001680");
+        let mut instruments = HashMap::new();
+        instruments.insert(
+            InstrumentId::from("BTC-LOW-C.DERIBIT"),
+            (lower, OptionKind::Call),
+        );
+        instruments.insert(
+            InstrumentId::from("BTC-HIGH-C.DERIBIT"),
+            (upper, OptionKind::Call),
+        );
+        let mut tracker = AtmTracker::new();
+        tracker.set_initial_price(lower);
+        let mut agg = OptionChainAggregator::new(
+            make_series_id(),
+            StrikeRange::AtmRelative {
+                strikes_above: 0,
+                strikes_below: 0,
+            },
+            tracker,
+            instruments,
+        );
+        agg.set_hysteresis(0.6);
+        agg.set_cooldown_ns(DurationNanos::default());
+
+        agg.atm_tracker_mut().set_initial_price(blocked);
+        assert!(agg.check_rebalance(now()).is_none());
+
+        agg.atm_tracker_mut().set_initial_price(allowed);
+        assert!(agg.check_rebalance(now()).is_some());
+    }
+
+    #[rstest]
     fn test_zero_hysteresis_disables_guard() {
         let mut agg = make_multi_strike_aggregator();
         agg.set_hysteresis(0.0);
-        agg.set_cooldown_ns(0);
+        agg.set_cooldown_ns(DurationNanos::default());
 
         set_atm_via_greeks(&mut agg, 50000.0);
         let action = agg.check_rebalance(now()).unwrap();
@@ -1146,7 +1186,7 @@ mod tests {
     fn test_cooldown_blocks_rapid_rebalance() {
         let mut agg = make_multi_strike_aggregator();
         agg.set_hysteresis(0.0);
-        agg.set_cooldown_ns(5_000_000_000); // 5s
+        agg.set_cooldown_ns(DurationNanos::from_secs(5));
 
         set_atm_via_greeks(&mut agg, 50000.0);
         let t0 = now();
@@ -1163,7 +1203,7 @@ mod tests {
     fn test_cooldown_allows_after_elapsed() {
         let mut agg = make_multi_strike_aggregator();
         agg.set_hysteresis(0.0);
-        agg.set_cooldown_ns(5_000_000_000); // 5s
+        agg.set_cooldown_ns(DurationNanos::from_secs(5));
 
         set_atm_via_greeks(&mut agg, 50000.0);
         let t0 = now();
@@ -1180,7 +1220,7 @@ mod tests {
     fn test_zero_cooldown_disables_guard() {
         let mut agg = make_multi_strike_aggregator();
         agg.set_hysteresis(0.0);
-        agg.set_cooldown_ns(0);
+        agg.set_cooldown_ns(DurationNanos::default());
 
         set_atm_via_greeks(&mut agg, 50000.0);
         let t0 = now();
@@ -1285,7 +1325,7 @@ mod tests {
             instruments,
         );
         agg.set_hysteresis(0.6);
-        agg.set_cooldown_ns(0);
+        agg.set_cooldown_ns(DurationNanos::default());
 
         // Set ATM to 50000, rebalance -> active: {47500, 50000, 52500}
         set_atm_via_greeks(&mut agg, 50000.0);
@@ -1471,7 +1511,7 @@ mod tests {
             instruments,
         );
         agg.set_hysteresis(0.0);
-        agg.set_cooldown_ns(0);
+        agg.set_cooldown_ns(DurationNanos::default());
         agg
     }
 

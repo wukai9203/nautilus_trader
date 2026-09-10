@@ -28,7 +28,7 @@
 //!   protection. Each transaction requires a unique, incrementing sequence number.
 //! - **Short-term orders**: Use Good-Til-Block (GTB) for replay protection. The chain's
 //!   `ClobDecorator` ante handler skips sequence checking, so sequences are not consumed.
-//!   Use [`TransactionManager::get_cached_sequence`] for these — it returns the current value
+//!   Use [`TransactionManager::get_cached_sequence`] for these: it returns the current value
 //!   without incrementing.
 //!
 //! For stateful orders, this module provides:
@@ -39,11 +39,12 @@
 //!    broadcasts
 
 use std::sync::{
-    Arc, RwLock,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
 
 use cosmrs::Any;
+use parking_lot::RwLock;
 
 use super::{types::PreparedTransaction, wallet::Wallet};
 use crate::{
@@ -157,14 +158,10 @@ impl TransactionManager {
     /// - Using permissioned key but no authenticators found for main account
     /// - No authenticator matches the wallet's public key
     /// - gRPC query fails
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     pub async fn resolve_authenticators(&self) -> Result<(), DydxError> {
         // Check if we already have authenticator IDs configured
         {
-            let ids = self.authenticator_ids.read().expect("RwLock poisoned");
+            let ids = self.authenticator_ids.read();
             if !ids.is_empty() {
                 log::debug!("Using pre-configured authenticator IDs: {:?}", *ids);
                 return Ok(());
@@ -188,7 +185,7 @@ impl TransactionManager {
             return Ok(());
         }
 
-        log::info!(
+        log::debug!(
             "Detected permissioned key setup: signing with {} for main account {}",
             signing_address,
             self.wallet_address
@@ -231,7 +228,7 @@ impl TransactionManager {
         for auth in &authenticators {
             if Self::authenticator_matches_pubkey(auth, &signing_pubkey_b64) {
                 matching_ids.push(auth.id);
-                log::info!("Found matching authenticator: id={}", auth.id);
+                log::debug!("Found matching authenticator: id={}", auth.id);
             }
         }
 
@@ -247,10 +244,10 @@ impl TransactionManager {
 
         // Store the resolved authenticator IDs
         {
-            let mut ids = self.authenticator_ids.write().expect("RwLock poisoned");
+            let mut ids = self.authenticator_ids.write();
             *ids = matching_ids.clone();
         }
-        log::info!("Resolved authenticator IDs: {matching_ids:?}");
+        log::debug!("Resolved authenticator IDs: {matching_ids:?}");
 
         Ok(())
     }
@@ -435,7 +432,7 @@ impl TransactionManager {
 
         let chain_seq = base_account.sequence;
         self.sequence_number.store(chain_seq, Ordering::SeqCst);
-        log::info!("Resynced sequence from chain: {chain_seq}");
+        log::debug!("Resynced sequence from chain: {chain_seq}");
         Ok(())
     }
 
@@ -474,10 +471,6 @@ impl TransactionManager {
     /// # Errors
     ///
     /// Returns error if account lookup fails or transaction building fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     pub async fn build_transaction(
         &self,
         msgs: Vec<Any>,
@@ -492,7 +485,7 @@ impl TransactionManager {
 
         // Read authenticator IDs (resolved during connect if using permissioned keys)
         let auth_ids_snapshot: Vec<u64> = {
-            let ids = self.authenticator_ids.read().expect("RwLock poisoned");
+            let ids = self.authenticator_ids.read();
             ids.clone()
         };
 

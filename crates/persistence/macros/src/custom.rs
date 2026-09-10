@@ -207,6 +207,11 @@ fn use_string_extract(ty: &Type, json: bool) -> bool {
     }
 }
 
+/// Returns true if the field uses binary extraction (`Binary` or `BinaryView`).
+fn use_binary_extract(ty: &Type) -> bool {
+    type_for_macro(ty).is_some_and(|(outer, inner)| outer == "Vec" && inner == "u8")
+}
+
 /// Arrow `DataType` and array type for encoding/decoding. Emits token streams that reference
 /// `arrow::datatypes::DataType` and arrow array types.
 fn arrow_type_for_rust_type(
@@ -387,7 +392,7 @@ fn decode_field_rhs(
     }
 }
 
-/// Builder type and initialisation for a field, such as `StringBuilder::new()` or
+/// Builder type and initialization for a field, such as `StringBuilder::new()` or
 /// `Float64Array::builder(len)`.
 fn encode_builder_for_field(ty: &Type, json: bool, len_var: &syn::Ident) -> Option<TokenStream> {
     if json {
@@ -452,7 +457,7 @@ fn py_field_init(ident: &syn::Ident, ty: &Type, json: bool) -> Option<TokenStrea
 
     if json {
         if let Some(map_kind) = typed_json_map_kind(ty) {
-            let helper = if map_kind == "IndexMap" {
+            let converter = if map_kind == "IndexMap" {
                 quote! { indexmap_from_pyobject_pyo3 }
             } else {
                 quote! { hashmap_from_pyobject_pyo3 }
@@ -460,7 +465,7 @@ fn py_field_init(ident: &syn::Ident, ty: &Type, json: bool) -> Option<TokenStrea
             return Some(quote! {
                 pyo3::Python::attach(|py| -> pyo3::PyResult<#ty> {
                     let value = #name.bind(py);
-                    nautilus_core::python::serialization::#helper::<_, _>(py, value)
+                    nautilus_core::python::serialization::#converter::<_, _>(py, value)
                         .map_err(|e| nautilus_core::python::to_pyvalue_err(format!("failed to deserialize JSON field '{}': {e}", stringify!(#name))))
                 })?
             });
@@ -515,14 +520,14 @@ fn py_getter_body(ident: &syn::Ident, ty: &Type, json: bool) -> Option<TokenStre
 
     if json {
         if let Some(map_kind) = typed_json_map_kind(ty) {
-            let helper = if map_kind == "IndexMap" {
+            let converter = if map_kind == "IndexMap" {
                 quote! { indexmap_to_pydict_pyo3 }
             } else {
                 quote! { hashmap_to_pydict_pyo3 }
             };
             return Some(quote! {
                 pyo3::Python::attach(|py| {
-                    nautilus_core::python::serialization::#helper(py, &self.#name)
+                    nautilus_core::python::serialization::#converter(py, &self.#name)
                         .map_err(|e| nautilus_core::python::to_pyvalue_err(format!("failed to serialize JSON field '{}': {e}", stringify!(#name))))
                 })
             });
@@ -1075,6 +1080,14 @@ fn gen_decode_batch_impl(ctx: &ExpansionContext<'_>) -> TokenStream {
             if use_string_extract(ty, f.options.serde) {
                 quote! {
                     let #col_name = nautilus_serialization::arrow::extract_column_string(
+                        record_batch.columns(),
+                        #fn_str,
+                        #idx,
+                    )?;
+                }
+            } else if use_binary_extract(ty) {
+                quote! {
+                    let #col_name = nautilus_serialization::arrow::extract_column_binary(
                         record_batch.columns(),
                         #fn_str,
                         #idx,

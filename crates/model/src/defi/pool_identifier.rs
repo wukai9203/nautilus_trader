@@ -32,6 +32,14 @@ use ustr::Ustr;
 ///
 /// The type implements case-insensitive equality and hashing for address comparison,
 /// while preserving the original case for display purposes.
+///
+/// DeFi pool data carries both this `PoolIdentifier` and an `InstrumentId`, which key different
+/// layers. The chain and database layers key on the `PoolIdentifier`: the raw on-chain identity
+/// used for log filters and table lookups. The engine, message bus, and cache key on the
+/// `InstrumentId` (`Symbol(pool_identifier)` at `Venue(chain:dex)`), so pool events flow through
+/// the same instrument-keyed infrastructure as any other data. The `InstrumentId` flattens the
+/// identifier to a string and loses the `Address` versus `PoolId` variant, so it cannot
+/// reconstruct this type: both are stored rather than derived.
 #[derive(Clone, Copy, PartialOrd, Ord)]
 pub enum PoolIdentifier {
     /// V2/V3 pool identifier (checksummed Ethereum address)
@@ -197,7 +205,7 @@ impl PoolIdentifier {
     pub fn to_pool_id_bytes(&self) -> anyhow::Result<[u8; 32]> {
         match self {
             Self::PoolId(s) => {
-                let hex_str = s.as_str().strip_prefix("0x").unwrap_or(s.as_str());
+                let hex_str = s.strip_prefix("0x").unwrap_or(s.as_str());
                 hex::decode_array::<32>(hex_str)
                     .map_err(|e| anyhow::anyhow!("Failed to decode pool ID hex: {e}"))
             }
@@ -220,7 +228,7 @@ impl PartialEq for PoolIdentifier {
         match (self, other) {
             (Self::Address(a), Self::Address(b)) | (Self::PoolId(a), Self::PoolId(b)) => {
                 // Case-insensitive comparison
-                a.as_str().eq_ignore_ascii_case(b.as_str())
+                a.eq_ignore_ascii_case(b)
             }
             // Different variants are never equal
             _ => false,
@@ -238,7 +246,7 @@ impl Hash for PoolIdentifier {
         // Then hash the lowercase version of the string
         match self {
             Self::Address(s) | Self::PoolId(s) => {
-                for byte in s.as_str().bytes() {
+                for byte in s.bytes() {
                     state.write_u8(byte.to_ascii_lowercase());
                 }
             }

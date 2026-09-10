@@ -1,6 +1,5 @@
 [package]
 name = "nautilus-live"
-readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,6 +21,7 @@ crate-type = ["rlib"]
 
 [features]
 default = ["node", "plugin"]
+fuzz = ["dep:libfuzzer-sys"]
 node = [
   "dep:nautilus-data",
   "dep:nautilus-portfolio",
@@ -29,7 +29,7 @@ node = [
   "dep:nautilus-system",
   "dep:nautilus-trading",
 ]
-plugin = ["node", "dep:aws-lc-rs", "dep:nautilus-plugin"]
+plugin = ["node"]
 examples = ["node", "dep:nautilus-testkit", "nautilus-trading/examples"]
 streaming = ["node", "nautilus-persistence", "nautilus-system/streaming"]
 extension-module = [
@@ -41,7 +41,6 @@ extension-module = [
   "pyo3/extension-module",
   "streaming",
 ]
-ffi = ["nautilus-common/ffi", "nautilus-core/ffi", "nautilus-model/ffi"]
 python = [
   "node",
   "nautilus-common/python",
@@ -68,6 +67,12 @@ simulation = [
   "nautilus-common/simulation",
   "nautilus-execution/simulation",
 ]
+test-support = [
+  "dep:nautilus-portfolio",
+  "dep:nautilus-risk",
+  "dep:nautilus-testkit",
+  "dep:nautilus-trading",
+]
 
 [package.metadata.cargo-machete]
 ignored = [
@@ -75,46 +80,61 @@ ignored = [
 ] # Optional dep activated only via the streaming feature
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["defi", "examples", "node", "plugin", "simulation", "streaming"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 nautilus-common = { workspace = true, features = ["live"] }
 nautilus-core = { workspace = true }
 nautilus-execution = { workspace = true }
-nautilus-model = { workspace = true, features = ["stubs"] }
+nautilus-model = { workspace = true }
+nautilus-network = { workspace = true }
 
 nautilus-data = { workspace = true, optional = true }
 nautilus-persistence = { workspace = true, optional = true }
-nautilus-plugin = { workspace = true, features = ["host"], optional = true }
 nautilus-portfolio = { workspace = true, optional = true }
 nautilus-risk = { workspace = true, optional = true }
 nautilus-system = { workspace = true, features = ["live"], optional = true }
-nautilus-testkit = { workspace = true, optional = true }
+nautilus-testkit = { workspace = true, default-features = false, features = [
+  "testers",
+], optional = true }
 nautilus-trading = { workspace = true, optional = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
-aws-lc-rs = { workspace = true, optional = true }
 bon = { workspace = true }
+futures-util = { workspace = true }
 indexmap = { workspace = true }
+libfuzzer-sys = { workspace = true, optional = true }
 log = { workspace = true }
+parking_lot = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tabled = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 ustr = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-model = { workspace = true, features = ["test-support"] }
+nautilus-testkit = { workspace = true, default-features = false, features = [
+  "testers",
+] }
+
+bytes = { workspace = true }
 criterion = { workspace = true }
 madsim = { workspace = true }
+proptest = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 toml = { workspace = true }
 ustr = { workspace = true }
 
@@ -123,27 +143,13 @@ ustr = { workspace = true }
 name = "runner"
 harness = false
 
-[[test]]
-name = "manager"
-path = "tests/manager.rs"
+# Run with `cargo bench -p nautilus-live --bench queue_monitor`
+[[bench]]
+name = "queue_monitor"
+harness = false
 required-features = ["node"]
 
 [[test]]
-name = "plugin"
-path = "tests/plugin.rs"
-required-features = ["plugin"]
-
-[[test]]
-name = "plugin_dispatch"
-path = "tests/plugin_dispatch.rs"
-required-features = ["plugin"]
-
-[[test]]
-name = "node"
-path = "tests/node.rs"
-required-features = ["node"]
-
-[[test]]
-name = "stress"
-path = "tests/stress.rs"
+name = "integration"
+path = "tests/integration/main.rs"
 required-features = ["node"]

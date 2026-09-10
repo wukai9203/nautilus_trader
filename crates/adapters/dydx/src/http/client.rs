@@ -13,8 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Provides an ergonomic wrapper around the **dYdX v4 Indexer REST API** –
-//! <https://docs.dydx.xyz/api_integration-indexer/indexer_api>.
+//! Provides an ergonomic wrapper around the **dYdX v4 Indexer REST API**:
+//! <https://docs.dydx.xyz/indexer-client/http>.
 //!
 //! This module exports two complementary HTTP clients following the standardized
 //! two-layer architecture pattern established in OKX, Bybit, and BitMEX adapters:
@@ -46,19 +46,20 @@
 //!
 //! | Endpoint          | Reference                                                                 |
 //! |-------------------|---------------------------------------------------------------------------|
-//! | Market data       | <https://docs.dydx.xyz/api_integration-indexer/indexer_api#markets>  |
-//! | Account data      | <https://docs.dydx.xyz/api_integration-indexer/indexer_api#accounts> |
-//! | Utility endpoints | <https://docs.dydx.xyz/api_integration-indexer/indexer_api#utility>  |
+//! | Market data       | <https://docs.dydx.xyz/indexer-client/http/markets>  |
+//! | Account data      | <https://docs.dydx.xyz/indexer-client/http/accounts> |
+//! | Utility endpoints | <https://docs.dydx.xyz/indexer-client/http>  |
 
 use std::{
     collections::HashMap,
     fmt::Debug,
     num::NonZeroU32,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock},
 };
 
 use ahash::AHashMap;
-use chrono::{DateTime, Utc};
+use jiff::{Timestamp, tz::Offset};
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
     UnixNanos,
     consts::NAUTILUS_USER_AGENT,
@@ -82,8 +83,9 @@ use nautilus_model::{
 use nautilus_network::{
     http::{HttpClient, Method, USER_AGENT},
     ratelimiter::{RateLimiter, clock::MonotonicClock, quota::Quota},
-    retry::{RetryConfig, RetryManager},
+    retry::{RetryConfig, RetryError, RetryManager},
 };
+use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_util::sync::CancellationToken;
@@ -155,7 +157,6 @@ fn rate_limit_keys() -> Vec<Ustr> {
 fn rest_rate_limiter(base_url: &str) -> DydxRestRateLimiter {
     DYDX_REST_RATE_LIMITERS
         .lock()
-        .expect("dYdX REST rate limiter registry mutex poisoned")
         .entry(base_url.to_string())
         .or_insert_with(|| Arc::new(RateLimiter::new_with_quota(Some(*DYDX_REST_QUOTA), vec![])))
         .clone()
@@ -171,7 +172,7 @@ pub struct DydxResponse<T> {
     pub data: T,
 }
 
-/// Provides a raw HTTP client for interacting with the [dYdX v4](https://dydx.exchange) Indexer REST API.
+/// Provides a raw HTTP client for interacting with the [dYdX v4](https://dydx.trade) Indexer REST API.
 ///
 /// This client wraps the underlying [`HttpClient`] to handle functionality
 /// specific to dYdX Indexer API, such as rate-limiting, forming request URLs,
@@ -240,16 +241,15 @@ impl DydxRawHttpClient {
         let mut headers = HashMap::new();
         headers.insert(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string());
 
-        let client = HttpClient::new_with_rate_limiter(
-            headers,
-            vec![],
-            Some(timeout_secs),
-            proxy_url,
-            rest_rate_limiter(&base_url),
-        )
-        .map_err(|e| {
-            DydxHttpError::ValidationError(format!("Failed to create HTTP client: {e}"))
-        })?;
+        let client = HttpClient::builder()
+            .headers(headers)
+            .timeout_secs(timeout_secs)
+            .maybe_proxy_url(proxy_url)
+            .rate_limiters(vec![rest_rate_limiter(&base_url)])
+            .build()
+            .map_err(|e| {
+                DydxHttpError::ValidationError(format!("Failed to create HTTP client: {e}"))
+            })?;
 
         Ok(Self {
             base_url,
@@ -335,26 +335,11 @@ impl DydxRawHttpClient {
             }
         };
 
-        let create_error = |msg: String| -> DydxHttpError {
-            if msg == "canceled" {
-                DydxHttpError::Canceled("Adapter disconnecting or shutting down".to_string())
-            } else if msg.contains("Timed out") {
-                // Timeouts are transient -- map to HttpClientError so they are retried
-                DydxHttpError::HttpClientError(msg)
-            } else {
-                DydxHttpError::ValidationError(msg)
-            }
-        };
-
         let response = self
             .retry_manager
-            .execute_with_retry_with_cancel(
-                endpoint,
-                operation,
-                should_retry,
-                create_error,
-                &self.cancellation_token,
-            )
+            .invocation(endpoint, operation, should_retry, create_retry_error)
+            .cancellation_token(&self.cancellation_token)
+            .execute()
             .await?;
 
         serde_json::from_slice(&response.body).map_err(|e| DydxHttpError::Deserialization {
@@ -424,26 +409,11 @@ impl DydxRawHttpClient {
             }
         };
 
-        let create_error = |msg: String| -> DydxHttpError {
-            if msg == "canceled" {
-                DydxHttpError::Canceled("Adapter disconnecting or shutting down".to_string())
-            } else if msg.contains("Timed out") {
-                // Timeouts are transient -- map to HttpClientError so they are retried
-                DydxHttpError::HttpClientError(msg)
-            } else {
-                DydxHttpError::ValidationError(msg)
-            }
-        };
-
         let response = self
             .retry_manager
-            .execute_with_retry_with_cancel(
-                endpoint,
-                operation,
-                should_retry,
-                create_error,
-                &self.cancellation_token,
-            )
+            .invocation(endpoint, operation, should_retry, create_retry_error)
+            .cancellation_token(&self.cancellation_token)
+            .execute()
             .await?;
 
         serde_json::from_slice(&response.body).map_err(|e| DydxHttpError::Deserialization {
@@ -531,8 +501,8 @@ impl DydxRawHttpClient {
         ticker: &str,
         resolution: DydxCandleResolution,
         limit: Option<u32>,
-        from_iso: Option<DateTime<Utc>>,
-        to_iso: Option<DateTime<Utc>>,
+        from_iso: Option<Timestamp>,
+        to_iso: Option<Timestamp>,
     ) -> Result<super::models::CandlesResponse, DydxHttpError> {
         let endpoint = format!("/v4/candles/perpetualMarkets/{ticker}");
         let mut query_parts = vec![format!("resolution={resolution}")];
@@ -542,12 +512,12 @@ impl DydxRawHttpClient {
         }
 
         if let Some(from) = from_iso {
-            let from_str = from.to_rfc3339();
+            let from_str = from.display_with_offset(Offset::UTC).to_string();
             query_parts.push(format!("fromISO={}", urlencoding::encode(&from_str)));
         }
 
         if let Some(to) = to_iso {
-            let to_str = to.to_rfc3339();
+            let to_str = to.display_with_offset(Offset::UTC).to_string();
             query_parts.push(format!("toISO={}", urlencoding::encode(&to_str)));
         }
         let query = query_parts.join("&");
@@ -663,7 +633,7 @@ impl DydxRawHttpClient {
         ticker: &str,
         limit: Option<u32>,
         effective_before_or_at_height: Option<u64>,
-        effective_before_or_at: Option<DateTime<Utc>>,
+        effective_before_or_at: Option<Timestamp>,
     ) -> Result<super::models::HistoricalFundingResponse, DydxHttpError> {
         let endpoint = format!("/v4/historicalFunding/{ticker}");
         let mut query_parts = Vec::new();
@@ -677,7 +647,7 @@ impl DydxRawHttpClient {
         }
 
         if let Some(before) = effective_before_or_at {
-            let before_str = before.to_rfc3339();
+            let before_str = before.display_with_offset(Offset::UTC).to_string();
             query_parts.push(format!(
                 "effectiveBeforeOrAt={}",
                 urlencoding::encode(&before_str)
@@ -712,7 +682,7 @@ impl DydxRawHttpClient {
     }
 }
 
-/// Provides a higher-level HTTP client for the [dYdX v4](https://dydx.exchange) Indexer REST API.
+/// Provides a higher-level HTTP client for the [dYdX v4](https://dydx.trade) Indexer REST API.
 ///
 /// This client wraps the underlying `DydxRawHttpClient` to handle conversions
 /// into the Nautilus domain model, following the two-layer pattern established
@@ -730,7 +700,7 @@ impl DydxRawHttpClient {
 #[derive(Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.dydx", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.dydx", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -761,6 +731,18 @@ impl Default for DydxHttpClient {
     fn default() -> Self {
         Self::new(None, 60, None, DydxNetwork::Mainnet, None)
             .expect("Failed to create default DydxHttpClient")
+    }
+}
+
+fn create_retry_error(error: RetryError) -> DydxHttpError {
+    match error {
+        RetryError::Canceled => {
+            DydxHttpError::Canceled("Adapter disconnecting or shutting down".to_string())
+        }
+        error @ RetryError::OperationTimeout { .. } => {
+            DydxHttpError::HttpClientError(error.to_string())
+        }
+        error => DydxHttpError::ValidationError(error.to_string()),
     }
 }
 
@@ -876,7 +858,7 @@ impl DydxHttpClient {
         }
 
         if skipped_inactive > 0 {
-            log::info!(
+            log::debug!(
                 "Parsed {} instruments, skipped {} inactive",
                 instruments.len(),
                 skipped_inactive
@@ -942,9 +924,9 @@ impl DydxHttpClient {
         let count = items.len();
 
         if skipped_inactive > 0 {
-            log::info!("Cached {count} instruments, skipped {skipped_inactive} inactive");
+            log::debug!("Cached {count} instruments, skipped {skipped_inactive} inactive");
         } else {
-            log::info!("Cached {count} instruments");
+            log::debug!("Cached {count} instruments");
         }
 
         Ok(())
@@ -976,7 +958,7 @@ impl DydxHttpClient {
             self.instrument_cache
                 .insert(instrument.clone(), market.clone());
 
-            log::info!("Fetched and cached new instrument: {ticker}");
+            log::debug!("Fetched and cached new instrument: {ticker}");
             return Ok(Some(instrument));
         }
 
@@ -1070,8 +1052,8 @@ impl DydxHttpClient {
         symbol: &str,
         resolution: DydxCandleResolution,
         limit: Option<u32>,
-        from_iso: Option<DateTime<Utc>>,
-        to_iso: Option<DateTime<Utc>>,
+        from_iso: Option<Timestamp>,
+        to_iso: Option<Timestamp>,
     ) -> anyhow::Result<super::models::CandlesResponse> {
         self.inner
             .get_candles(symbol, resolution, limit, from_iso, to_iso)
@@ -1099,8 +1081,8 @@ impl DydxHttpClient {
     pub async fn request_bars(
         &self,
         bar_type: BarType,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
         timestamp_on_close: bool,
     ) -> anyhow::Result<Vec<Bar>> {
@@ -1109,7 +1091,7 @@ impl DydxHttpClient {
 
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let ticker = extract_raw_symbol(instrument_id.symbol.as_str());
         let price_precision = instrument.price_precision();
@@ -1133,7 +1115,8 @@ impl DydxHttpClient {
                 let overall_limit = limit.unwrap_or(u32::MAX);
                 let mut remaining = overall_limit;
                 let bars_per_call = DYDX_MAX_BARS_PER_REQUEST.min(remaining);
-                let chunk_duration = chrono::Duration::seconds(bar_secs * bars_per_call as i64);
+                let chunk_duration =
+                    jiff::SignedDuration::from_secs(bar_secs * bars_per_call as i64);
                 let mut chunk_start = range_start;
 
                 while chunk_start < range_end && remaining > 0 {
@@ -1228,8 +1211,8 @@ impl DydxHttpClient {
     pub async fn request_trade_ticks(
         &self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<TradeTick>> {
         const DYDX_MAX_TRADES_PER_REQUEST: u32 = 1_000;
@@ -1241,7 +1224,7 @@ impl DydxHttpClient {
 
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let ticker = extract_raw_symbol(instrument_id.symbol.as_str());
         let price_precision = instrument.price_precision();
@@ -1366,8 +1349,8 @@ impl DydxHttpClient {
     pub async fn request_funding_rates(
         &self,
         instrument_id: InstrumentId,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<FundingRateUpdate>> {
         let ticker = extract_raw_symbol(instrument_id.symbol.as_str());
@@ -1387,9 +1370,9 @@ impl DydxHttpClient {
             }
 
             let ts_event =
-                UnixNanos::from(entry.effective_at.timestamp_nanos_opt().ok_or_else(|| {
-                    anyhow::anyhow!("Timestamp overflow for {}", entry.effective_at)
-                })? as u64);
+                UnixNanos::from(u64::try_from(entry.effective_at.as_nanosecond()).map_err(
+                    |_| anyhow::anyhow!("Timestamp overflow for {}", entry.effective_at),
+                )?);
 
             rates.push(FundingRateUpdate::new(
                 instrument_id,
@@ -1404,7 +1387,7 @@ impl DydxHttpClient {
         // dYdX returns newest first; reverse to chronological order
         rates.reverse();
 
-        log::info!("Fetched {} funding rates for {instrument_id}", rates.len(),);
+        log::debug!("Fetched {} funding rates for {instrument_id}", rates.len(),);
 
         Ok(rates)
     }
@@ -1425,7 +1408,7 @@ impl DydxHttpClient {
     ) -> anyhow::Result<OrderBookDeltas> {
         let instrument = self
             .get_instrument(&instrument_id)
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let ticker = extract_raw_symbol(instrument_id.symbol.as_str());
         let response = self.inner.get_orderbook(ticker).await?;
@@ -1793,7 +1776,13 @@ impl DydxHttpClient {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     use axum::{Router, routing::get};
+    use nautilus_common::testing::wait_until_async;
     use nautilus_model::identifiers::Symbol;
     use rstest::rstest;
 
@@ -1890,13 +1879,18 @@ mod tests {
     async fn test_http_timeout_respects_configuration_and_does_not_block() {
         use tokio::net::TcpListener;
 
-        async fn slow_handler() -> &'static str {
-            // Sleep longer than the configured HTTP timeout.
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            "ok"
-        }
-
-        let router = Router::new().route("/v4/slow", get(slow_handler));
+        let handler_entered = Arc::new(AtomicBool::new(false));
+        let handler_entered_clone = Arc::clone(&handler_entered);
+        let router = Router::new()
+            .route(
+                "/v4/slow",
+                get(move || async move {
+                    handler_entered_clone.store(true, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    "ok"
+                }),
+            )
+            .route("/health", get(|| async { "ok" }));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1909,12 +1903,27 @@ mod tests {
 
         let base_url = format!("http://{addr}");
 
+        // The measured request must reach the slow route, so establish that the server is
+        // accepting before starting the clock: binding the listener makes the port
+        // connectable before the serve task has reached its accept loop.
+        let ready_url = format!("{base_url}/health");
+        let probe = HttpClient::builder().build().unwrap();
+        wait_until_async(
+            || {
+                let url = ready_url.clone();
+                let probe = probe.clone();
+                async move { probe.get(url, None, None, Some(1), None).await.is_ok() }
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
         // Configure a small operation timeout and no retries so the request
         // fails quickly even though the handler sleeps for 5 seconds.
         let retry_config = RetryConfig {
             max_retries: 0,
-            initial_delay_ms: 0,
-            max_delay_ms: 0,
+            initial_delay_ms: 1,
+            max_delay_ms: 1,
             backoff_factor: 1.0,
             jitter_ms: 0,
             operation_timeout_ms: Some(500),
@@ -1938,9 +1947,18 @@ mod tests {
             client.send_request(Method::GET, "/v4/slow", None).await;
         let elapsed = start.elapsed();
 
-        // Request should fail (timeout or client error), but without blocking the thread
-        // for the full handler duration.
-        assert!(result.is_err());
+        let expected = RetryError::OperationTimeout { timeout_ms: 500 }.to_string();
+        assert!(
+            matches!(
+                &result,
+                Err(error::DydxHttpError::HttpClientError(message)) if message == &expected
+            ),
+            "Expected operation timeout, received {result:?}"
+        );
+        assert!(
+            handler_entered.load(Ordering::SeqCst),
+            "Slow route was never entered"
+        );
         assert!(elapsed < std::time::Duration::from_secs(3));
     }
 }
