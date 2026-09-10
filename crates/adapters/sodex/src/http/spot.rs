@@ -20,6 +20,23 @@
 //! Spot order items also lack the perps-only fields — no modifier, stop, trigger,
 //! reduce-only or position side — since those describe positions, which spot does not have.
 //!
+//! - **The action names differ too.** Spot's batch actions are `batchNewOrder` and
+//!   `batchCancelOrder`, where perps uses `newOrder` and `cancelOrder`. The action name is
+//!   hashed into the signature, so borrowing the perps name produces a valid signature over
+//!   the wrong digest.
+//!
+//! # Why a wrong action name reports "API key not found"
+//!
+//! The gateway recovers the signer's address from the digest and signature, then looks up an
+//! API key by that address. ECDSA recovery does not fail on a wrong digest — it returns a
+//! *different* address, and no key is registered for it. So a mismatched payload hash
+//! surfaces as a missing key rather than as a signature error, pointing at credentials when
+//! the credentials are fine.
+//!
+//! Distinguishing the two: if a cheap signed call such as `scheduleCancel` succeeds with the
+//! same key on the same engine, the key is registered and working, and the fault is in the
+//! failing request's payload or action name.
+//!
 //! One more asymmetry worth knowing when pricing orders: spot's limit price bounds are
 //! computed from `lastTradePrice`, while perps uses `markPrice`.
 //!
@@ -140,7 +157,11 @@ impl SpotNewOrderRequest {
     pub const ENDPOINT: &'static str = "/trade/orders/batch";
 
     /// Action name for the signing payload.
-    pub const ACTION: &'static str = "newOrder";
+    ///
+    /// `batchNewOrder`, not `newOrder` — spot's batch form is its own action. The name is
+    /// hashed into the signature, so using the perps name yields a digest the venue cannot
+    /// match. See the module docs for why that surfaces as "API key not found".
+    pub const ACTION: &'static str = "batchNewOrder";
 
     /// Builds a batch, validating size and every order.
     ///
@@ -243,8 +264,8 @@ impl SpotCancelOrderRequest {
     /// Path this request must be sent to, with `DELETE`.
     pub const ENDPOINT: &'static str = "/trade/orders/batch";
 
-    /// Action name for the signing payload.
-    pub const ACTION: &'static str = "cancelOrder";
+    /// Action name for the signing payload. `batchCancelOrder`, not `cancelOrder`.
+    pub const ACTION: &'static str = "batchCancelOrder";
 
     /// Builds a cancel batch, validating size and every item.
     ///
@@ -383,6 +404,41 @@ mod tests {
             SpotNewOrderRequest::new(1, vec![]).unwrap_err(),
             RequestError::BatchSize(0)
         );
+    }
+
+    /// Action names are hashed into the signature, and the perps names are not
+    /// interchangeable with the spot ones. Values taken from the official Go SDK
+    /// (`spot/types/batch_new_order_request.go`, `perps/types/new_order_request.go`).
+    #[test]
+    fn spot_batch_actions_are_not_the_perps_action_names() {
+        use crate::http::requests::{CancelOrderRequest, NewOrderRequest};
+
+        assert_eq!(SpotNewOrderRequest::ACTION, "batchNewOrder");
+        assert_eq!(SpotCancelOrderRequest::ACTION, "batchCancelOrder");
+
+        assert_eq!(NewOrderRequest::ACTION, "newOrder");
+        assert_eq!(CancelOrderRequest::ACTION, "cancelOrder");
+
+        assert_ne!(SpotNewOrderRequest::ACTION, NewOrderRequest::ACTION);
+        assert_ne!(SpotCancelOrderRequest::ACTION, CancelOrderRequest::ACTION);
+    }
+
+    /// The action name is part of the hashed envelope, so swapping it changes the digest and
+    /// therefore the signature — which is why the wrong name cannot be shrugged off.
+    #[test]
+    fn action_name_changes_the_signing_digest() {
+        use crate::signing::payload_hash;
+
+        let request = SpotNewOrderRequest::new(
+            60366,
+            vec![SpotOrderItem::market(1, id("a"), OrderSide::Buy, "0.001")],
+        )
+        .unwrap();
+
+        let correct = payload_hash(SpotNewOrderRequest::ACTION, &request).unwrap();
+        let perps_name = payload_hash("newOrder", &request).unwrap();
+
+        assert_ne!(correct, perps_name);
     }
 
     #[test]
