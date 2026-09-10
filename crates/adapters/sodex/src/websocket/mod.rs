@@ -1,5 +1,21 @@
 //! WebSocket streams for SoDEX.
 //!
+//! # Channels
+//!
+//! Three are implemented, and their selectors do not share a shape:
+//!
+//! | Channel  | Selector | Carries |
+//! |----------|----------|---------|
+//! | `candle` | `symbol` + `interval` | OHLC bars, republished while forming |
+//! | `trade`  | `symbols` array | Public trades with the aggressing side |
+//! | `ticker` | `symbols` array | 24h statistics plus top of book, on a fixed cadence |
+//!
+//! The set was established by asking the venue rather than by assumption: the
+//! `probe_channels` example sweeps candidate names and reports which reply `unknown channel`
+//! and which reply `invalid params`, the latter meaning the name exists and only the
+//! selector was wrong. That sweep also found an `accountUpdate` channel whose selector is
+//! still unknown — see the crate documentation.
+//!
 //! # Streams carry no authorization
 //!
 //! The venue states that user-specific streams require no subscription authorization and
@@ -25,8 +41,10 @@
 pub mod client;
 pub mod messages;
 
-pub use client::{SodexWebSocketClient, SodexWsEvent, WsError};
-pub use messages::{Candle, CandleParams, Heartbeat, Op, WsAck, WsRequest, WsUpdate};
+pub use client::{SodexWebSocketClient, SodexWsEvent, Subscription, WsError};
+pub use messages::{
+    Candle, CandleParams, Heartbeat, Op, SymbolsParams, Ticker, Trade, WsAck, WsRequest, WsUpdate,
+};
 
 use crate::{common::Market, http::Network};
 

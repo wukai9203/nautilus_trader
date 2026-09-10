@@ -37,27 +37,32 @@
 //! |------|-------|
 //! | Instruments | Loaded from the venue listing for both engines |
 //! | Historical bars | REST klines, with the still-forming tail removed |
-//! | Streaming bars | Candle channel, closed bars only |
+//! | Streaming bars | `candle` channel, completed bars only |
+//! | Quotes | `ticker` channel — a periodic sample of top of book, not every change |
+//! | Trades | `trade` channel, with the aggressing side |
 //! | Order submission | Market and limit, spot and perps |
 //! | Order cancellation | By venue order id, falling back to the client order id |
+//! | Order books | **Not implemented** — the venue publishes no book channel |
 //! | Account state | **Not implemented** |
 //! | Order status and fill reports | **Not implemented** |
 //! | Position reports | **Not implemented** |
 //!
-//! The three gaps share one cause: the venue documentation this adapter was built from
-//! covers the trading endpoints, and the paths for account, order-status and position reads
-//! have not been verified against a live link. Guessing them would produce failures that
-//! read like credential errors rather than missing endpoints — a diagnosis this integration
-//! has already cost time on once.
+//! The account, order-status and position gaps share one cause: the venue documentation this
+//! adapter was built from covers the trading endpoints, and the paths for those reads have
+//! not been verified against a live link. Guessing them would produce failures that read
+//! like credential errors rather than missing endpoints — a diagnosis this integration has
+//! already cost time on once.
 //!
 //! The consequence is worth stating rather than leaving to be discovered: **the execution
 //! client cannot reconcile.** Orders it did not place, and fills that occurred while it was
-//! disconnected, remain invisible to the engine. Fills are also not reported at all, so a
-//! live run currently learns that an order was accepted but never that it was filled. The
-//! venue does publish a user stream that would carry them, and it requires no authorization,
-//! but its channel names and payload shapes are not documented here — that stream is the
-//! next thing to add, and it should be built against a live link rather than from
-//! assumption.
+//! disconnected, remain invisible to the engine. Fills are not reported at all, so a live run
+//! learns that an order was accepted but never that it was filled.
+//!
+//! An `accountUpdate` stream channel does exist — the `probe_channels` example found it, and
+//! the venue's own error text names an `accountID` field on its subscription parameters — but
+//! eighteen candidate parameter shapes were all refused as `invalid params`, so its selector
+//! remains unknown. That channel is the next thing to add, and finding its shape is a
+//! question for the venue rather than for guesswork.
 //!
 //! # Backtesting
 //!

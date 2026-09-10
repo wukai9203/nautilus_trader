@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::common::enums::OrderSide;
+
 /// A client request. `op` selects the operation; `params` carries the channel selector.
 ///
 /// `id` is echoed back in the acknowledgement, which is the only way to correlate an ack
@@ -98,6 +100,147 @@ impl CandleParams {
             interval: interval.into(),
         }
     }
+}
+
+/// Subscription selector for the channels keyed by symbol list.
+///
+/// `trade` and `ticker` take `symbols` as an array, unlike [`CandleParams`], which takes a
+/// single `symbol` plus an interval. The venue's acknowledgement echoes one `symbol` per
+/// subscription regardless, so the request shape and the reply shape do not match — which is
+/// why acknowledgements are correlated by request id rather than by their echoed selector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolsParams {
+    pub channel: String,
+    pub symbols: Vec<String>,
+}
+
+impl SymbolsParams {
+    /// Public trade channel.
+    pub const TRADE: &'static str = "trade";
+
+    /// 24-hour rolling statistics with top of book.
+    pub const TICKER: &'static str = "ticker";
+
+    #[must_use]
+    pub fn new(channel: impl Into<String>, symbols: Vec<String>) -> Self {
+        Self {
+            channel: channel.into(),
+            symbols,
+        }
+    }
+
+    /// One symbol on the trade channel.
+    #[must_use]
+    pub fn trade(symbol: impl Into<String>) -> Self {
+        Self::new(Self::TRADE, vec![symbol.into()])
+    }
+
+    /// One symbol on the ticker channel.
+    #[must_use]
+    pub fn ticker(symbol: impl Into<String>) -> Self {
+        Self::new(Self::TICKER, vec![symbol.into()])
+    }
+
+    /// The single symbol this selector names, if it names exactly one.
+    #[must_use]
+    pub fn sole_symbol(&self) -> Option<&str> {
+        match self.symbols.as_slice() {
+            [symbol] => Some(symbol),
+            _ => None,
+        }
+    }
+}
+
+/// One public trade.
+///
+/// Prices and sizes stay as decimal strings for the same reason they do on [`Candle`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Trade {
+    /// Time the venue produced this frame, milliseconds.
+    #[serde(rename = "E")]
+    pub event_time_ms: u64,
+    /// Time the trade occurred, milliseconds. This is the one that belongs on the tick.
+    #[serde(rename = "T")]
+    pub trade_time_ms: u64,
+    #[serde(rename = "t")]
+    pub trade_id: u64,
+    #[serde(rename = "s")]
+    pub symbol: String,
+    /// The **aggressing** side.
+    ///
+    /// Established by observation rather than assumption: across 22 mainnet trades matched
+    /// against contemporaneous top-of-book, every `BUY` printed at the ask and every `SELL`
+    /// at the bid. A trade at the ask is a buyer crossing the spread, so this names the taker.
+    /// Reading it as the maker's side would invert every order-flow measure built on it.
+    #[serde(rename = "S")]
+    pub side: OrderSide,
+    #[serde(rename = "p")]
+    pub price: String,
+    #[serde(rename = "q")]
+    pub quantity: String,
+    /// Buyer's account id.
+    #[serde(rename = "bi")]
+    pub buyer_account_id: u64,
+    /// Seller's account id.
+    #[serde(rename = "si")]
+    pub seller_account_id: u64,
+}
+
+/// Rolling 24-hour statistics with the current top of book.
+///
+/// The venue publishes no dedicated quote channel; `a`/`A` and `b`/`B` here are the only
+/// top-of-book this adapter has, and they arrive on the ticker's own cadence rather than on
+/// every book change — the acknowledgement reports that cadence as `pushInterval`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct Ticker {
+    /// Time the venue produced this frame, milliseconds.
+    #[serde(rename = "E")]
+    pub event_time_ms: u64,
+    #[serde(rename = "s")]
+    pub symbol: String,
+    /// Last traded price.
+    #[serde(rename = "c")]
+    pub last_price: String,
+    /// Last traded quantity.
+    #[serde(rename = "Q")]
+    pub last_quantity: String,
+    /// Weighted average price over the window.
+    #[serde(rename = "w")]
+    pub weighted_average_price: String,
+    /// Best ask price.
+    #[serde(rename = "a")]
+    pub ask_price: String,
+    /// Best ask quantity.
+    #[serde(rename = "A")]
+    pub ask_quantity: String,
+    /// Best bid price.
+    #[serde(rename = "b")]
+    pub bid_price: String,
+    /// Best bid quantity.
+    #[serde(rename = "B")]
+    pub bid_quantity: String,
+    /// Absolute price change over the window.
+    #[serde(rename = "p")]
+    pub price_change: String,
+    /// Percentage price change over the window.
+    #[serde(rename = "P")]
+    pub price_change_percent: f64,
+    #[serde(rename = "o")]
+    pub open: String,
+    #[serde(rename = "h")]
+    pub high: String,
+    #[serde(rename = "l")]
+    pub low: String,
+    #[serde(rename = "v")]
+    pub volume: String,
+    #[serde(rename = "q")]
+    pub quote_volume: String,
+    /// Start of the statistics window, milliseconds.
+    #[serde(rename = "O")]
+    pub window_open_ms: u64,
+    /// End of the statistics window, milliseconds.
+    #[serde(rename = "C")]
+    pub window_close_ms: u64,
 }
 
 /// A push frame carrying channel data.

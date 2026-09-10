@@ -16,6 +16,14 @@
 //! Nautilus applies its own constraint upstream — minute steps must divide 60 evenly — so
 //! this layer only has to reject what Nautilus accepts but the venue does not serve.
 //!
+//! # The ticker is the only top of book available
+//!
+//! The venue publishes no dedicated quote channel. Its `ticker` frame carries best bid and
+//! ask alongside 24-hour statistics, on its own cadence — the subscription acknowledgement
+//! reports that as `pushInterval`, observed at 1000ms — rather than on every book change. A
+//! quote built from it is therefore a periodic sample of the top of book, not a stream of
+//! every change, and a strategy that assumes it sees every touch of the spread will be wrong.
+//!
 //! # Only closed bars are safe to emit
 //!
 //! The candle channel republishes the forming bar on every block. Emitting those downstream
@@ -27,15 +35,19 @@ use std::str::FromStr;
 
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    data::{Bar, BarSpecification, BarType},
-    enums::{AggregationSource, BarAggregation, PriceType},
-    identifiers::InstrumentId,
+    data::{Bar, BarSpecification, BarType, QuoteTick, TradeTick},
+    enums::{AggregationSource, AggressorSide, BarAggregation, PriceType},
+    identifiers::{InstrumentId, TradeId},
     types::{Price, Quantity},
 };
 
 use crate::{
-    common::{Market, decimal::normalize as normalize_decimal},
-    websocket::Candle,
+    common::{
+        Market,
+        decimal::{normalize as normalize_decimal, normalize_to},
+        enums::OrderSide,
+    },
+    websocket::{Candle, Ticker, Trade},
 };
 
 /// Every interval the venue serves, with its Nautilus equivalent.
@@ -221,6 +233,99 @@ pub fn parse_completed_bar(
         // The venue stamps bars in milliseconds; Nautilus works in nanoseconds. The bar's
         // event time is its open, which is what makes a series joinable across sources.
         UnixNanos::from(candle.open_time_ms * 1_000_000),
+        ts_init,
+    ))
+}
+
+/// The precision a value must carry to sit beside its counterpart in one tick.
+///
+/// Taken from the instrument rather than from the text, because the venue writes the same
+/// tick size two ways — a bid of `"77378.5"` beside an ask of `"77379"` — and Nautilus
+/// rejects a quote whose two sides disagree about precision.
+fn price_at(raw: &str, precision: u8, field: &'static str) -> Result<Price, BarMappingError> {
+    let invalid = |reason: String| BarMappingError::InvalidValue {
+        field,
+        value: raw.to_string(),
+        reason,
+    };
+    let normalized = normalize_to(raw, precision).map_err(|e| invalid(e.to_string()))?;
+    Price::from_str(&normalized).map_err(|e| invalid(e.to_string()))
+}
+
+fn quantity_at(
+    raw: &str,
+    precision: u8,
+    field: &'static str,
+) -> Result<Quantity, BarMappingError> {
+    let invalid = |reason: String| BarMappingError::InvalidValue {
+        field,
+        value: raw.to_string(),
+        reason,
+    };
+    let normalized = normalize_to(raw, precision).map_err(|e| invalid(e.to_string()))?;
+    Quantity::from_str(&normalized).map_err(|e| invalid(e.to_string()))
+}
+
+/// Which side crossed the spread.
+///
+/// The venue's `S` names the aggressor. Established by observation rather than assumption:
+/// across 22 mainnet trades matched against contemporaneous top of book, every `BUY` printed
+/// at the ask and every `SELL` at the bid, which is a taker crossing in each case. Reading it
+/// as the resting side would invert every order-flow measure built on this feed.
+#[must_use]
+pub const fn map_aggressor_side(side: OrderSide) -> AggressorSide {
+    match side {
+        OrderSide::Buy => AggressorSide::Buy,
+        OrderSide::Sell => AggressorSide::Sell,
+    }
+}
+
+/// Converts a public trade into a Nautilus tick.
+///
+/// # Errors
+///
+/// Returns [`BarMappingError::InvalidValue`] if the price or size cannot be parsed at the
+/// instrument's precision.
+pub fn parse_trade(
+    trade: &Trade,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+) -> Result<TradeTick, BarMappingError> {
+    Ok(TradeTick::new(
+        instrument_id,
+        price_at(&trade.price, price_precision, "trade price")?,
+        quantity_at(&trade.quantity, size_precision, "trade quantity")?,
+        map_aggressor_side(trade.side),
+        TradeId::new(trade.trade_id.to_string().as_str()),
+        // The trade's own time, not the frame's: `E` is when the venue produced the push and
+        // moves with network conditions, while `T` is when the trade happened.
+        UnixNanos::from(trade.trade_time_ms * 1_000_000),
+        ts_init,
+    ))
+}
+
+/// Converts a ticker frame into a Nautilus quote.
+///
+/// # Errors
+///
+/// Returns [`BarMappingError::InvalidValue`] if a price or size cannot be parsed at the
+/// instrument's precision.
+pub fn parse_quote(
+    ticker: &Ticker,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+) -> Result<QuoteTick, BarMappingError> {
+    Ok(QuoteTick::new(
+        instrument_id,
+        price_at(&ticker.bid_price, price_precision, "bid price")?,
+        price_at(&ticker.ask_price, price_precision, "ask price")?,
+        quantity_at(&ticker.bid_quantity, size_precision, "bid size")?,
+        quantity_at(&ticker.ask_quantity, size_precision, "ask size")?,
+        UnixNanos::from(ticker.event_time_ms * 1_000_000),
         ts_init,
     ))
 }

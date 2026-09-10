@@ -46,6 +46,37 @@ pub fn normalize(raw: &str) -> Result<String, DecimalError> {
     Ok(capped.to_string())
 }
 
+/// Rewrites a venue decimal string at exactly `precision` decimal places.
+///
+/// [`normalize`] makes a value representable; this makes two values *comparable*. Nautilus
+/// rejects a quote whose bid and ask carry different precisions, and the venue happily sends
+/// a bid of `"77378.5"` beside an ask of `"77379"` — the same tick size, written two ways.
+/// Pinning both to the instrument's declared precision is what keeps that from being read as
+/// a malformed quote.
+///
+/// Rounding is half-even and explicit. Excess places beyond the instrument's own precision
+/// are below its tick size and cannot describe a real price.
+///
+/// # Errors
+///
+/// Returns [`DecimalError`] if the input is not a decimal number, or if `precision` exceeds
+/// what the engine's fixed-point types can hold.
+pub fn normalize_to(raw: &str, precision: u8) -> Result<String, DecimalError> {
+    if precision > FIXED_PRECISION {
+        return Err(DecimalError(format!(
+            "{raw:?} requested at {precision} decimal places, beyond the engine's {FIXED_PRECISION}"
+        )));
+    }
+
+    let mut value = Decimal::from_str(raw).map_err(|_| DecimalError(raw.to_string()))?;
+    value = value.round_dp(u32::from(precision));
+    // `round_dp` bounds the scale but does not set it, so a whole number stays scale 0 and
+    // would parse back at precision 0. `rescale` pads it out to the declared precision.
+    value.rescale(u32::from(precision));
+
+    Ok(value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +145,45 @@ mod tests {
         assert!(normalize("").is_err());
         assert!(normalize("abc").is_err());
         assert!(normalize("1.2.3").is_err());
+    }
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+
+    #[test]
+    fn a_whole_number_is_padded_out_to_the_declared_precision() {
+        // Without this, an ask of "77379" parses at precision 0 while a bid of "77378.5"
+        // parses at 1, and the engine rejects the pair as inconsistent.
+        assert_eq!(normalize_to("77379", 1).unwrap(), "77379.0");
+        assert_eq!(normalize_to("77379", 0).unwrap(), "77379");
+    }
+
+    #[test]
+    fn both_sides_of_a_quote_end_up_at_one_precision() {
+        assert_eq!(normalize_to("77378.5", 1).unwrap(), "77378.5");
+        assert_eq!(normalize_to("77379", 1).unwrap(), "77379.0");
+    }
+
+    #[test]
+    fn on_chain_padding_is_cut_to_the_instrument_precision() {
+        assert_eq!(normalize_to("0.001390000000000000", 5).unwrap(), "0.00139");
+    }
+
+    #[test]
+    fn places_below_the_tick_are_rounded_away() {
+        assert_eq!(normalize_to("77378.567", 2).unwrap(), "77378.57");
+    }
+
+    #[test]
+    fn a_precision_the_engine_cannot_hold_is_refused() {
+        // Silently clamping would produce a value that claims a precision it does not have.
+        assert!(normalize_to("1.0", FIXED_PRECISION + 1).is_err());
+    }
+
+    #[test]
+    fn a_non_number_is_still_refused() {
+        assert!(normalize_to("not-a-number", 2).is_err());
     }
 }

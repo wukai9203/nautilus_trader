@@ -48,7 +48,8 @@ use nautilus_common::{
         DataEvent,
         data::{
             BarsResponse, DataResponse, InstrumentResponse, InstrumentsResponse, RequestBars,
-            RequestInstrument, RequestInstruments, SubscribeBars, UnsubscribeBars,
+            RequestInstrument, RequestInstruments, SubscribeBars, SubscribeQuotes,
+            SubscribeTrades, UnsubscribeBars, UnsubscribeQuotes, UnsubscribeTrades,
         },
     },
     providers::InstrumentProvider,
@@ -60,21 +61,21 @@ use nautilus_core::{
 };
 use nautilus_model::{
     data::{BarType, Data},
-    identifiers::{ClientId, Venue},
+    identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
 };
 use parking_lot::Mutex;
 
 use super::{
     history::{BarRequest, fetch_bars},
-    parse::{parse_completed_bar, spec_to_interval},
+    parse::{parse_completed_bar, parse_quote, parse_trade, spec_to_interval},
 };
 use crate::{
     common::Market,
     config::SodexDataClientConfig,
     http::SodexHttpClient,
     providers::SodexInstrumentProvider,
-    websocket::{Candle, CandleParams, SodexWebSocketClient, SodexWsEvent},
+    websocket::{Candle, SodexWebSocketClient, SodexWsEvent, Subscription},
 };
 
 /// Identifies a candle feed the way the venue's push frames do.
@@ -82,6 +83,30 @@ type FeedKey = (String, String);
 
 /// The most recent push for one feed, held until its bar is provably complete.
 type Pending = HashMap<FeedKey, Candle>;
+
+/// What a subscribed symbol needs before its frames can become ticks.
+///
+/// The precisions come from the instrument definition rather than from the text of each
+/// value. The venue writes one tick size several ways — `"77379"` and `"77378.5"` are both
+/// this instrument's prices — and Nautilus rejects a quote whose two sides disagree about
+/// precision, so the declared precision is the only consistent source.
+#[derive(Debug, Clone, Copy)]
+struct TickFeed {
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+}
+
+/// Everything the stream task needs to turn a push into engine data.
+///
+/// A push whose symbol is absent from the relevant map is dropped: rebuilding an identity
+/// from the frame's own text would publish data for feeds nobody subscribed to.
+#[derive(Debug, Default)]
+struct Feeds {
+    bars: HashMap<FeedKey, BarType>,
+    quotes: HashMap<String, TickFeed>,
+    trades: HashMap<String, TickFeed>,
+}
 
 /// Live market data client for one SoDEX engine.
 pub struct SodexDataClient {
@@ -92,8 +117,8 @@ pub struct SodexDataClient {
     http: Arc<SodexHttpClient>,
     provider: SodexInstrumentProvider,
     ws: Option<Arc<SodexWebSocketClient>>,
-    /// Bar types by the symbol and interval the venue will echo back on the stream.
-    feeds: Arc<Mutex<HashMap<FeedKey, BarType>>>,
+    /// What each subscribed feed maps to, keyed as the venue's push frames are.
+    feeds: Arc<Mutex<Feeds>>,
     is_connected: Arc<AtomicBool>,
     stream_task: Option<tokio::task::JoinHandle<()>>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
@@ -106,7 +131,7 @@ impl std::fmt::Debug for SodexDataClient {
             .field("client_id", &self.client_id)
             .field("venue", &self.venue)
             .field("connected", &self.is_connected.load(Ordering::Relaxed))
-            .field("feeds", &self.feeds.lock().len())
+            .field("bar_feeds", &self.feeds.lock().bars.len())
             .finish()
     }
 }
@@ -129,7 +154,7 @@ impl SodexDataClient {
             http: Arc::new(http),
             provider,
             ws: None,
-            feeds: Arc::new(Mutex::new(HashMap::new())),
+            feeds: Arc::new(Mutex::new(Feeds::default())),
             is_connected: Arc::new(AtomicBool::new(false)),
             stream_task: None,
             data_sender: get_data_event_sender(),
@@ -143,6 +168,52 @@ impl SodexDataClient {
             .as_ref()
             .map(Arc::clone)
             .ok_or_else(|| anyhow::anyhow!("SoDEX data client is not connected"))
+    }
+
+    /// The identity and precisions a symbol's ticks are built with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the instrument has not been loaded. Defaulting the precisions
+    /// would produce ticks that claim a tick size the instrument does not have.
+    fn tick_feed(&self, instrument_id: &InstrumentId) -> anyhow::Result<TickFeed> {
+        let instrument = self
+            .provider
+            .store()
+            .find(instrument_id)
+            .ok_or_else(|| anyhow::anyhow!("{instrument_id} has not been loaded"))?;
+
+        Ok(TickFeed {
+            instrument_id: *instrument_id,
+            price_precision: instrument.price_precision(),
+            size_precision: instrument.size_precision(),
+        })
+    }
+
+    fn spawn_subscribe(
+        &self,
+        ws: Arc<SodexWebSocketClient>,
+        subscription: Subscription,
+        subject: impl std::fmt::Display + Send + 'static,
+    ) {
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.subscribe(subscription).await {
+                log::error!("sodex_subscribe_failed subject={subject} error={e}");
+            }
+        });
+    }
+
+    fn spawn_unsubscribe(
+        &self,
+        ws: Arc<SodexWebSocketClient>,
+        subscription: Subscription,
+        subject: impl std::fmt::Display + Send + 'static,
+    ) {
+        get_runtime().spawn(async move {
+            if let Err(e) = ws.unsubscribe(&subscription).await {
+                log::error!("sodex_unsubscribe_failed subject={subject} error={e}");
+            }
+        });
     }
 
     fn send(&self, event: DataEvent) {
@@ -165,46 +236,68 @@ fn feed_key(bar_type: &BarType, market: Market) -> anyhow::Result<FeedKey> {
     Ok((bar_type.instrument_id().symbol.to_string(), interval.to_string()))
 }
 
-/// Publishes completed bars from the stream and reports what the venue refused.
+/// Publishes completed bars, quotes and trades from the stream, and reports what the venue
+/// refused.
 async fn run_stream(
     mut events: tokio::sync::mpsc::UnboundedReceiver<SodexWsEvent>,
-    feeds: Arc<Mutex<HashMap<FeedKey, BarType>>>,
+    feeds: Arc<Mutex<Feeds>>,
     sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
     clock: &'static AtomicTime,
 ) {
     let mut pending = Pending::new();
 
     while let Some(event) = events.recv().await {
-        match event {
-            SodexWsEvent::Candle(candle) => {
-                let key = (candle.symbol.clone(), candle.interval.clone());
-                let Some(bar_type) = feeds.lock().get(&key).copied() else {
-                    log::debug!(
-                        "sodex_candle_unsubscribed symbol={} interval={}",
-                        candle.symbol,
-                        candle.interval
-                    );
+        let published = match event {
+            SodexWsEvent::Candle(candle) => publish_candle(&feeds, &mut pending, *candle, clock),
+            SodexWsEvent::Trade(trade) => {
+                let Some(feed) = feeds.lock().trades.get(&trade.symbol).copied() else {
+                    log::debug!("sodex_trade_unsubscribed symbol={}", trade.symbol);
                     continue;
                 };
-
-                for completed in advance(&mut pending, key, *candle) {
-                    match parse_completed_bar(&completed, bar_type, clock.get_time_ns()) {
-                        Ok(bar) => {
-                            if sender.send(DataEvent::Data(Data::Bar(bar))).is_err() {
-                                log::debug!("sodex_data_consumer_gone");
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("sodex_bar_unparsed bar_type={bar_type} error={e}");
-                        }
+                match parse_trade(
+                    &trade,
+                    feed.instrument_id,
+                    feed.price_precision,
+                    feed.size_precision,
+                    clock.get_time_ns(),
+                ) {
+                    Ok(tick) => vec![Data::Trade(tick)],
+                    Err(e) => {
+                        log::error!("sodex_trade_unparsed symbol={} error={e}", trade.symbol);
+                        continue;
                     }
                 }
             }
-            SodexWsEvent::RequestRejected { op, params, reason } => {
+            SodexWsEvent::Ticker(ticker) => {
+                let Some(feed) = feeds.lock().quotes.get(&ticker.symbol).copied() else {
+                    log::debug!("sodex_ticker_unsubscribed symbol={}", ticker.symbol);
+                    continue;
+                };
+                match parse_quote(
+                    &ticker,
+                    feed.instrument_id,
+                    feed.price_precision,
+                    feed.size_precision,
+                    clock.get_time_ns(),
+                ) {
+                    Ok(tick) => vec![Data::Quote(tick)],
+                    Err(e) => {
+                        log::error!("sodex_quote_unparsed symbol={} error={e}", ticker.symbol);
+                        continue;
+                    }
+                }
+            }
+            SodexWsEvent::RequestRejected {
+                op,
+                subscription,
+                reason,
+            } => {
                 // A refused subscribe leaves a feed permanently silent, which otherwise looks
                 // exactly like a market with no trades.
-                log::error!("sodex_stream_request_rejected op={op:?} params={params:?} {reason}");
+                log::error!(
+                    "sodex_stream_request_rejected op={op:?} subscription={subscription:?} {reason}"
+                );
+                continue;
             }
             SodexWsEvent::Reconnected => {
                 // The held bars belong to the connection that just went away. A gap in the
@@ -212,9 +305,48 @@ async fn run_stream(
                 // publishing it later would present a partial bar as a complete one.
                 pending.clear();
                 log::info!("sodex_stream_reconnected pending_bars_dropped");
+                continue;
+            }
+        };
+
+        for data in published {
+            if sender.send(DataEvent::Data(data)).is_err() {
+                log::debug!("sodex_data_consumer_gone");
+                return;
             }
         }
     }
+}
+
+/// Turns a candle push into whatever bars it completed.
+fn publish_candle(
+    feeds: &Arc<Mutex<Feeds>>,
+    pending: &mut Pending,
+    candle: Candle,
+    clock: &'static AtomicTime,
+) -> Vec<Data> {
+    let key = (candle.symbol.clone(), candle.interval.clone());
+    let Some(bar_type) = feeds.lock().bars.get(&key).copied() else {
+        log::debug!(
+            "sodex_candle_unsubscribed symbol={} interval={}",
+            candle.symbol,
+            candle.interval
+        );
+        return Vec::new();
+    };
+
+    advance(pending, key, candle)
+        .into_iter()
+        .filter_map(
+            |completed| match parse_completed_bar(&completed, bar_type, clock.get_time_ns()) {
+                Ok(bar) => Some(Data::Bar(bar)),
+                Err(e) => {
+                    log::error!("sodex_bar_unparsed bar_type={bar_type} error={e}");
+                    None
+                }
+            },
+        )
+        .collect()
 }
 
 /// Folds one push into the held state, returning whatever became complete.
@@ -299,7 +431,7 @@ impl DataClient for SodexDataClient {
         if let Some(ws) = self.ws.take() {
             get_runtime().spawn(async move { ws.close().await });
         }
-        self.feeds.lock().clear();
+        *self.feeds.lock() = Feeds::default();
         Ok(())
     }
 
@@ -354,7 +486,7 @@ impl DataClient for SodexDataClient {
         if let Some(task) = self.stream_task.take() {
             task.abort();
         }
-        self.feeds.lock().clear();
+        *self.feeds.lock() = Feeds::default();
         self.is_connected.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -370,15 +502,10 @@ impl DataClient for SodexDataClient {
         // acknowledges the subscribe, and a push with no entry here would be dropped.
         self.feeds
             .lock()
+            .bars
             .insert((symbol.clone(), interval.clone()), bar_type);
 
-        let params = CandleParams::new(symbol, interval);
-
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.subscribe_candles(params).await {
-                log::error!("sodex_subscribe_bars_failed bar_type={bar_type} error={e}");
-            }
-        });
+        self.spawn_subscribe(ws, Subscription::candles(symbol, interval), bar_type);
         Ok(())
     }
 
@@ -389,15 +516,56 @@ impl DataClient for SodexDataClient {
 
         self.feeds
             .lock()
+            .bars
             .remove(&(symbol.clone(), interval.clone()));
 
-        let params = CandleParams::new(symbol, interval);
+        self.spawn_unsubscribe(ws, Subscription::candles(symbol, interval), bar_type);
+        Ok(())
+    }
 
-        get_runtime().spawn(async move {
-            if let Err(e) = ws.unsubscribe_candles(&params).await {
-                log::error!("sodex_unsubscribe_bars_failed bar_type={bar_type} error={e}");
-            }
-        });
+    fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        let feed = self.tick_feed(&instrument_id)?;
+        let ws = self.ws_client()?;
+        let symbol = instrument_id.symbol.to_string();
+
+        self.feeds.lock().quotes.insert(symbol.clone(), feed);
+
+        self.spawn_subscribe(ws, Subscription::ticker(symbol), instrument_id);
+        Ok(())
+    }
+
+    fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        let ws = self.ws_client()?;
+        let symbol = instrument_id.symbol.to_string();
+
+        self.feeds.lock().quotes.remove(&symbol);
+
+        self.spawn_unsubscribe(ws, Subscription::ticker(symbol), instrument_id);
+        Ok(())
+    }
+
+    fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        let feed = self.tick_feed(&instrument_id)?;
+        let ws = self.ws_client()?;
+        let symbol = instrument_id.symbol.to_string();
+
+        self.feeds.lock().trades.insert(symbol.clone(), feed);
+
+        self.spawn_subscribe(ws, Subscription::trades(symbol), instrument_id);
+        Ok(())
+    }
+
+    fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
+        let instrument_id = cmd.instrument_id;
+        let ws = self.ws_client()?;
+        let symbol = instrument_id.symbol.to_string();
+
+        self.feeds.lock().trades.remove(&symbol);
+
+        self.spawn_unsubscribe(ws, Subscription::trades(symbol), instrument_id);
         Ok(())
     }
 
@@ -496,7 +664,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::config::SODEX_PERPS;
+    use crate::{
+        config::SODEX_PERPS,
+        websocket::{Ticker, Trade},
+    };
 
     fn bar_type(step: usize, aggregation: BarAggregation) -> BarType {
         BarType::new(
@@ -527,16 +698,33 @@ mod tests {
         }
     }
 
-    fn feeds_with(entry: BarType) -> Arc<Mutex<HashMap<FeedKey, BarType>>> {
-        let mut feeds = HashMap::new();
-        feeds.insert(("vBTC_vUSDC".to_string(), "1m".to_string()), entry);
+    fn feeds_with(entry: BarType) -> Arc<Mutex<Feeds>> {
+        let mut feeds = Feeds::default();
+        feeds
+            .bars
+            .insert(("vBTC_vUSDC".to_string(), "1m".to_string()), entry);
+        Arc::new(Mutex::new(feeds))
+    }
+
+    fn tick_feeds() -> Arc<Mutex<Feeds>> {
+        let feed = TickFeed {
+            instrument_id: InstrumentId::new(
+                Symbol::from("vBTC_vUSDC"),
+                Venue::from(SODEX_PERPS),
+            ),
+            price_precision: 1,
+            size_precision: 5,
+        };
+        let mut feeds = Feeds::default();
+        feeds.quotes.insert("vBTC_vUSDC".to_string(), feed);
+        feeds.trades.insert("vBTC_vUSDC".to_string(), feed);
         Arc::new(Mutex::new(feeds))
     }
 
     /// Drives the stream task over one batch of events and collects what it published.
     async fn publish(
         events: Vec<SodexWsEvent>,
-        feeds: Arc<Mutex<HashMap<FeedKey, BarType>>>,
+        feeds: Arc<Mutex<Feeds>>,
     ) -> Vec<DataEvent> {
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         for event in events {
@@ -709,7 +897,131 @@ mod tests {
         // the venue sent, including a feed nobody asked for.
         let published = publish(
             vec![SodexWsEvent::Candle(Box::new(candle(true)))],
-            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Feeds::default())),
+        )
+        .await;
+
+        assert!(published.is_empty());
+    }
+
+    fn ticker() -> Ticker {
+        // The venue's own frame, with the mixed precision that makes this worth pinning: a
+        // bid of "77378.5" beside an ask of "77379".
+        Ticker {
+            event_time_ms: 1_789_051_618_837,
+            symbol: "vBTC_vUSDC".to_string(),
+            last_price: "77341".to_string(),
+            last_quantity: "0.00111".to_string(),
+            weighted_average_price: "79419.4852395990663188".to_string(),
+            ask_price: "77379".to_string(),
+            ask_quantity: "0.00102".to_string(),
+            bid_price: "77378.5".to_string(),
+            bid_quantity: "0.00124".to_string(),
+            price_change: "-1488".to_string(),
+            price_change_percent: -1.887_630_186_860_17,
+            open: "78829".to_string(),
+            high: "89000".to_string(),
+            low: "76760".to_string(),
+            volume: "0.21849".to_string(),
+            quote_volume: "17352.36333".to_string(),
+            window_open_ms: 1_788_965_220_000,
+            window_close_ms: 1_789_051_616_322,
+        }
+    }
+
+    fn trade(side: crate::common::enums::OrderSide) -> Trade {
+        Trade {
+            event_time_ms: 1_789_051_802_631,
+            trade_time_ms: 1_789_051_802_606,
+            trade_id: 3_110_013,
+            symbol: "vBTC_vUSDC".to_string(),
+            side,
+            price: "77304".to_string(),
+            quantity: "0.00001".to_string(),
+            buyer_account_id: 2140,
+            seller_account_id: 1001,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ticker_becomes_a_quote_with_both_sides_at_one_precision() {
+        // The venue writes the same tick size two ways. Parsing each side's precision from
+        // its own text would make this pair look inconsistent and the engine would reject it.
+        let published = publish(
+            vec![SodexWsEvent::Ticker(Box::new(ticker()))],
+            tick_feeds(),
+        )
+        .await;
+
+        assert_eq!(published.len(), 1);
+        let DataEvent::Data(Data::Quote(quote)) = &published[0] else {
+            panic!("expected a quote");
+        };
+        assert_eq!(quote.bid_price.to_string(), "77378.5");
+        assert_eq!(quote.ask_price.to_string(), "77379.0");
+        assert_eq!(quote.bid_price.precision, quote.ask_price.precision);
+    }
+
+    #[tokio::test]
+    async fn a_trade_carries_the_aggressing_side_and_its_own_timestamp() {
+        // `S` names the taker: every observed BUY printed at the ask. And the tick is stamped
+        // with the trade's time, not the frame's, which moves with the network.
+        let published = publish(
+            vec![SodexWsEvent::Trade(Box::new(trade(
+                crate::common::enums::OrderSide::Buy,
+            )))],
+            tick_feeds(),
+        )
+        .await;
+
+        assert_eq!(published.len(), 1);
+        let DataEvent::Data(Data::Trade(tick)) = &published[0] else {
+            panic!("expected a trade");
+        };
+        assert_eq!(tick.aggressor_side, nautilus_model::enums::AggressorSide::Buy);
+        assert_eq!(tick.trade_id.to_string(), "3110013");
+        assert_eq!(tick.ts_event.as_u64(), 1_789_051_802_606 * 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_sell_trade_is_the_seller_aggressing() {
+        let published = publish(
+            vec![SodexWsEvent::Trade(Box::new(trade(
+                crate::common::enums::OrderSide::Sell,
+            )))],
+            tick_feeds(),
+        )
+        .await;
+
+        let DataEvent::Data(Data::Trade(tick)) = &published[0] else {
+            panic!("expected a trade");
+        };
+        assert_eq!(
+            tick.aggressor_side,
+            nautilus_model::enums::AggressorSide::Sell
+        );
+    }
+
+    #[tokio::test]
+    async fn ticks_for_unsubscribed_symbols_are_dropped() {
+        // Each channel keeps its own registry, so subscribing to trades must not start
+        // publishing quotes for the same symbol.
+        let mut feeds = Feeds::default();
+        feeds.trades.insert(
+            "vBTC_vUSDC".to_string(),
+            TickFeed {
+                instrument_id: InstrumentId::new(
+                    Symbol::from("vBTC_vUSDC"),
+                    Venue::from(SODEX_PERPS),
+                ),
+                price_precision: 1,
+                size_precision: 5,
+            },
+        );
+
+        let published = publish(
+            vec![SodexWsEvent::Ticker(Box::new(ticker()))],
+            Arc::new(Mutex::new(feeds)),
         )
         .await;
 
@@ -722,7 +1034,7 @@ mod tests {
             vec![
                 SodexWsEvent::RequestRejected {
                     op: crate::websocket::Op::Subscribe,
-                    params: None,
+                    subscription: None,
                     reason: "unknown symbol".to_string(),
                 },
                 SodexWsEvent::Candle(Box::new(candle(true))),
